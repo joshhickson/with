@@ -139,14 +139,11 @@ fn ci_migrate_shared_defs_active() -> bool:
 fn ci_migrate_output_is_prelude_free() -> bool:
     g_migrate_prelude_free != 0
 
-// True when the shared-defs migration targets the lib/std/re modeled-C zone
-// (pcre2 uses `--shared-defs std.re.defs`). Only there does the compiler exempt
-// cross-module manual-extern calls from the unsafe requirement
-// (sema_path_is_migrated_regex_implementation), so only there is dropping the
-// migrator's `unsafe` wrap around a modeled-libc call correct. The prelude-free
-// vocabulary is NOT keyed on this: that is ci_migrate_output_is_prelude_free.
-fn ci_migrate_shared_defs_targets_regex_zone() -> bool:
-    ci_starts_with(g_migrate_shared_defs_prefix, "std.re")
+// Sema classifies extern declarations in every lib/std module as compiler
+// implementation bindings (sema_extern_is_compiler_implementation). Match
+// that declaration policy for every corpus, without a library-name exception.
+fn ci_migrate_shared_defs_targets_std_zone() -> bool:
+    ci_starts_with(g_migrate_shared_defs_prefix, "std.")
 
 fn ci_migrate_shared_defs_reset:
     g_migrate_shared_decl_buf = Vec.new()
@@ -314,22 +311,30 @@ fn ci_migrate_shared_module_prefix() -> str:
         return g_migrate_shared_defs_prefix.slice(0, g_migrate_shared_defs_prefix.len() - 5)
     g_migrate_shared_defs_prefix
 
-fn ci_migrate_source_module_suffix(path: &str) -> str:
-    var rel = with_str_clone_ref(path)
-    if g_migrate_directory_input_dir.len() > 0 and ci_starts_with(path, g_migrate_directory_input_dir):
-        rel = path.slice(g_migrate_directory_input_dir.len(), path.len())
+// Physical output paths and imports must use the same identifier spelling.
+// A C filename may contain punctuation that is not valid in a With module.
+fn ci_migrate_module_relative_path(input_dir: &str, path: &str) -> str:
+    var rel = path.clone()
+    if input_dir.len() > 0 and ci_starts_with(path, input_dir):
+        rel = path.slice(input_dir.len(), path.len())
     while rel.len() > 0 and rel[0] == 47:
         rel = rel.slice(1, rel.len())
     if rel.ends_with(".c"):
         rel = rel.slice(0, rel.len() - 2)
     var out = ""
-    for i in 0..rel.len() as i32:
-        let ch = rel[i]
-        if ch == 47:
-            out = out ++ "."
-        else:
-            out = out ++ rel.slice(i as i64, (i + 1) as i64)
+    let segments = rel.split("/")
+    for segment in segments:
+        var identifier = ""
+        for i in 0..segment.len():
+            let ch = segment[i] as i32
+            if i == 0 and ch >= 48 and ch <= 57: identifier = identifier ++ "_"
+            identifier = identifier ++ (if ci_is_ident_char(ch): segment.slice(i, i + 1) else: "_")
+        if out.len() > 0: out = out ++ "/"
+        out = out ++ ci_escape_reserved(identifier)
     out
+
+fn ci_migrate_source_module_suffix(path: &str):
+    ci_migrate_module_relative_path(g_migrate_directory_input_dir, path).replace("/", ".")
 
 fn ci_migrate_source_module_path(path: &str) -> str:
     let prefix = ci_migrate_shared_module_prefix()
@@ -897,6 +902,24 @@ impl CiProject:
             ty_id = self.types.type_from_translated_text(owner_type)
         ty_id
 
+    // The module that owns a header's inline definitions: the registered
+    // unit whose stem equals the header's (`dir/tommyhashdyn.h:12:1` ->
+    // the module for `.../tommyhashdyn.c`), or -1 when no unit has it.
+    fn header_owner_module(location: &str) -> i32:
+        // Only a HEADER's definition is API; a unit's own `static inline`
+        // helpers (tommyhashdyn.c's hashdyn_grow_step) stay private.
+        if not ci_migrate_location_is_header(location): return -1
+        let stem = ci_migrate_location_stem(location)
+        if stem.len() == 0: return -1
+        for i in 0..self.module_paths.len() as i32:
+            if ci_migrate_path_stem(ci_migrate_path_basename(self.module_paths[i])) == stem: return i
+        -1
+
+    // Every unit of the migration is a module before any file is scanned,
+    // so a header's owner resolves whatever the scan order.
+    mut fn register_modules(files: &Vec[str]):
+        for path in files: let _ = self.ensure_module(path)
+
     mut fn migrate_scan_file(input_path: &str) -> i32:
         ci_migrate_prepare_include_path(input_path)
         ci_prepare_clang_resource_dir()
@@ -980,6 +1003,20 @@ impl CiProject:
                     i = i + 1
                     continue
                 if with_cimport_fn_storage_class(session, i) == CX_SC_STATIC:
+                    // A `static inline` function DEFINED in a header is the
+                    // header's API: every includer compiles a private copy,
+                    // and the unit of the same name (tommyhashdyn.c for
+                    // tommyhashdyn.h) is where the library keeps that
+                    // header's code. That unit publishes the one definition;
+                    // includers import it. A header no unit owns keeps a
+                    // private copy per includer (tommytypes.h's tommy_ilog2).
+                    let header_owner = if with_cimport_fn_is_inline(session, i) != 0 and cursor >= 0 and with_ci_cursor_is_definition(session, cursor) != 0: self.header_owner_module(loc) else: -1
+                    if header_owner >= 0:
+                        let symbol_id = self.ensure_symbol(CiProjectSymbolKind.CIPS_FN, name)
+                        self.symbols[symbol_id].add_consumer(module_id)
+                        self.symbols[symbol_id].owner_module = header_owner
+                        self.symbols[symbol_id].owner_rank = 1
+                        self.symbols[symbol_id].owner_definition_kind = 1
                     i = i + 1
                     continue
                 let symbol_id = self.ensure_symbol(CiProjectSymbolKind.CIPS_FN, name)
@@ -1223,6 +1260,31 @@ fn ci_migrate_path_basename(path: &str) -> str:
         start = start - 1
     path.slice((start + 1) as i64, end as i64)
 
+// `name.c` -> `name`; a name without a dot is its own stem.
+fn ci_migrate_path_stem(basename: &str) -> str:
+    var end = basename.len() as i32
+    while end > 0 and basename[(end - 1)] != '.':
+        end = end - 1
+    if end == 0: basename.clone() else: basename.slice(0, (end - 1) as i64)
+
+// The file of a cursor location (`path:line:col`), "" when absent.
+fn ci_migrate_location_file(location: &str) -> str:
+    var end = location.len() as i32
+    var colons = 0
+    while end > 0 and colons < 2:
+        end = end - 1
+        if location[end] == ':': colons = colons + 1
+    if colons < 2: "" else: location.slice(0, end as i64)
+
+fn ci_migrate_location_is_header(location: &str) -> bool:
+    ci_migrate_location_file(location).ends_with(".h")
+
+// The file stem of a cursor location (`path:line:col`), "" when absent.
+fn ci_migrate_location_stem(location: &str) -> str:
+    let file = ci_migrate_location_file(location)
+    if file.len() == 0: return ""
+    ci_migrate_path_stem(ci_migrate_path_basename(file))
+
 fn ci_migrate_excludes_contains(excludes: &str, basename: &str) -> bool:
     if excludes.len() == 0 or basename.len() == 0:
         return false
@@ -1292,17 +1354,21 @@ fn ci_migrate_sorted_files(files: &Vec[str]) -> Vec[str]:
         i = i + 1
     sorted
 
-fn ci_migrate_directory_output_path(input_dir: &str, output_dir: &str, file_path: &str) -> str:
-    var out_path = ""
-    if ci_starts_with(file_path, input_dir):
-        let relative = file_path.slice(input_dir.len(), file_path.len())
-        if relative.len() > 2 and relative.slice(relative.len() - 2, relative.len()) == ".c":
-            out_path = f"{output_dir}{relative.slice(0, relative.len() - 2)}.w"
-        else:
-            out_path = f"{output_dir}{relative}.w"
-    else:
-        out_path = f"{output_dir}/{file_path}.w"
-    out_path
+fn ci_migrate_directory_output_path(input_dir: &str, output_dir: &str, file_path: &str):
+    output_dir ++ "/" ++ ci_migrate_module_relative_path(input_dir, file_path) ++ ".w"
+
+fn ci_migrate_validate_module_paths(input_dir: &str, files: &Vec[str]):
+    var owners: HashMap[str, str] = HashMap.new()
+    for path in files:
+        let module_path = ci_migrate_module_relative_path(input_dir, path)
+        if ci_migrate_shared_defs_active() and module_path == "defs":
+            eprint("migrate: source " ++ path ++ " collides with the shared definitions module")
+            return false
+        if owners.contains(module_path):
+            eprint("migrate: module path collision: " ++ owners.get(module_path).unwrap() ++ " and " ++ path ++ " both map to " ++ module_path)
+            return false
+        owners.insert(module_path, path.clone())
+    true
 
 fn ci_migrate_print_progress(file_path: &str, current: i32, total: i32):
     let base = ci_migrate_path_basename(file_path)
@@ -1373,6 +1439,7 @@ fn ci_migrate_directory_filewise(input_dir: &str, output_dir: &str, files: &Vec[
 
         ci_migrate_shared_defs_reset()
         var project = CiProject.new()
+        project.register_modules(files)
         var scan_i = 0
         while scan_i < files.len() as i32:
             if project.migrate_scan_file(files[scan_i]) != 0:
@@ -1406,6 +1473,7 @@ pub fn migrate_c_directory(input_dir: &str, output_dir: &str, exclude_basenames:
         return 1
 
     let sorted_files = ci_migrate_sorted_files(files)
+    if not ci_migrate_validate_module_paths(input_dir, sorted_files): return 1
     let files_scanned = sorted_files.len() as i32
     var files_migrated = 0
 
@@ -1413,6 +1481,7 @@ pub fn migrate_c_directory(input_dir: &str, output_dir: &str, exclude_basenames:
         return ci_migrate_directory_filewise(input_dir, output_dir, sorted_files)
 
     var project = CiProject.new()
+    project.register_modules(&sorted_files)
     var scan_i = 0
     while scan_i < sorted_files.len() as i32:
         if project.migrate_scan_file(sorted_files[scan_i]) != 0:
@@ -1616,6 +1685,13 @@ fn ci_migrate_translate_function(session: i64, idx: i32, known_structs: &str, pr
         let link_prefix = if safe_name != name: "@[link_name(\"" ++ name ++ "\")]\n" else: ""
         return link_prefix ++ cc_prefix ++ "extern fn " ++ safe_name ++ "(" ++ params ++ ") -> " ++ ret_render ++ "\n"
 
+    // A header's `static inline` definition is published once, by the unit
+    // that owns the header (the project scan's header_owner_module); every
+    // other unit imports it instead of keeping a private copy.
+    let header_owner = if storage == CX_SC_STATIC and with_cimport_fn_is_inline(session, idx) != 0: ci_migrate_project_fn_owner_path(project_active, project, name) else: ""
+    if header_owner.len() > 0 and header_owner != g_migrate_current_input_path:
+        return ""
+
     // @[c_export] for non-static functions (preserves C ABI)
     let export_prefix = if (g_migrate_no_c_export != 0 and g_migrate_export_function_defs == 0) or storage == CX_SC_STATIC: "" else: "@[c_export(\"" ++ name ++ "\")]\n"
 
@@ -1638,7 +1714,7 @@ fn ci_migrate_translate_function(session: i64, idx: i32, known_structs: &str, pr
         let ret_render = ci_unsafe_fn_ptr_type(ret)
         let ret_suffix = " -> " ++ ret_render
         let body_for_emit = if ret == "Unit" and ci_migrate_text_is_blank(body): "    return\n" else: body
-        let visibility = if g_migrate_no_c_export != 0 and storage != CX_SC_STATIC: "pub " else: ""
+        let visibility = if g_migrate_no_c_export != 0 and (storage != CX_SC_STATIC or header_owner.len() > 0): "pub " else: ""
         let fn_keyword = visibility ++ if ci_migrate_extern_fn_call_requires_unsafe(safe_name): "unsafe fn " else: "fn "
         if migrate_prefer_brace():
             return export_prefix ++ fn_keyword ++ safe_name ++ "(" ++ params ++ ")" ++ ret_suffix ++ " {\n" ++ body_for_emit ++ "}\n\n"
@@ -1736,7 +1812,10 @@ fn ci_migrate_collect_unsafe_extern_fns(session: i64, count: i32, primary_path: 
         let local_def = ci_find_fn_cursor(session, name)
         if local_def >= 0 and (owner_path.len() == 0 or owner_path == primary_path) and ci_migrate_fn_has_raw_pointer_param(session, i):
             ci_migrate_note_unsafe_extern_fn(ci_migrate_c_function_name(name))
-        if with_cimport_fn_storage_class(session, i) == CX_SC_STATIC:
+        // A static function stays local unless it is a header's inline
+        // definition another unit publishes (owner_path): then its calls
+        // here need the same unsafe context as any imported raw function.
+        if with_cimport_fn_storage_class(session, i) == CX_SC_STATIC and owner_path.len() == 0:
             i = i + 1
             continue
         if (owner_path.len() > 0 and owner_path != primary_path) and ci_migrate_fn_has_raw_pointer_param(session, i):
@@ -1798,7 +1877,7 @@ fn ci_migrate_var_owner_type(session: i64, idx: i32) -> str:
     if ci_starts_with(actual_type, "[0]"):
         let cursor = with_cimport_decl_cursor(session, idx)
         if cursor >= 0:
-            let init_cursor = ci_find_var_init_cursor(session, cursor)
+            let init_cursor = with_ci_var_initializer(session, cursor)
             if init_cursor >= 0:
                 let init_type = with_ci_type_translated(session, with_ci_cursor_type(session, init_cursor))
                 if init_type.len() > 0 and init_type[0] == 91:

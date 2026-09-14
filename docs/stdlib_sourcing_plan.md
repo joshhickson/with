@@ -4,6 +4,8 @@ Status: PLAN (2026-09-01), with engine selections ruled on 2026-09-12.
 The selections below describe the destination, not completed migrations.
 Module grouping is provisional. Companion: `docs/harden_migrate.md` (the migrator plan
 this campaign exercises), `docs/harden_plan.md` item 7.
+Phase 0 (PR #1129) and Phase 1 (PR #1138, c-algorithms) are implemented;
+see "Phase 1 status" below.
 
 ## The ruling
 
@@ -389,6 +391,55 @@ Gate: upstream `test/` passes under With; facades' complexity fixtures
 green; drop audit green; comparison measurements recorded. #937 is retired
 by the M*LIB-backed `BTreeMap`/`BTreeSet` work in Phase 4.
 
+**Phase 1 status (2026-09-13, branch `c-algorithms-phase1`).**
+- Corpus: pinned (`build/c_algorithms.w`, revision `23d45379`), migrated
+  raw with `with migrate` (19 engine modules + `defs.w`), promoted to
+  `lib/std/c_algorithms/` as the third `.wo` bundle (`c_algorithms.wo`;
+  `bundle.w` root, `c-algorithms-bundle-root-check`, drift lane with
+  upstream's `test-cpp` as the harness). The build wires it exactly as
+  zlib's bundle at every site (`calg_wo` in `build.w`).
+- Upstream tests: all 17 test programs pass under With with
+  `ALLOC_TESTING`. Each test is its own whole migration (engine + framework +
+  test) because the programs' globals are independent; the migration is
+  promoted into `test/corpora/c_algorithms/` (one shared `engine/`, a
+  `programs/<name>/` with each program's `defs.w` and test module), and the
+  corpora lane `c-algorithms-test` (in `:test`) compiles those checked-in
+  programs with the release binary and runs them. A migrate workspace runs
+  in the build driver's own compiler, so re-migrating (pin change, migrator
+  fix) needs a tree compiler as the driver:
+  `WITH=out/release/bin/with out/release/bin/with build :c-algorithms-promote`;
+  the seed's migrator is behind the tree and bails on Darwin's `assert`.
+- Migrator fixes made for it, all general: a record forward-declared
+  without a definition in a TU renders `= opaque` so a later TU's
+  definition completes it whatever the file order (`_Trie` lost its body
+  when `test-trie.c` sorted before `trie.c`).
+- Facades (`std.collections.sorted_vec.SortedVec[T]`,
+  `std.collections.binary_heap.BinaryHeap[T]`,
+  `std.collections.trie.Trie[V]`, storage in
+  `std.collections.engine_slot`): the facade owns every value in a heap
+  slot the engine indexes by pointer; `get`/`peek` observe (`&T`),
+  `remove`/`pop` transfer, `move fn drop` releases every held value, then
+  the engine. Behavior tests, complexity fixtures (`test/complexity`) and
+  drop-audit cells (`tools/drop_audit.w`) cover each. The RB/AVL trees,
+  hash table, lists, queue, bloom filter and binomial heap remain internal
+  comparison engines (migrated, tested, not facaded).
+- Comparators: the engines' C callbacks receive one non-generic
+  trampoline; each slot carries the facade's With comparator closure
+  because a closure written in a generic function cannot yet be handed to
+  C directly (#1135). Two more compiler gaps found and filed: nested
+  stdlib modules cannot import a corpus `pub let` (#1136); ordering two
+  views of a type without an `lt` method silently compared addresses
+  (#1137, fixed in this branch: it is now a diagnostic).
+- The branch's pre-facade compiler commits (31a347d4, 88f0ad31, 92c0c01d)
+  regressed ~16 existing fixtures; root-caused and fixed (`docs/handoff.md`
+  §1c), plus the va_list call-site model (e7ddf116). The full battery is
+  green at 4832bf0a.
+- Comparisons of user types: ruled (decisions.md D41, 2026-09-13).
+  `Ord.cmp(self: &Self, other: &Self)` backs `<`/`<=`/`>`/`>=` and
+  `Eq.eq(other: &Self)` backs `==`/`!=`; fixed-name methods are optional
+  overrides. The facades bound `T: Ord` and compare views with `<`/`>`
+  directly. §11.7 carries the blessed wording (2026-09-14).
+
 **Phase 2 — TommyDS, whole.**
 Specialized indexing/storage engines: `hashtable`, `hashdyn`, `hashlin`,
 tries, and `arrayblk`. Benchmark the hash engines against Phase 1's hash
@@ -396,6 +447,61 @@ table and today's `rt_core` engine; STC remains the selected default owning
 map engine. The facade design item is node ownership (above).
 Gate: `check.c` passes under With; benchmark table recorded; specialized
 adapters have complexity and drop evidence. #939 remains a Phase 3 gate.
+
+**Phase 2 status (2026-09-14, branch `tommyds-phase2`).**
+- Corpus: pinned (`build/tommyds.w`, amadvance/tommyds `1f3727fc`),
+  migrated raw with `with migrate` (the 13 units as modules + `defs.w`;
+  `tommy.c`, upstream's amalgamation of those units, is excluded),
+  promoted to `lib/std/tommyds/` as the fourth `.wo` bundle (`tommyds.wo`;
+  `bundle.w` root, `tommyds-bundle-root-check`, drift lane with upstream's
+  `check.c` as the harness — module `check_`, since `check` is a prelude
+  name). Wired as c-algorithms is at every site (`tommy_wo` in `build.w`).
+- Upstream test: `check.c` runs to `OK` under With (37 timed sections,
+  every structure's insert/search/remove/sort paths, `tommy_hash` test
+  vectors). The corpora lane `tommyds-test` (in `:test`) compiles it from
+  the checked-in corpus with the release binary and runs it. Re-migration:
+  `WITH=out/release/bin/with out/release/bin/with build :tommyds-promote`.
+- Migrator fixes made for it, all general: `__builtin_clz/ctz/popcount/
+  bswap` lower to the integer methods (`(x as u32).clz()`); a pointer to a
+  function typedef is a function pointer; `qsort`/`rand`/`srand` and
+  Darwin's mach clock are std.libc bindings (the clock modeled portably:
+  the runtime's monotonic nanoseconds, timebase 1/1); a header's
+  `static inline` definitions are published once by the unit of the same
+  name and imported by every other unit (TommyDS keeps `tommy_hashdyn_search`,
+  `tommy_hashlin_search`, `tommy_inthash_u32` in headers; before this every
+  includer had a private copy and nothing outside the corpus could call
+  them). A header no unit owns (`tommytypes.h`'s `tommy_ilog2`) keeps a
+  private copy per includer.
+- Node ownership, the facade design item: `std.collections.hash_index.
+  HashIndex[K: Hash + Eq, V]` over `hashdyn`. The engine threads intrusive
+  nodes it never allocates; the facade owns every node — one heap slot per
+  entry holding the node (first, so the engine's node pointer is the slot),
+  the With key comparator (fixed offset, read by the one C trampoline
+  `hash_slot_compare`), the key and the value. `get` observes, `remove`
+  and a replacing `insert` transfer, `clear`/`drop` walk the buckets and
+  release every slot exactly once. Behavior test `behav_hash_index`,
+  complexity row `hash-index` (`test/complexity/stdlib.w`), drop-audit
+  cells `hash_index_*` (`tools/drop_audit.w`). `hashlin` (incremental
+  resize) and `hashtable` (fixed) stay internal engines: same node
+  protocol, so the facade would be the same file with three `init`
+  calls; not a public surface until a facade needs it.
+- Benchmark (`test/benchmark/hash_engines.w`, `with run`; i32 keys,
+  n = 200000, ns per operation, median of three, Eric's laptop, `-O1`):
+
+  | engine | insert | lookup | remove |
+  |---|---|---|---|
+  | `rt_core` HashMap[i32, i32] | 41 | 9 | 58 |
+  | HashIndex[i32, i32] (hashdyn, facade) | 32 | 3 | 26 |
+  | tommy_hashdyn raw (caller-owned nodes) | 18 | 5 | 15 |
+  | tommy_hashlin raw | 24 | 6 | 14 |
+  | tommy_hashtable raw (fixed, n buckets) | 4 | 7 | 10 |
+  | c-algorithms hash_table raw | 47 | 1 | 25 |
+
+  The facade's cost over the raw engine is one heap slot per entry and
+  the key hash + comparator call; its lookup reuses one probe slot.
+
+  STC remains the selected default owning map engine (Phase 3); the
+  numbers above are the comparison the plan asked for, not a selection.
 
 **Phase 3 — STC, whole: the macro-migrator campaign.**
 STC is valuable because its template mechanism is nasty: containers are
