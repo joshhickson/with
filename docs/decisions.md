@@ -10,6 +10,100 @@ decision supersedes an earlier one, say so in both.
 
 ---
 
+## D46 — `with get` builds a C package from source from the recipe read as data; no per-package files; `with cc` is clang inside the binary
+
+**Date:** 2026-09-19. **Status:** ruled (Eric: "with get must build c when
+there's no binary for the package"; "we cant be writing special case code
+for every conan package"; prerequisites "we need to expose them to the
+user … user will need to take care of it"; "OpenSSL can't be a UAT").
+Specification §18.5 and §18.8 blessed 2026-09-19. Implemented in #1208.
+
+**Context.** Conan Center publishes no Linux armv8 binaries at all (zlib,
+bzip2, sqlite3, openssl, libcurl, raylib checked 2026-09-18), so every
+`with get c.X` on linux-aarch64 failed. The old fallback compiled every `.c`
+in the tarball with the system `cc` and gave up on any recipe with patches or
+a configure step — zlib already — and could not be locked.
+
+**Decision.**
+- *Compiler:* clang's driver is linked into `with` (`with cc`), as Zig does;
+  the toolchain never trusts a system compiler. `clang_main` lives in the
+  clang tool's own objects, archived into the SDK as `libclangMain`; one plain
+  extern is aliased to the mangled name per linker. An SDK published before
+  this links a stand-in and the compiler says it has no C compiler; a platform
+  gains `with cc` when its SDK is republished.
+- *Build knowledge:* the package's own CMake build, driven by `cmake` and
+  `ninja` with `with cc`. What is package-specific comes from the recipe Conan
+  Center already publishes, **read as data and never executed**: archive,
+  digest, patches, requirements, and `tc.variables`, evaluated against the
+  option defaults and the host under the `if`s that hold.
+- *Prerequisites* (`cmake`, `ninja`, Perl for OpenSSL, …) are named and the
+  build stops; installing them is the programmer's step. A release UAT may not
+  require one, so OpenSSL is not a UAT.
+
+**Rejected.** Per-package port files (written, then deleted the same night:
+"special case code for every conan package"). Executing `conanfile.py`
+(needs Python and Conan). pkg-config / system packages (apt ceremony, no
+Windows story). Hosting our own binaries as the primary answer (moves the
+gap). Detecting the stand-in by comparing function addresses (LLVM folds two
+distinct function symbols to "not equal"; the stand-in was called).
+
+**What would reopen it.** A class of popular packages whose recipes cannot
+be read as data (logic the evaluator cannot follow), or Conan Center
+publishing binaries for every platform With targets.
+
+---
+
+## D45 — A copy is never implicit unless it is O(1); an allocating copy is spelled
+
+**Date:** 2026-09-19. **Status:** ruled (Eric: "unless copy is O(1) we
+should[n't] even consider doing it by default"; "yes for now option A … that
+lands regardless of what happens to str later"). Specification §13.6's
+examples do not yet conform (they build owning collections of `str` from
+views without a clone); the wording is Eric's to bless. Measurement that
+could reopen this: #1211.
+
+**Question.** `let words: HashSet[str] = [w for w in tokens]` — `tokens` is
+observed (D44), so `w` is a `&str`. Does the comprehension clone it? Mission
+¶2 argues yes (the target type forces exactly one meaning). The same question
+covers `let s: str = w` and passing a view to a consuming parameter.
+
+**Ruling.** An owned-value demand on a view `&T` materializes a `T` only when
+`T: Copy` (D22). For a type whose copy allocates, the programmer writes
+`.clone()`. A comprehension's element, key and value positions are
+owned-value demands like any other; they get no exception. A view of a Copy
+type stored by a comprehension materializes (it stored `&i32` before); a view
+of a Drop-class value is an error that says to clone it.
+
+**Why.** Meaning is one gate; cost visibility is the other ("close to the
+machine"). Verified in `.reference/`: of go, mojo, rust, scala3, swift, Vale
+and zig, none copies a string implicitly while paying an allocation for it.
+Every implicit-copy language made the copy O(1) first — Mojo (refcount, COW,
+small strings inline), Swift (ARC retain, skipped for small and immortal
+strings), Vale (`str` is always a shared type), Go and Scala (shared immutable
+bytes). Rust, whose `String::clone` allocates, spells it. Mojo 0.25.6 drew
+this exact line: `Copyable` became explicit (`.copy()`), `ImplicitlyCopyable`
+opt-in; `List`, `Dict` and `Set` lost implicit copy because theirs allocates,
+`String` kept it because its copy is a refcount bump. With's `str` is an owned
+`(ptr, len)` buffer and §15.2 already marks `&str → str` as "(allocates)".
+Cloning silently would have made With the only one of the eight that hides a
+per-element allocation.
+
+**Rejected.** Implicit clone in a typed comprehension only (a second rule for
+one position, and the same hidden cost). A separate cheap string type in the
+library (the default type, the one in every example, still needs the clone).
+
+**What would reopen it.** `str` becoming O(1) to copy — immutable shared bytes,
+a refcount in the allocation header, immortal literals (#1211 measures whether
+that pays, including deleting the per-free `rt_payload_start_is_owned`
+lookup). Then D22 extends by one line, and the string clones this ruling
+requires become redundant and are removed. If the numbers are bad, this is the
+permanent answer and §13.6's examples iterate `move tokens`.
+
+**Supersedes nothing.** Extends D22 (owned-value demand) and D44 (traversal
+observes) to the positions a comprehension stores from.
+
+---
+
 ## D44 — Map traversal observes; consuming iteration transfers; no operation on a map makes a second owner
 
 **Date:** 2026-09-18. **Status:** ruled (Eric, "make it canon"); specification
