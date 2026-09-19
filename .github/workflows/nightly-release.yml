@@ -22,9 +22,14 @@ on:
         required: false
         default: ""
         type: string
+      diagnostic_run:
+        description: Test-only native package diagnosis using compiler artifacts from this run ID; does not verify or publish a release
+        required: false
+        default: ""
+        type: string
 
 concurrency:
-  group: nightly-release-${{ github.repository }}-${{ github.event_name == 'push' && github.ref_name || github.event_name == 'schedule' && 'nightly' || inputs.channel || 'test' }}
+  group: nightly-release-${{ github.repository }}-${{ inputs.diagnostic_run && 'diagnostic' || github.event_name == 'push' && github.ref_name || github.event_name == 'schedule' && 'nightly' || inputs.channel || 'test' }}
   cancel-in-progress: false
 
 permissions: {}
@@ -42,8 +47,177 @@ env:
   WITH_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version || '' }}
 
 jobs:
+  dll-copy-diagnostics:
+    name: Diagnose Mesa copy on windows-${{ matrix.arch }}
+    if: github.event_name == 'workflow_dispatch' && inputs.diagnostic_run != ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-latest
+            seed_version: v0.15.2.1
+            seed_asset: with-windows-x86_64.exe
+            seed_sha256: 8f4817f2c4a3a916515ec93fd8a8f228bc9cfcd423689c5977dc564efc02a115
+            mesa_arch: x64
+            mesa_sha256: 418f1938dc48d401538cf6440d3c718e2f456ef2023e44133105263f483e903f
+          - arch: aarch64
+            runner: windows-11-arm
+            seed_version: v0.15.2.1
+            seed_asset: with-windows-aarch64.exe
+            seed_sha256: bb3b17c64ad057ddc852a5ee6a61a4e4a224780447013699d490e6f726893c73
+            mesa_arch: arm64
+            mesa_sha256: bd1c00a49504b3efe20037cf29fa437380cfb5cbe73f196272624b94938330f1
+    steps:
+      - name: Require diagnostic channel
+        run: test "${{ inputs.channel }}" = test
+      - name: Checkout copy fixture
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Fetch the pinned driver and actual Mesa library
+        run: |
+          mkdir -p out/dll-copy-probe
+          curl -fL -o out/diagnostic-seed.exe "https://github.com/withlang-dev/with/releases/download/${{ matrix.seed_version }}/${{ matrix.seed_asset }}"
+          printf '%s  %s\n' '${{ matrix.seed_sha256 }}' out/diagnostic-seed.exe | sha256sum -c -
+          curl -fL -o out/mesa.7z "https://github.com/mmozeiko/build-mesa/releases/download/26.2.2/mesa-llvmpipe-${{ matrix.mesa_arch }}-26.2.2.7z"
+          printf '%s  %s\n' '${{ matrix.mesa_sha256 }}' out/mesa.7z | sha256sum -c -
+          7z x -y -oout/dll-copy-probe out/mesa.7z opengl32.dll
+          mv out/dll-copy-probe/opengl32.dll out/dll-copy-probe/source.dll
+      - name: Initialize isolated copy project
+        working-directory: out/dll-copy-probe
+        run: ../diagnostic-seed.exe init .
+      - name: Install copy action
+        run: cp tools/diagnose_dll_copy_build.w out/dll-copy-probe/build.w
+      - name: Copy through the pinned evaluator
+        working-directory: out/dll-copy-probe
+        run: ../diagnostic-seed.exe build --strict-effects
+      - name: Compare original and copied DLL bytes
+        if: always()
+        working-directory: out/dll-copy-probe
+        run: |
+          ls -l source.dll out/copied.dll
+          file source.dll out/copied.dll
+          sha256sum source.dll out/copied.dll
+          cmp source.dll out/copied.dll
+      - name: Reproduce the UAT's external absolute source
+        working-directory: out/dll-copy-probe
+        continue-on-error: true
+        run: |
+          cp out/copied.dll out/relative-copy.dll
+          cp source.dll ../external-source.dll
+          rm out/copied.dll
+          export WITH_UAT_OPENGL32_DLL="$(cygpath -m "$PWD/../external-source.dll")"
+          ../diagnostic-seed.exe build --strict-effects
+      - name: Inspect external-path copy result
+        if: always()
+        working-directory: out/dll-copy-probe
+        run: |
+          ls -l source.dll out/copied.dll
+          file source.dll out/copied.dll
+          sha256sum source.dll out/copied.dll
+          cmp source.dll out/copied.dll
+      - name: Preserve DLL evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dll-copy-windows-${{ matrix.arch }}
+          retention-days: 7
+          path: |
+            out/dll-copy-probe/source.dll
+            out/dll-copy-probe/out/copied.dll
+            out/dll-copy-probe/out/relative-copy.dll
+
+  package-diagnostics:
+    name: Diagnose ${{ matrix.package }} on windows-${{ matrix.arch }}
+    if: github.event_name == 'workflow_dispatch' && inputs.diagnostic_run != ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [bzip2, libcurl]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: windows-latest
+            procdump: procdump64.exe
+          - arch: aarch64
+            runner: windows-11-arm
+            procdump: procdump64a.exe
+    steps:
+      - name: Require diagnostic channel
+        run: test "${{ inputs.channel }}" = test
+      - name: Checkout diagnostic fixtures
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Fetch the exact failed compiler and symbols
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIAGNOSTIC_RUN: ${{ inputs.diagnostic_run }}
+        run: gh run download "$DIAGNOSTIC_RUN" --repo "$GITHUB_REPOSITORY" --name package-failures-windows-${{ matrix.arch }} --dir out/diagnostic-compiler
+      - name: Fetch native stack capture tool
+        run: |
+          curl -fL -o out/procdump.zip https://download.sysinternals.com/files/Procdump.zip
+          7z x -y -oout/procdump out/procdump.zip
+          mkdir -p out/diagnostic-project out/package-dumps
+      - name: Initialize isolated package project
+        working-directory: out/diagnostic-project
+        run: ../diagnostic-compiler/release/bin/with.exe init .
+      - name: Fetch current package
+        id: fresh-get
+        continue-on-error: true
+        working-directory: out/diagnostic-project
+        run: ../diagnostic-compiler/release/bin/with.exe get c.${{ matrix.package }}
+      - name: Expose failed package download
+        if: steps.fresh-get.outcome == 'failure'
+        continue-on-error: true
+        shell: pwsh
+        working-directory: out/diagnostic-project
+        run: |
+          Get-Command curl.exe
+          curl.exe -v -fSL -o /tmp/with-conan-diagnostic.json "https://center2.conan.io/v2/conans/search?q=${{ matrix.package }}"
+      # Investigation of the old binary only: retain the fresh-get failure
+      # above, then recreate the full battery's scratch directory so we can
+      # reach its separate C import hang. This is never release evidence.
+      - name: Reproduce the older compiler's scratch environment
+        if: steps.fresh-get.outcome == 'failure'
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force /tmp
+      - name: Fetch package for header stack capture
+        if: steps.fresh-get.outcome == 'failure'
+        working-directory: out/diagnostic-project
+        run: ../diagnostic-compiler/release/bin/with.exe get c.${{ matrix.package }}
+      - name: Install the actual UAT fixture
+        run: cp build/release_uat_fixtures/${{ matrix.package }}_main.w out/diagnostic-project/src/main.w
+      - name: Capture native check stacks
+        working-directory: out/diagnostic-project
+        timeout-minutes: 3
+        env:
+          WITH_PROFILE: '1'
+        run: ../procdump/${{ matrix.procdump }} -accepteula -mm -n 3 -s 15 -x ../package-dumps ../diagnostic-compiler/release/bin/with.exe check src/main.w
+      - name: Preserve stack evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-stacks-${{ matrix.package }}-windows-${{ matrix.arch }}
+          retention-days: 7
+          if-no-files-found: error
+          path: out/package-dumps
+
   build:
     name: Verify and package ${{ matrix.platform }}
+    if: inputs.diagnostic_run == ''
     strategy:
       fail-fast: false
       matrix:
@@ -185,7 +359,9 @@ jobs:
           sudo apt-get update -qq
           # xvfb: a virtual X display. libgl1-mesa-dri: Mesa's llvmpipe, the
           # software OpenGL 4.5 the raylib spiral UAT renders through.
-          sudo apt-get install -y --no-install-recommends xvfb libgl1-mesa-dri
+          sudo apt-get install -y --no-install-recommends xvfb xauth libgl1-mesa-dri \
+            libgl-dev libx11-dev libxext-dev libxfixes-dev libxi-dev \
+            libxinerama-dev libxrandr-dev libxcursor-dev
 
       - name: Release UAT (Linux, under Xvfb)
         if: runner.os == 'Linux'
@@ -257,7 +433,7 @@ jobs:
     # published from the maintainer's Mac (tools/release_local.w) minutes
     # after the tag; CI builds it for the nightly and test channels only.
     # The body mirrors the unix matrix job above.
-    if: github.event_name != 'push'
+    if: github.event_name != 'push' && inputs.diagnostic_run == ''
     strategy:
       fail-fast: false
       matrix:
@@ -431,6 +607,7 @@ jobs:
 
   build-windows:
     name: Verify and package windows-x86_64
+    if: inputs.diagnostic_run == ''
     runs-on: windows-latest
     timeout-minutes: 360
     defaults:
@@ -565,10 +742,10 @@ jobs:
           curl -fL -o "$archive" \
             "https://github.com/mmozeiko/build-mesa/releases/download/26.2.2/mesa-llvmpipe-x64-26.2.2.7z"
           printf '%s  %s\n' "418f1938dc48d401538cf6440d3c718e2f456ef2023e44133105263f483e903f" "$archive" | sha256sum -c -
-          mkdir -p "$RUNNER_TEMP/mesa"
-          7z x -y -o"$RUNNER_TEMP/mesa" "$archive" opengl32.dll > /dev/null
-          test -f "$RUNNER_TEMP/mesa/opengl32.dll"
-          echo "WITH_UAT_OPENGL32_DLL=$(cygpath -m "$RUNNER_TEMP/mesa/opengl32.dll")" >> "$GITHUB_ENV"
+          mkdir -p out/release-uat/mesa
+          7z x -y -oout/release-uat/mesa "$archive" opengl32.dll > /dev/null
+          test -f out/release-uat/mesa/opengl32.dll
+          echo "WITH_UAT_OPENGL32_DLL=out/release-uat/mesa/opengl32.dll" >> "$GITHUB_ENV"
 
       - name: Release UAT
         # Driven by the seed, not the rebuilt binary: the UAT tests the
@@ -577,6 +754,51 @@ jobs:
         # every invocation (#1157) — Windows cannot replace a running
         # executable ("could not rename out/release/bin/with.exe.tmp").
         run: ./src/main.exe build :release-uat
+
+      - name: Fetch native hang capture tool (test channel)
+        if: ${{ failure() && inputs.channel == 'test' }}
+        run: |
+          curl -fL -o out/procdump.zip https://download.sysinternals.com/files/Procdump.zip
+          7z x -y -oout/procdump out/procdump.zip
+          mkdir -p out/package-dumps/bzip2 out/package-dumps/libcurl
+
+      - name: Diagnose bzip2 check (test channel)
+        if: ${{ failure() && inputs.channel == 'test' }}
+        timeout-minutes: 3
+        continue-on-error: true
+        working-directory: out/release-uat/bzip2-project
+        env:
+          WITH_PROFILE: '1'
+        run: ../../procdump/procdump64.exe -accepteula -mm -n 3 -s 15 -x ../../package-dumps/bzip2 ../../release/bin/with.exe check src/main.w
+
+      - name: Diagnose libcurl check (test channel)
+        if: ${{ failure() && inputs.channel == 'test' }}
+        timeout-minutes: 3
+        continue-on-error: true
+        working-directory: out/release-uat/libcurl-project
+        env:
+          WITH_PROFILE: '1'
+        run: ../../procdump/procdump64.exe -accepteula -mm -n 3 -s 15 -x ../../package-dumps/libcurl ../../release/bin/with.exe check src/main.w
+
+      - name: Inspect spiral DLL integrity (test channel)
+        if: ${{ failure() && inputs.channel == 'test' }}
+        continue-on-error: true
+        run: |
+          sha256sum "$WITH_UAT_OPENGL32_DLL" out/release-uat/raylib-spiral-project/out/bin/opengl32.dll
+          "$LLVM_PREFIX/bin/llvm-readobj.exe" --file-headers "$WITH_UAT_OPENGL32_DLL" out/release-uat/raylib-spiral-project/out/bin/opengl32.dll
+          ls -l out/release-uat/raylib-spiral-project/out/bin
+
+      - name: Preserve native package failure evidence (test channel)
+        if: ${{ failure() && inputs.channel == 'test' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-failures-windows-x86_64
+          retention-days: 7
+          path: |
+            out/package-dumps
+            out/release/bin/with.exe
+            out/release/bin/*.pdb
+            out/release-uat/raylib-spiral-project/out/bin/opengl32.dll
 
       - name: Package fixpoint-verified release asset
         run: |
@@ -642,7 +864,7 @@ jobs:
     # published from the maintainer's Mac (tools/release_local.w, the
     # linux/arm64 container in tools/docker/linux-aarch64). CI builds it for
     # the nightly and test channels only.
-    if: github.event_name != 'push'
+    if: github.event_name != 'push' && inputs.diagnostic_run == ''
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     permissions:
@@ -778,7 +1000,9 @@ jobs:
           sudo apt-get update -qq
           # xvfb: a virtual X display. libgl1-mesa-dri: Mesa's llvmpipe, the
           # software OpenGL 4.5 the raylib spiral UAT renders through.
-          sudo apt-get install -y --no-install-recommends xvfb libgl1-mesa-dri
+          sudo apt-get install -y --no-install-recommends xvfb xauth libgl1-mesa-dri \
+            libgl-dev libx11-dev libxext-dev libxfixes-dev libxi-dev \
+            libxinerama-dev libxrandr-dev libxcursor-dev
 
       - name: Release UAT (under Xvfb)
         env:
@@ -834,6 +1058,7 @@ jobs:
 
   build-windows-aarch64:
     name: Verify and package windows-aarch64
+    if: inputs.diagnostic_run == ''
     runs-on: windows-11-arm
     timeout-minutes: 360
     defaults:
@@ -954,10 +1179,10 @@ jobs:
           curl -fL -o "$archive" \
             "https://github.com/mmozeiko/build-mesa/releases/download/26.2.2/mesa-llvmpipe-arm64-26.2.2.7z"
           printf '%s  %s\n' "bd1c00a49504b3efe20037cf29fa437380cfb5cbe73f196272624b94938330f1" "$archive" | sha256sum -c -
-          mkdir -p "$RUNNER_TEMP/mesa"
-          7z x -y -o"$RUNNER_TEMP/mesa" "$archive" opengl32.dll > /dev/null
-          test -f "$RUNNER_TEMP/mesa/opengl32.dll"
-          echo "WITH_UAT_OPENGL32_DLL=$(cygpath -m "$RUNNER_TEMP/mesa/opengl32.dll")" >> "$GITHUB_ENV"
+          mkdir -p out/release-uat/mesa
+          7z x -y -oout/release-uat/mesa "$archive" opengl32.dll > /dev/null
+          test -f out/release-uat/mesa/opengl32.dll
+          echo "WITH_UAT_OPENGL32_DLL=out/release-uat/mesa/opengl32.dll" >> "$GITHUB_ENV"
 
       - name: Release UAT
         # Driven by the seed, not the rebuilt binary: the UAT tests the
@@ -966,6 +1191,51 @@ jobs:
         # every invocation (#1157) — Windows cannot replace a running
         # executable ("could not rename out/release/bin/with.exe.tmp").
         run: ./src/main.exe build :release-uat
+
+      - name: Fetch native hang capture tool (test channel)
+        if: ${{ failure() && inputs.channel == 'test' }}
+        run: |
+          curl -fL -o out/procdump.zip https://download.sysinternals.com/files/Procdump.zip
+          7z x -y -oout/procdump out/procdump.zip
+          mkdir -p out/package-dumps/bzip2 out/package-dumps/libcurl
+
+      - name: Diagnose bzip2 check (test channel)
+        if: ${{ failure() && inputs.channel == 'test' }}
+        timeout-minutes: 3
+        continue-on-error: true
+        working-directory: out/release-uat/bzip2-project
+        env:
+          WITH_PROFILE: '1'
+        run: ../../procdump/procdump64a.exe -accepteula -mm -n 3 -s 15 -x ../../package-dumps/bzip2 ../../release/bin/with.exe check src/main.w
+
+      - name: Diagnose libcurl check (test channel)
+        if: ${{ failure() && inputs.channel == 'test' }}
+        timeout-minutes: 3
+        continue-on-error: true
+        working-directory: out/release-uat/libcurl-project
+        env:
+          WITH_PROFILE: '1'
+        run: ../../procdump/procdump64a.exe -accepteula -mm -n 3 -s 15 -x ../../package-dumps/libcurl ../../release/bin/with.exe check src/main.w
+
+      - name: Inspect spiral DLL integrity (test channel)
+        if: ${{ failure() && inputs.channel == 'test' }}
+        continue-on-error: true
+        run: |
+          sha256sum "$WITH_UAT_OPENGL32_DLL" out/release-uat/raylib-spiral-project/out/bin/opengl32.dll
+          "$LLVM_PREFIX/bin/llvm-readobj.exe" --file-headers "$WITH_UAT_OPENGL32_DLL" out/release-uat/raylib-spiral-project/out/bin/opengl32.dll
+          ls -l out/release-uat/raylib-spiral-project/out/bin
+
+      - name: Preserve native package failure evidence (test channel)
+        if: ${{ failure() && inputs.channel == 'test' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-failures-windows-aarch64
+          retention-days: 7
+          path: |
+            out/package-dumps
+            out/release/bin/with.exe
+            out/release/bin/*.pdb
+            out/release-uat/raylib-spiral-project/out/bin/opengl32.dll
 
       - name: Package fixpoint-verified release asset
         run: |
@@ -1012,4 +1282,3 @@ jobs:
           RELEASE_BUILDER: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} (windows-aarch64)
           RELEASE_REPO: ${{ github.repository }}
         run: ./out/release/bin/with.exe build :publish-release-asset
-
