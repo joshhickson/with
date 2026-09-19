@@ -1593,10 +1593,42 @@ impl Sema:
         if self.alloc != 0 and has_global_allocator == 0:
             self.emit_error("alloc in no_std requires @[global_allocator]", fallback_node)
 
+    // #1196: a function with no return annotation gets its type from its body
+    // (§9.1, D43), so a caller checked before that body saw no type at all
+    // ("right operand of logical operator must be bool" for a bool function
+    // declared further down). Bodies that define a signature are checked first,
+    // in source order; the rest follow. Declaration order no longer matters to
+    // a caller whose own return type is written.
     mut fn check_bodies():
+        self.check_bodies_where(false)
+        self.check_bodies_where(true)
+        // A call typed before its callee's body was: wrong only if that body
+        // turned out to produce a value.
+        let saved_file_id = self.local_file_id
+        var ci = 0
+        while ci + 3 < self.untyped_callee_calls.len() as i32:
+            let call_node: i32 = self.untyped_callee_calls[ci]
+            let call_sig: i32 = self.untyped_callee_calls[ci + 1]
+            let call_file: i32 = self.untyped_callee_calls[ci + 3]
+            if self.sig_return_type(call_sig) != self.ty_void as i32:
+                let callee: str = with_str_clone_ref(self.pool_resolve(self.untyped_callee_calls[ci + 2]))
+                self.local_file_id = call_file
+                self.emit_error("the return type of '" ++ callee ++ "' was not known here: it comes from a body declared after this function's, and this function has no return type either; write either function's return type, or declare '" ++ callee ++ "' first", call_node)
+            ci = ci + 4
+        self.local_file_id = saved_file_id
+        self.validate_global_data_race_accesses()
+
+    mut fn check_bodies_where(annotated: bool):
         for di in 0..self.ast.decl_count():
             if self.decl_is_lazy_skipped(di):
                 continue
+            let candidate = self.ast.get_decl(di)
+            if self.ast.kind(candidate) == NodeKind.NK_FN_DECL:
+                let candidate_meta = self.ast.find_fn_meta(candidate)
+                // An entry point or test has a fixed contract: nothing reads its type.
+                let has_contract = (candidate_meta >= 0 and self.ast.fn_meta_ret(candidate_meta) != 0) or self.fn_decl_is_entry_point(candidate) != 0
+                if has_contract != annotated: continue
+            else if not annotated: continue
             self.update_decl_source_context(di)
             let decl = self.ast.get_decl(di)
             if self.ast.kind(decl) == NodeKind.NK_FN_DECL:
@@ -1645,7 +1677,6 @@ impl Sema:
                         if not is_generic_struct_method:
                             self.update_module_context(di)
                             self.check_fn_body_at(decl, di)
-        self.validate_global_data_race_accesses()
 
     mut fn record_global_concurrency_evidence(node: i32, reason: &str):
         if node == 0:
@@ -2296,6 +2327,7 @@ impl Sema:
             else:
                 let inferred_ret = self.infer_unannotated_function_return_type(body, body_ty)
                 self.set_sig_return_type(sig_idx, inferred_ret)
+            self.body_typed_sigs.insert(sig_idx, 1)
         else if body_expected_ret != 0 and body_expected_ret != self.ty_void and body_ty == self.ty_void:
             let explicit_void_results_ok = self.check_body_explicit_value_results(body, 1, body_expected_ret as i32, "return type mismatch")
             if explicit_void_results_ok != 0 and self.body_has_explicit_value_result(body, 1) != 0 and self.body_can_fall_through(body) != 0:
@@ -15778,6 +15810,17 @@ impl Sema:
                 self.note_allocation_site(node, AllocConstructKind.EXPLICIT_API, 0, 0)
             self.note_allocating_callee(node, fn_sym)
             let ret = self.sig_return_type(sig_idx) as i32
+            // #1196: a callee that takes its type from a body not checked yet
+            // reads as Unit. Often that is right (a procedure); check_bodies
+            // reports the calls where it was not.
+            if not self.body_typed_sigs.contains(sig_idx) and fn_sym != self.current_fn_symbol and self.fn_decl_nodes.contains(fn_sym):
+                let callee_decl: i32 = self.fn_decl_nodes.get(fn_sym).unwrap()
+                let callee_meta = self.ast.find_fn_meta(callee_decl)
+                if callee_meta >= 0 and self.ast.fn_meta_ret(callee_meta) == 0 and self.ast.fn_meta_tp_count(callee_meta) == 0 and self.fn_decl_is_entry_point(callee_decl) == 0:
+                    self.untyped_callee_calls.push(node)
+                    self.untyped_callee_calls.push(sig_idx)
+                    self.untyped_callee_calls.push(fn_sym)
+                    self.untyped_callee_calls.push(self.local_file_id)
             // Check arg count (supports default parameters via required-count
             // metadata packed into fn_meta flags by the parser).
             let expected = self.sig_get_param_count(sig_idx)
