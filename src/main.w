@@ -31,6 +31,7 @@ use InitTemplates
 use BuildGraphRuntime
 use BuildGraphCache
 use compiler.ClangDriver
+use compiler.GreenEvidence
 use compiler.DriverOptions
 use compiler.AbiStamp
 use compiler.Runtime
@@ -2366,7 +2367,7 @@ unsafe fn run_build_graph(root: &str, cfg: &ProjectConfig, graph: &BuildGraph, a
             completed_targets.push(with_str_clone_ref(target.name))
             continue
         if target.kind == 23:
-            if survey and survey_failed.len() > 0 and (target.name == "test-green" or target.name == "last-green"):
+            if survey and survey_failed.len() > 0 and (target.name == "test-green" or target.name == "last-green" or target.name == "last-green-record"):
                 with_eprint("survey: skipping evidence target '" ++ target.name ++ "' (earlier failures)")
                 continue
             if not build_action_worker_env_enabled():
@@ -2816,9 +2817,6 @@ fn cli_fast_install_blessed(root: &str, target_name: &str) -> i32:
         with_eprint("error: missing " ++ compiler_path ++ "; run `with build` first")
         return 1
     let manifest = with_fs_read_file(resolve_join(root, "out/.build-state/last-green.json"))
-    if manifest.len() == 0:
-        with_eprint("error: missing last-green manifest; run `with build :last-green` after build/fixpoint/test")
-        return 1
     let data = with_fs_read_file(compiler_path)
     if data.len() == 0:
         with_eprint("error: could not read " ++ compiler_path)
@@ -2826,8 +2824,15 @@ fn cli_fast_install_blessed(root: &str, target_name: &str) -> i32:
     var digest: [32]u8 = [0 as u8; 32]
     sha256_hash_str(data, &raw mut digest[0] as *mut u8)
     let sha = sha256_hex(&digest[0] as *const u8)
+    var verified_by = "verified against last-green"
     if not manifest.contains("\"compiler_sha256\": \"" ++ sha ++ "\""):
-        with_eprint("error: " ++ compiler_path ++ " is not the compiler recorded by last-green; run `with build`, `with build :fixpoint`, `with build :test`, then `with build :last-green`")
+        let green_commit = green_by_source_identity(root)
+        if green_commit.len() > 0: verified_by = "these sources are green: recorded at commit " ++ green_commit
+    if verified_by == "verified against last-green" and manifest.len() == 0:
+        with_eprint("error: missing last-green manifest, and no published green for these sources; run `with build :last-green` after build/fixpoint/test")
+        return 1
+    if verified_by == "verified against last-green" and not manifest.contains("\"compiler_sha256\": \"" ++ sha ++ "\""):
+        with_eprint("error: " ++ compiler_path ++ " is not the compiler recorded by last-green, and these sources have no published green (a dirty or changed tree never borrows one); run `with build`, `with build :fixpoint`, `with build :test`, then `with build :last-green`")
         return 1
     let gate_rc = reseed_gate_smoke(root, compiler_path)
     if gate_rc != 0:
@@ -2839,7 +2844,7 @@ fn cli_fast_install_blessed(root: &str, target_name: &str) -> i32:
     if with_fs_chmod(dest, 0o755) != 0:
         with_eprint("error: could not chmod " ++ dest)
         return 1
-    with_write("[" ++ target_name ++ "] " ++ dest ++ " <- out/release/bin/with (verified against last-green)\n")
+    with_write("[" ++ target_name ++ "] " ++ dest ++ " <- out/release/bin/with (" ++ verified_by ++ ")\n")
     0
 
 fn run_build_command(options: BuildCommandOptions, graph_options: &BuildGraphCommandOptions) -> i32:
