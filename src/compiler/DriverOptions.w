@@ -8,6 +8,7 @@ extern fn with_str_slice_ref(s: &str, start: i64, end: i64) -> str
 extern fn with_str_clone_ref(s: &str) -> str
 
 use Overflow
+use compiler.EmbeddedClangResourceData
 
 pub enum BuildOutputKind: i32:
     Binary = 0
@@ -325,6 +326,12 @@ pub fn driver_target_triple_kind(triple: &str) -> i32:
         return 5
     if triple == "aarch64-pc-windows-msvc" or triple == "arm64-pc-windows-msvc" or triple == "windows_aarch64":
         return 6
+    // WebAssembly. The import ABI is WASI preview1 whatever the OS field
+    // says, so the wasi/wasip1 spellings map to the same freestanding kind.
+    if triple == "wasm32" or triple == "wasm32-unknown-unknown" or triple == "wasm32-wasi" or triple == "wasm32-wasip1" or triple == "wasm32-unknown-wasi":
+        return 7
+    if triple == "wasm64" or triple == "wasm64-unknown-unknown" or triple == "wasm64-wasi" or triple == "wasm64-wasip1" or triple == "wasm64-unknown-wasi":
+        return 8
     -1
 
 pub type DriverTargetParseResult {
@@ -358,6 +365,11 @@ pub fn driver_parse_build_target(argc: i32) -> DriverTargetParseResult:
             let parsed = driver_target_triple_kind(value)
             if parsed < 0:
                 return DriverTargetParseResult { false, 0, true, "unsupported target triple '" ++ value ++ "'; see §18.5 for the accepted triples" }
+            // A wasm target needs LLVM's WebAssembly backend. A compiler linked
+            // against an SDK without it (build/compiler.w aliases the backend's
+            // entry points to a no-op then) says so here, before any codegen.
+            if (parsed == 7 or parsed == 8) and not embedded_llvm_wasm_backend_linked():
+                return DriverTargetParseResult { false, 0, true, "--target=" ++ value ++ " needs LLVM's WebAssembly backend, and this compiler was linked against an LLVM SDK built without it; rebuild the SDK with tools/build-static-llvm.sh (its default target set includes WebAssembly)" }
             kind = parsed
             explicit = true
     DriverTargetParseResult { true, kind, explicit, "" }
