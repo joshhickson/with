@@ -1113,11 +1113,10 @@ impl Sema:
         if kind == NodeKind.NK_TYPE_REF:
             let pointee = self.resolve_type_expr(self.ast.get_data0(node))
             let is_mut = self.ast.get_data1(node)
-            // docs/completed/mut.md Rev 8 §15.1 — at P12 lockdown, reject `&mut T` in
-            // type position. Use `mut self: Self`, `*mut T` (FFI), or
-            // owned-by-value parameters per the migration guide §16.
+            // Spec §3.1 (Reference Types): there is no `&mut T` in safe With.
+            // Use `mut self`, `*mut T` (FFI), or an owned-by-value parameter.
             if STRICT_NO_MUT_REF != 0 and is_mut != 0:
-                self.emit_error("`&mut T` is not part of safe With (§15.1); use mut self / *mut T (unsafe) / owned-by-value parameter", node)
+                self.emit_error("`&mut T` is not part of safe With (§3.1); use mut self / *mut T (unsafe) / owned-by-value parameter", node)
             return self.ensure_exact_type(TypeKind.TY_REF, pointee as i32, is_mut, 0)
 
         if kind == NodeKind.NK_TYPE_FN or kind == NodeKind.NK_TYPE_EXTERN_FN:
@@ -1207,7 +1206,7 @@ impl Sema:
             if op == UnaryOp.UOP_REF:
                 return self.ensure_exact_type(TypeKind.TY_REF, inner, 0, 0) as i32
             if op == UnaryOp.UOP_MUT_REF:
-                self.emit_error("`&mut T` is not part of safe With (§15.1); use mut self / *mut T (unsafe) / owned-by-value parameter", node)
+                self.emit_error("`&mut T` is not part of safe With (§3.1); use mut self / *mut T (unsafe) / owned-by-value parameter", node)
                 return self.ensure_exact_type(TypeKind.TY_REF, inner, 1, 0) as i32
             if op == UnaryOp.UOP_RAW_REF_CONST:
                 return self.ensure_exact_type(TypeKind.TY_PTR, inner, 0, 0) as i32
@@ -1803,7 +1802,15 @@ impl Sema:
         if self.global_race_concurrency_node != 0:
             let conc = self.global_race_concurrency_node
             diag.add_label(Span { file: self.global_race_concurrency_file, start: self.ast.get_start(conc), end: self.ast.get_end(conc) }, "program may run concurrently here (" ++ self.global_race_concurrency_reason ++ ")")
-        diag.add_help("use Atomic[T], wrap the state in a synchronization type, or assert the access with `unsafe`")
+        // §9.1c's worked example names the remedies for this global's own
+        // type: `use Atomic[i32], wrap in Mutex, or assert with `unsafe``.
+        var atomic = "Atomic[T]"
+        if self.global_value_decl_bindings.contains(sym):
+            let bind: i32 = self.global_value_decl_bindings.get(sym).unwrap()
+            let tid: i32 = self.bind_types[bind]
+            if tid != 0:
+                atomic = "Atomic[" ++ self.type_name(tid) ++ "]"
+        diag.add_help("use " ++ atomic ++ ", wrap in Mutex, or assert with `unsafe`")
         self.diags.emit(move diag)
 
     mut fn validate_global_data_race_accesses():
@@ -8939,7 +8946,7 @@ impl Sema:
                 let _ = self.record_contextual_copy_adjustment(operand_node, self.ty_bool as i32, operand as i32)
             return self.ty_bool as i32
         if op == UnaryOp.UOP_MUT_REF:
-            self.emit_error("`&mut` is not part of safe With (§15.1); use `&raw mut` for FFI or mutating receiver methods", node)
+            self.emit_error("`&mut` is not part of safe With (§3.1); use `&raw mut` for FFI or mutating receiver methods", node)
             return 0
         if op == UnaryOp.UOP_REF or op == UnaryOp.UOP_RAW_REF_CONST or op == UnaryOp.UOP_RAW_REF_MUT:
             let address_operand_node = self.unwrap_address_place_expr(operand_node)
