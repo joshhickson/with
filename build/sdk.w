@@ -435,6 +435,10 @@ fn sdk_package_tool_selected(rel: &str, platform: &str) -> bool:
         tools.push("bin/clang++.exe")
         tools.push("bin/clang-cl.exe")
         tools.push("bin/cmake.exe")
+        // The Ninja generator's RC dependency scanner; cmake looks for it
+        // beside cmake.exe and, when it is absent, silently emits the RC
+        // rule without it, so rc.exe gets the scanner's arguments (RC1107).
+        tools.push("bin/cmcldeps.exe")
         tools.push("bin/ninja.exe")
         tools.push("bin/lld-link.exe")
         tools.push("bin/wasm-ld.exe")
@@ -472,13 +476,17 @@ fn sdk_clang_driver_rel() -> str: "bin/clang-" ++ COMPILER_LLVM_VERSION.split(".
 
 // Everything the next SDK build needs from this package as its bootstrap
 // (sdk_validate_staged_paths asks for exactly these): the compiler driver,
-// its links, CMake with its module tree, and Ninja.
+// its links, CMake with its module tree and RC scanner, and Ninja; on
+// Windows also the MSVC-style driver and linker cmake's own build uses.
 fn sdk_bootstrap_set(platform: &str) -> Vec[str]:
     let set: Vec[str] = Vec.new()
     if sdk_platform_is_windows(platform):
         set.push("bin/clang.exe")
         set.push("bin/clang++.exe")
+        set.push("bin/clang-cl.exe")
+        set.push("bin/lld-link.exe")
         set.push("bin/cmake.exe")
+        set.push("bin/cmcldeps.exe")
         set.push("bin/ninja.exe")
     else:
         set.push("bin/clang")
@@ -530,6 +538,12 @@ fn sdk_package_entries(ctx: &ActionCtx, prefix: &str, sdk_base: &str, platform: 
             if fs.exists(sdk_join(prefix, "bin/" ++ alias)):
                 entries.push(archive_symlink_entry("lld", sdk_base ++ "/bin/" ++ alias, 0o777))
     entries
+
+// The resource compiler of the same Windows Kit as mt.exe (they share
+// bin/<version>/<arch>/). Left to PATH, CMake found a 2015 rc.exe that
+// rejects its flags: `fatal error RC1107: invalid usage` compiling
+// CMakeVersion.rc on both Windows lanes.
+fn sdk_windows_rc_from_mt(windows_mt: &str) -> str: sdk_dirname(windows_mt) ++ "/rc.exe"
 
 fn sdk_write_text(ctx: &ActionCtx, path: &str, text: &str) -> i32:
     let fs = ctx.fs()
@@ -831,6 +845,17 @@ pub fn run_sdk_cmake_action(ctx: ActionCtx) -> i32:
         configure.push("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded")
         configure.push("-DCMAKE_LINKER=" ++ sdk_abs(root, sdk_tool(bootstrap_prefix, "lld-link")))
         configure.push("-DCMAKE_MT=" ++ windows_mt)
+        configure.push("-DCMAKE_RC_COMPILER=" ++ sdk_windows_rc_from_mt(windows_mt))
+        // CMake links its executables with `/MANIFEST:EMBED
+        // /MANIFESTINPUT:cmake.version.manifest`, so the linker merges its
+        // own UAC block into that manifest. lld-link writes that block
+        // without an xmlns, and a lld-link built with libxml2 (the LLVM
+        // Windows releases a runner bootstraps from) merges it into
+        // `ms_asmv1:level` attributes Windows rejects: the built cmake.exe
+        // fails to start with "side-by-side configuration is incorrect".
+        // cmake.version.manifest already carries requestedExecutionLevel,
+        // so the linker's block is redundant; leave it out.
+        configure.push("-DCMAKE_EXE_LINKER_FLAGS=/MANIFESTUAC:NO")
     rc = sdk_run_capture(ctx, "cmake-configure", configure, 600000)
     if rc != 0: return rc
     var build: Vec[str] = Vec.new()
@@ -1003,6 +1028,7 @@ pub fn run_sdk_llvm_action(ctx: ActionCtx) -> i32:
         if windows_mt.len() == 0:
             return sdk_fail(ctx, "SDK_WINDOWS_MT must name the Windows SDK mt.exe path for Windows SDK rebuilds")
         configure.push("-DCMAKE_MT=" ++ windows_mt)
+        configure.push("-DCMAKE_RC_COMPILER=" ++ sdk_windows_rc_from_mt(windows_mt))
     else:
         configure.push("-DCMAKE_C_COMPILER=" ++ sdk_abs(root, sdk_tool(bootstrap_prefix, "clang")))
         configure.push("-DCMAKE_CXX_COMPILER=" ++ sdk_abs(root, sdk_tool(bootstrap_prefix, "clang++")))
