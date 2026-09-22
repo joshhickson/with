@@ -1,27 +1,23 @@
 name: windows aarch64
 
 on:
-  # Restrict push to main so a PR-branch push does not trigger BOTH a push run
-  # and a pull_request run (the double-run that doubles runner usage). PRs are
-  # covered by pull_request; main pushes (merges) by push.
-  push:
-    branches: [main]
-    # Docs are not build inputs (D49): a docs-only merge starts no lane.
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-  pull_request:
+  # Lanes run nightly and on request; never on a push or a PR (D56, Eric
+  # 2026-09-22: CI was overzealous in what it did on every push). A lane
+  # takes hours on a 4-core runner (compiler build, fixpoint, battery), so
+  # it is not a merge signal: the seed-driven battery on the maintainer
+  # machine gates a PR and is posted on it. The SDK is built only on
+  # release (sdk-release.yml), never here.
+  schedule:
+    - cron: "20 9 * * *"
+  workflow_dispatch:
 
-# Cancel a superseded in-progress run when the same PR branch is re-pushed.
+# Never cancel a run: it is the evidence for that night's main.
 # Hardcode the platform token (not ${{ github.workflow }}) so a workflow
 # rename can never merge two platforms into one group and cancel each
 # other.
 concurrency:
   group: selfhost-tests-windows-arm64-${{ github.head_ref || github.ref }}
-  # A superseded PR-branch run is cancelled; a main run is never cancelled —
-  # it is the run that builds and caches the source-built SDK (hours), and
-  # every merge would otherwise restart it from zero.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   selfhost-windows-aarch64:
@@ -146,14 +142,10 @@ jobs:
           echo "UM_INCDIR=$WITH_WINDOWS_UM_INCDIR"
           command -v lld-link.exe && lld-link.exe --version || true
 
-      - uses: ./.github/actions/source-sdk
-        with:
-          host-tag: windows-aarch64-msvc
-
       - name: Build (seed -> stage1 -> stage2 -> stage3)
         run: ./src/main.exe build
 
-      - name: WebAssembly fixtures with source-built SDK
+      - name: WebAssembly fixtures
         run: ./src/main.exe build :wasm-tests
 
       - name: Fixpoint (stage2 == stage3)
