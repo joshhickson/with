@@ -179,3 +179,81 @@ pub fn mir_test_enum_payload_read() -> Unit:
     assert(payload_read_verdict(false, true).contains("enum payload read declares"))
     assert(payload_read_verdict(true, false) == "")
     assert(payload_read_verdict(false, false) == "")
+
+// #1229: an `aggregate` assigned to a slice-typed place. An array literal
+// passed to a `[]T` parameter was typed as the slice and lowered this way;
+// codegen passed the elements as {ptr, len} and the callee segfaulted while
+// this verifier said ok. A slice is produced by `slice`, never built from
+// fields; the same aggregate into an array-typed place is the literal itself.
+fn slice_aggregate_verdict(dest_is_slice: bool) -> str:
+    var mir_mod = MirModule.init()
+    for kind in [0, TypeKind.TY_INT, TypeKind.TY_ARRAY, TypeKind.TY_SLICE]:
+        mir_mod.sema_type_kinds.push(kind)
+        mir_mod.sema_type_d0.push(if kind == TypeKind.TY_INT: 0 else: 1)
+        mir_mod.sema_type_d1.push(if kind == TypeKind.TY_ARRAY: 2 else: 0)
+        mir_mod.sema_type_d2.push(0)
+    let int_ty = 1
+    let array_ty = 2
+    let slice_ty = 3
+    var body = MirBody.init_for_fn(1)
+    let dest_local = body.new_temp(if dest_is_slice: slice_ty else: array_ty)
+    let dest = body.new_place(dest_local)
+    let entry = body.new_block()
+    let fields: Vec[i32] = Vec.new()
+    let names: Vec[i32] = Vec.new()
+    for value in [5, 6]:
+        let element = body.new_const(ConstKind.CK_INT, value, 0, 0, int_ty)
+        fields.push(body.new_operand(OperandKind.OK_CONSTANT, element))
+        names.push(0)
+    let field_table = body.new_agg_fields(&fields, &names)
+    let aggregate = body.new_rvalue(RvalueKind.RK_AGGREGATE, 0, field_table, 0)
+    body.push_stmt(entry, StmtKind.Assign, dest, aggregate, 0)
+    body.set_terminator(entry, TermKind.TK_RETURN, 0, 0, 0, 0, 0)
+    let err = validate_typed_mir_body(mir_mod, body)
+    with_str_clone_ref(err.message)
+
+pub fn mir_test_slice_aggregate() -> Unit:
+    assert(slice_aggregate_verdict(true).contains("aggregate assigned to a slice-typed place"))
+    assert(slice_aggregate_verdict(false) == "")
+
+// #1230: a call through a fn-typed value with more arguments than its type
+// declares. MirLower resolved a parameter named `check` to
+// `std.builtins.check` by name and appended that fn's `loc = src()`
+// default; this verifier said ok and LLVM's rejected the call. The fn type
+// is `fn(i32)`: one parameter, whatever the argument count.
+fn indirect_arity_verdict(arg_count: i32) -> str:
+    var mir_mod = MirModule.init()
+    for kind in [0, TypeKind.TY_VOID, TypeKind.TY_INT, TypeKind.TY_FN]:
+        mir_mod.sema_type_kinds.push(kind)
+        mir_mod.sema_type_d0.push(0)
+        mir_mod.sema_type_d1.push(0)
+        mir_mod.sema_type_d2.push(0)
+    let unit_ty = 1
+    let int_ty = 2
+    let fn_ty = 3
+    mir_mod.sema_type_d0[fn_ty] = mir_mod.sema_type_extra.len() as i32
+    mir_mod.sema_type_d1[fn_ty] = 1
+    mir_mod.sema_type_d2[fn_ty] = unit_ty
+    mir_mod.sema_type_extra.push(int_ty)
+    var body = MirBody.init_for_fn(1)
+    let callee_local = body.new_temp(fn_ty)
+    let callee_place = body.new_place(callee_local)
+    let result_local = body.new_temp(unit_ty)
+    let result_place = body.new_place(result_local)
+    let entry = body.new_block()
+    let done = body.new_block()
+    let callee_operand = body.new_operand(OperandKind.OK_COPY, callee_place)
+    let args: Vec[i32] = Vec.new()
+    for i in 0..arg_count:
+        let argument = body.new_const(ConstKind.CK_INT, i, 0, 0, int_ty)
+        args.push(body.new_operand(OperandKind.OK_CONSTANT, argument))
+    let call_id = body.new_call_args(&args)
+    body.set_terminator(entry, TermKind.TK_CALL, callee_operand, call_id, result_place, done, 0)
+    body.set_terminator(done, TermKind.TK_RETURN, 0, 0, 0, 0, 0)
+    let err = validate_typed_mir_body(mir_mod, body)
+    with_str_clone_ref(err.message)
+
+pub fn mir_test_indirect_call_arity() -> Unit:
+    assert(indirect_arity_verdict(2).contains("indirect call passes 2 argument(s) but the callee's fn type declares 1"))
+    assert(indirect_arity_verdict(0).contains("declares 1"))
+    assert(indirect_arity_verdict(1) == "")
