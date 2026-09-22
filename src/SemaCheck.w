@@ -10039,8 +10039,10 @@ impl Sema:
                 // origin already reachable through that place. For `&pair`
                 // where `pair` contains `&value`, retaining only `pair` loses
                 // `value` at the next projection and admits mutation through a
-                // live `&&T` (D22 Rule 10).
-                out = self.push_unique_i32(move out, self.place_root_sym(operand))
+                // live `&&T` (D22 Rule 10). Through a reference-typed root the
+                // place's storage is the pointee, so only the root's own
+                // origins count (#1297).
+                out = self.push_unique_i32(move out, self.ref_storage_root_sym(operand))
                 out = self.collect_expr_view_deps(operand, move out)
             else:
                 out = self.collect_expr_view_deps(self.ast.get_data1(node), move out)
@@ -10414,7 +10416,7 @@ impl Sema:
         if expr_node == 0:
             return
         if self.ast.kind(expr_node) == NodeKind.NK_UNARY and self.ast.get_data0(expr_node) == UnaryOp.UOP_REF:
-            let origin_sym = self.place_root_sym(self.ast.get_data1(expr_node))
+            let origin_sym = self.ref_storage_root_sym(self.ast.get_data1(expr_node))
             if self.view_origin_is_stack_local(origin_sym) != 0:
                 let origin_name: str = with_str_clone_ref(self.pool_resolve(origin_sym))
                 self.emit_error("yielded view may outlive its origin '" ++ origin_name ++ "'", report_node)
@@ -10457,7 +10459,7 @@ impl Sema:
                         let init_node: i32 = self.binding_value_nodes.get(view_sym).unwrap()
                         let init_kind = self.ast.kind(init_node)
                         if init_kind == NodeKind.NK_UNARY and self.ast.get_data0(init_node) == UnaryOp.UOP_REF:
-                            let origin_sym = self.place_root_sym(self.ast.get_data1(init_node))
+                            let origin_sym = self.ref_storage_root_sym(self.ast.get_data1(init_node))
                             if self.view_origin_is_stack_local(origin_sym) != 0:
                                 let origin_name: str = with_str_clone_ref(self.pool_resolve(origin_sym))
                                 self.emit_error("yielded view may outlive its origin '" ++ origin_name ++ "'", report_node)
@@ -10483,7 +10485,7 @@ impl Sema:
         if self.reject_view_into_temporary(expr_node, "returns") != 0:
             return
         if self.ast.kind(expr_node) == NodeKind.NK_UNARY and self.ast.get_data0(expr_node) == UnaryOp.UOP_REF:
-            let origin_sym = self.place_root_sym(self.ast.get_data1(expr_node))
+            let origin_sym = self.ref_storage_root_sym(self.ast.get_data1(expr_node))
             if self.view_origin_is_stack_local(origin_sym) != 0:
                 let origin_name: str = with_str_clone_ref(self.pool_resolve(origin_sym))
                 self.emit_error("returned view may outlive its origin '" ++ origin_name ++ "'", report_node)
@@ -10526,7 +10528,7 @@ impl Sema:
                         let init_node: i32 = self.binding_value_nodes.get(view_sym).unwrap()
                         let init_kind = self.ast.kind(init_node)
                         if init_kind == NodeKind.NK_UNARY and self.ast.get_data0(init_node) == UnaryOp.UOP_REF:
-                            let origin_sym = self.place_root_sym(self.ast.get_data1(init_node))
+                            let origin_sym = self.ref_storage_root_sym(self.ast.get_data1(init_node))
                             if self.view_origin_is_stack_local(origin_sym) != 0:
                                 let origin_name: str = with_str_clone_ref(self.pool_resolve(origin_sym))
                                 self.emit_error("returned view may outlive its origin '" ++ origin_name ++ "'", report_node)
@@ -11145,6 +11147,8 @@ impl Sema:
             self.scope_put(binding, elem_type, 0)
         if yields_views != 0 and binding != 0:
             self.scope_set_is_view_bound(binding)
+        if binding != 0 and not self.ast.for_binding_is_pattern(node) and self.type_is_ephemeral_value(elem_type) != 0:
+            self.record_for_binding_view_origins(binding, iterable)
         let for_meta = self.ast.find_for_meta(node)
         var label = 0
         if for_meta >= 0:
@@ -11169,6 +11173,22 @@ impl Sema:
         self.pop_scope()
         self.pop_move_control_flow_context()
         self.ty_void as i32
+
+    // #1297 / D44: `for x in xs` is `xs.iter()`, so the loop binding is a view
+    // produced from the iterated place and carries its origins the way
+    // record_view_producer_origins records them for the spelled call: the
+    // parameter mask, the collected deps, else the iterated place's root (a
+    // local collection, so `&x.field` cannot escape). It registers no borrow
+    // of that root — a whole-root borrow of `self` would reject
+    // `for e in self.items: self.count += 1`; #1317 tracks the missing
+    // live-view check on the iterated collection.
+    fn record_for_binding_view_origins(sym: i32, iterable: i32):
+        let param_mask = self.compute_expr_view_origin_mask(iterable)
+        var deps: Vec[i32] = Vec.new()
+        deps = self.collect_expr_view_deps(iterable, move deps)
+        if deps.len() == 0 and param_mask == 0:
+            deps = self.push_unique_i32(move deps, self.place_root_sym(iterable))
+        self.set_binding_view_deps(sym, param_mask, deps)
 
     fn struct_field_info_by_index(struct_type: i32, index: i32) -> i64:
         if struct_type == 0:
@@ -23571,6 +23591,25 @@ impl Sema:
                 return self.place_root_sym(self.ast.get_data1(node))
         0
 
+    // #1297 / §21.1 rule 10: the binding whose OWN storage `&place` borrows.
+    // A place projected through a reference-typed root (`&e.value` with
+    // `e: &KV`, `&v[i]` with `v: &Vec[KV]`) borrows the pointee, whose origins
+    // the root binding already carries (its deps and parameter mask); the
+    // root is not the storage, and naming it pinned every field view of a
+    // loop or element binding to that binding. A bare `&e` borrows the
+    // reference's own slot and stays rooted at `e`.
+    fn ref_storage_root_sym(place: i32) -> i32:
+        var peeled = place
+        while peeled != 0 and self.ast.kind(peeled) == NodeKind.NK_GROUPED:
+            peeled = self.ast.get_data0(peeled)
+        let root = self.place_root_sym(peeled)
+        if root == 0 or self.ast.kind(peeled) == NodeKind.NK_IDENT:
+            return root
+        let root_ty = self.scope_lookup(root)
+        if root_ty > 0 and self.get_type_kind(self.resolve_alias(root_ty as TypeId)) == TypeKind.TY_REF:
+            return 0
+        root
+
 // ── docs/completed/mut.md Rev 8 §2 — Place classification ──────────────────
 //
 // The mutation model is built on the concept of a *place* — a storage
@@ -24860,15 +24899,18 @@ impl Sema:
             if self.get_type_kind(seq_resolved) == TypeKind.TY_ARRAY or self.get_type_kind(seq_resolved) == TypeKind.TY_SLICE:
                 let seq_elem = self.get_type_d0(seq_resolved)
                 return if self.type_needs_drop(seq_elem) != 0 and self.is_copy(seq_elem as TypeId) == 0: 1 else: 0
-            if self.get_type_kind(bare_resolved) == TypeKind.TY_GENERIC_INST and self.get_generic_inst_arg_count(bare_resolved as i32) > 0:
-                if self.pool_resolve(self.get_type_d0(bare_resolved)) == "Vec":
-                    let bare_elem = self.get_generic_inst_arg(bare_resolved as i32, 0)
+            // A `&Vec[T]` / `&HashMap[K, V]` iterable (a borrowed parameter,
+            // a match-bound payload) yields the same views as the owned
+            // collection (#1297).
+            if self.get_type_kind(seq_resolved) == TypeKind.TY_GENERIC_INST and self.get_generic_inst_arg_count(seq_resolved as i32) > 0:
+                if self.pool_resolve(self.get_type_d0(seq_resolved)) == "Vec":
+                    let bare_elem = self.get_generic_inst_arg(seq_resolved as i32, 0)
                     if self.type_needs_drop(bare_elem) != 0 and self.is_copy(bare_elem as TypeId) == 0:
                         return 1
                 // D44: a map's Drop-class keys and values bind as views too.
-                if self.pool_resolve(self.get_type_d0(bare_resolved)) == "HashMap" and self.get_generic_inst_arg_count(bare_resolved as i32) >= 2:
+                if self.pool_resolve(self.get_type_d0(seq_resolved)) == "HashMap" and self.get_generic_inst_arg_count(seq_resolved as i32) >= 2:
                     for ai in 0..2:
-                        let map_elem = self.get_generic_inst_arg(bare_resolved as i32, ai)
+                        let map_elem = self.get_generic_inst_arg(seq_resolved as i32, ai)
                         if self.type_needs_drop(map_elem) != 0 and self.is_copy(map_elem as TypeId) == 0:
                             return 1
         if self.ast.kind(iterable) != NodeKind.NK_CALL:
