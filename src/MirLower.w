@@ -2606,10 +2606,11 @@ impl MirBuilder:
             return index
         self.variant_index(variant_sym)
 
-    fn enum_variant_discriminant_for_type(enum_ty: i32, variant_sym: i32) -> i32:
-        let disc = self.sema.enum_variant_discriminant_for_type(enum_ty, variant_sym)
-        if disc >= 0:
-            return disc
+    // A discriminant is any i64 (`B = -3`); whether `enum_ty` declares the
+    // variant is asked of its index (#1451).
+    fn enum_variant_discriminant_for_type(enum_ty: i32, variant_sym: i32) -> i64:
+        if self.sema.enum_variant_index_for_type(enum_ty, variant_sym) >= 0:
+            return self.sema.enum_variant_discriminant_for_type(enum_ty, variant_sym)
         self.variant_index(variant_sym)
 
     // Resolve variant sym from an AST node, checking sema's comprehension sidecar first.
@@ -3907,7 +3908,7 @@ impl MirBuilder:
             let vl_decl_ty: i32 = if self.sema.variant_type_ids.contains(vl_sym): self.sema.variant_type_ids.get(vl_sym).unwrap() else: self.sema.variant_type_ids.get(sym).unwrap()
             // #671: same guard as the constructor-call path — an ambient
             // expectation that does not carry this variant must not retype it.
-            var vl_result_ty = if self.expected_type != 0 and self.sema.enum_variant_discriminant_for_type(self.expected_type, vl_sym) >= 0: self.expected_type else: type_id
+            var vl_result_ty = if self.expected_type != 0 and self.sema.enum_variant_index_for_type(self.expected_type, vl_sym) >= 0: self.expected_type else: type_id
             if vl_result_ty == 0 or vl_result_ty == self.sema.ty_void as i32:
                 vl_result_ty = vl_decl_ty
             // #1455: the aggregate names its variant by index; only the
@@ -3922,14 +3923,7 @@ impl MirBuilder:
             let vl_resolved = self.sema.resolve_alias(vl_decl_ty)
             let vl_is_disc_enum = self.sema.disc_repr_types.contains(vl_resolved as i32)
             if vl_is_disc_enum and not self.sema.disc_has_payload.contains(vl_resolved as i32):
-                var vl_disc_val = self.enum_variant_discriminant_for_type(vl_decl_ty, vl_sym)
-                if self.sema.disc_values.contains(vl_sym):
-                    vl_disc_val = self.sema.disc_values.get(vl_sym).unwrap()
-                else:
-                    let vl_bare_sym = self.sema.unqualified_enum_variant_sym(vl_sym)
-                    if self.sema.disc_values.contains(vl_bare_sym):
-                        vl_disc_val = self.sema.disc_values.get(vl_bare_sym).unwrap()
-                return self.int_const_operand(vl_disc_val, vl_result_ty)
+                return self.int_const_operand(self.enum_variant_discriminant_for_type(vl_decl_ty, vl_sym), vl_result_ty)
             let vl_fields: Vec[i32] = Vec.new()
             let vl_names: Vec[i32] = Vec.new()
             let vl_fid = self.body.new_agg_fields(vl_fields, vl_names)
@@ -5006,7 +5000,7 @@ impl MirBuilder:
         let end_bb = self.new_block()
         let lhs_read = self.body.new_operand(OperandKind.OK_COPY, result_place)
         // Use switch_int: value 1 (true) goes to one target, default goes to other
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         if op == 12:
@@ -5135,7 +5129,7 @@ impl MirBuilder:
             return self.unit_operand()
 
         let disc = self.lower_enum_discriminant(branch_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(continue_idx)
         let targets: Vec[i32] = Vec.new()
         targets.push(pass_bb as i32)
@@ -6756,7 +6750,7 @@ impl MirBuilder:
         let else_bb = self.new_block()
         let join_bb = self.new_block()
 
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(then_bb as i32)
@@ -6976,7 +6970,7 @@ impl MirBuilder:
         else:
             cond_op = self.lower_expr(cond_expr)
         self.finish_stmt_temp_frame(cond_frame)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -7025,7 +7019,7 @@ impl MirBuilder:
 
         self.switch_to(cond_bb)
         let cond_op = self.lower_expr(cond_expr)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -7219,7 +7213,7 @@ impl MirBuilder:
         self.switch_to(after_next_bb)
         let disc = self.lower_enum_discriminant(next_place)
         let some_idx = self.success_variant_index()
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(some_idx)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -7388,7 +7382,7 @@ impl MirBuilder:
             let pass_bb = self.new_block()
             let skip_bb = self.new_block()
             let cond_op = self.lower_expr(filter)
-            let vals: Vec[i32] = Vec.new()
+            let vals: Vec[i64] = Vec.new()
             vals.push(1)
             let targets: Vec[i32] = Vec.new()
             targets.push(pass_bb as i32)
@@ -7441,7 +7435,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(iter_expr))
         let cmp_result = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -7496,7 +7490,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(range_node))
         let cmp_result = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -7548,7 +7542,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(iter_expr))
         let cmp_read = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -7613,7 +7607,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(iter_expr))
         let cmp_read = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -7697,7 +7691,7 @@ impl MirBuilder:
         self.switch_to(after_next_bb)
         let disc = self.lower_enum_discriminant(next_place)
         let some_idx = self.success_variant_index()
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(some_idx)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -7726,7 +7720,7 @@ impl MirBuilder:
         if clause_filter != 0:
             let pass_bb = self.new_block()
             let cond_op = self.lower_expr(clause_filter)
-            let fvals: Vec[i32] = Vec.new()
+            let fvals: Vec[i64] = Vec.new()
             fvals.push(1)
             let ftargets: Vec[i32] = Vec.new()
             ftargets.push(pass_bb as i32)
@@ -7884,7 +7878,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(iter_expr))
         let cmp_result = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -7956,7 +7950,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(range_node))
         let cmp_result = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -8092,7 +8086,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(iter_expr))
         let cmp_read = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -8178,7 +8172,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(iter_expr))
         let cmp_read = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -8299,7 +8293,7 @@ impl MirBuilder:
         let more_local = self.new_temp(self.sema.ty_bool)
         let more_place = self.place_for_local(more_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, more_place, more_rv, span)
-        let more_vals: Vec[i32] = Vec.new()
+        let more_vals: Vec[i64] = Vec.new()
         more_vals.push(1)
         let more_targets: Vec[i32] = Vec.new()
         more_targets.push(body_bb as i32)
@@ -8311,7 +8305,7 @@ impl MirBuilder:
         let occupied_local = self.new_temp(self.sema.ty_i32)
         let occupied_place = self.place_for_local(occupied_local)
         self.emit_map_slot_call(MirIntrinsic.MAP_SLOT_OCCUPIED, map_place, slot_place, occupied_place)
-        let empty_vals: Vec[i32] = Vec.new()
+        let empty_vals: Vec[i64] = Vec.new()
         empty_vals.push(0)
         let empty_targets: Vec[i32] = Vec.new()
         empty_targets.push(inc_bb as i32)
@@ -8431,7 +8425,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(iter_expr))
         let cmp_read = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -8446,7 +8440,7 @@ impl MirBuilder:
         let occupied_place = self.place_for_local(occupied_local)
         self.emit_map_slot_call(MirIntrinsic.MAP_SLOT_OCCUPIED, map_place, counter_place, occupied_place)
         let live_bb = self.new_block()
-        let occupied_vals: Vec[i32] = Vec.new()
+        let occupied_vals: Vec[i64] = Vec.new()
         occupied_vals.push(0)
         let occupied_targets: Vec[i32] = Vec.new()
         occupied_targets.push(inc_bb as i32)
@@ -8523,7 +8517,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(vec_expr))
         let cmp_read = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -8593,7 +8587,7 @@ impl MirBuilder:
         self.emit_wait_cancel_check()
         let disc = self.lower_enum_discriminant(opt_place)
         let some_disc = self.enum_variant_discriminant_for_type(opt_ty, self.sema.syms.some)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(some_disc)
         let targets: Vec[i32] = Vec.new()
         targets.push(bind_bb as i32)
@@ -8671,7 +8665,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(vec_expr))
         let cmp_read = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(body_bb as i32)
@@ -8834,7 +8828,7 @@ impl MirBuilder:
         let self_cancel_bb = self.new_block()
         let unwind_bb = self.new_block()
         let normal_bb = self.new_block()
-        let sw_vals1: Vec[i32] = Vec.new()
+        let sw_vals1: Vec[i64] = Vec.new()
         sw_vals1.push(0)
         let sw_tgts1: Vec[i32] = Vec.new()
         sw_tgts1.push(check_child_bb)
@@ -8875,7 +8869,7 @@ impl MirBuilder:
         self.switch_to(check_child_cont)
 
         // Branch: 0 → normal, else: → unwind
-        let sw_vals2: Vec[i32] = Vec.new()
+        let sw_vals2: Vec[i64] = Vec.new()
         sw_vals2.push(0)
         let sw_tgts2: Vec[i32] = Vec.new()
         sw_tgts2.push(normal_bb)
@@ -8928,7 +8922,7 @@ impl MirBuilder:
         self.switch_to(check_bb)
         let continue_bb = self.new_block()
         let unwind_bb = self.new_block()
-        let sw_vals: Vec[i32] = Vec.new()
+        let sw_vals: Vec[i64] = Vec.new()
         sw_vals.push(0)
         let sw_tgts: Vec[i32] = Vec.new()
         sw_tgts.push(continue_bb)
@@ -8981,7 +8975,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_tmp)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(pat_node))
         let cmp_op = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(arm_bb)
@@ -9060,7 +9054,7 @@ impl MirBuilder:
         let captures_opt_place = self.lower_regex_captures_places(regex_place, scrutinee_place)
         self.remember_regex_pattern_captures(pat_node, captures_opt_place)
         let result_op = self.lower_option_is_some_place(captures_opt_place, self.regex_captures_option_type())
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(1)
         let targets: Vec[i32] = Vec.new()
         targets.push(arm_bb)
@@ -9138,12 +9132,13 @@ impl MirBuilder:
             let variant_sym = self.resolve_variant_sym(pat_node)
             let payload_start = self.ast.get_data1(pat_node)
             let payload_count = self.ast.get_data2(pat_node)
-            let variant_idx = self.variant_index(variant_sym)
-            var disc_idx = variant_idx
-            // For disc enums, use the actual discriminant value
-            if self.sema.variant_lookup.contains(variant_sym):
-                if self.sema.disc_values.contains(variant_sym):
-                    disc_idx = self.sema.disc_values.get(variant_sym).unwrap()
+            // The downcast names the variant by index; the switch compares the
+            // subject's tag with the variant's discriminant, an i64 of the
+            // subject's own enum (a by-name lookup answered for whichever enum
+            // last declared the name, #1451).
+            let variant_enum_ty = self.place_local_type(variant_subject_place)
+            let variant_idx = self.enum_variant_index_for_type(variant_enum_ty, variant_sym)
+            let variant_disc = self.enum_variant_discriminant_for_type(variant_enum_ty, variant_sym)
             var success_bb = arm_bb
             var needs_payload_checks = false
             let variant_place = self.body.new_downcast_place(variant_subject_place, variant_idx)
@@ -9159,8 +9154,8 @@ impl MirBuilder:
             if needs_payload_checks:
                 success_bb = self.new_block() as i32
             let disc = self.lower_enum_discriminant(variant_subject_place)
-            let vals: Vec[i32] = Vec.new()
-            vals.push(disc_idx)
+            let vals: Vec[i64] = Vec.new()
+            vals.push(variant_disc)
             let targets: Vec[i32] = Vec.new()
             targets.push(success_bb)
             let table = self.body.new_switch_table(vals, targets)
@@ -9220,7 +9215,7 @@ impl MirBuilder:
             self.body.push_stmt(self.cur_bb, StmtKind.Assign, ge_place, ge_rv, self.ast.get_start(pat_node))
             let ge_op = self.body.new_operand(OperandKind.OK_COPY, ge_place)
             let range_hi_bb = self.new_block()
-            let ge_vals: Vec[i32] = Vec.new()
+            let ge_vals: Vec[i64] = Vec.new()
             ge_vals.push(1)
             let ge_targets: Vec[i32] = Vec.new()
             ge_targets.push(range_hi_bb as i32)
@@ -9234,7 +9229,7 @@ impl MirBuilder:
             let le_place = self.place_for_local(le_tmp)
             self.body.push_stmt(self.cur_bb, StmtKind.Assign, le_place, le_rv, self.ast.get_start(pat_node))
             let le_op = self.body.new_operand(OperandKind.OK_COPY, le_place)
-            let le_vals: Vec[i32] = Vec.new()
+            let le_vals: Vec[i64] = Vec.new()
             le_vals.push(1)
             let le_targets: Vec[i32] = Vec.new()
             le_targets.push(arm_bb)
@@ -9309,7 +9304,7 @@ impl MirBuilder:
             self.terminate(TermKind.TK_CALL, tb_fn_op, tb_args_id, tb_result_place, tb_switch_bb)
             self.switch_to(tb_switch_bb)
             let tb_cmp_op = self.body.new_operand(OperandKind.OK_COPY, tb_result_place)
-            let tb_vals: Vec[i32] = Vec.new()
+            let tb_vals: Vec[i64] = Vec.new()
             tb_vals.push(1)
             let tb_targets: Vec[i32] = Vec.new()
             tb_targets.push(arm_bb)
@@ -9502,7 +9497,10 @@ impl MirBuilder:
             let bind_start = self.ast.get_data1(pat_node)
             let bind_count = self.ast.get_data2(pat_node)
             let variant_subject_place = self.pattern_shape_place(scrutinee_place)
-            let variant_place = self.body.new_downcast_place(variant_subject_place, self.variant_index(variant_sym))
+            // The same variant index the match test's downcast names.
+            let variant_enum_ty = self.place_local_type(variant_subject_place)
+            let variant_idx = self.enum_variant_index_for_type(variant_enum_ty, variant_sym)
+            let variant_place = self.body.new_downcast_place(variant_subject_place, variant_idx)
             for bi in 0..bind_count:
                 let raw = self.ast.get_extra(bind_start + bi)
                 let inner_pat = self.pattern_payload_node(pat_node, raw)
@@ -9858,7 +9856,7 @@ impl MirBuilder:
                 self.finish_stmt_temp_frame(guard_temp_frame)
                 let guard_pass_bb = self.new_block()
                 let guard_fail_bb = self.new_block()
-                let vals: Vec[i32] = Vec.new()
+                let vals: Vec[i64] = Vec.new()
                 vals.push(1)
                 let targets: Vec[i32] = Vec.new()
                 targets.push(guard_pass_bb as i32)
@@ -11794,7 +11792,10 @@ impl MirBuilder:
         if accessor_kind == 1:
             let recv_place = self.lower_field_base_place(self_expr)
             let disc = self.lower_enum_discriminant(recv_place)
-            let expected = self.int_const_operand(variant_disc, self.sema.ty_i32)
+            // Compared at the discriminant's own type: the repr of a repr
+            // enum, whose discriminant may not fit an i32 (#1451).
+            let disc_ty = self.enum_discriminant_type(recv_place)
+            let expected = self.int_const_operand(variant_disc, disc_ty)
             let cmp_rv = self.body.new_rvalue(RvalueKind.RK_BIN_OP, BinaryOp.OP_EQ, disc, expected)
             let cmp_tmp = self.new_temp(self.sema.ty_bool as i32)
             let cmp_place = self.place_for_local(cmp_tmp)
@@ -11827,7 +11828,7 @@ impl MirBuilder:
         let join_bb = self.new_block()
 
         let disc = self.lower_enum_discriminant(recv_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(variant_disc)
         let targets: Vec[i32] = Vec.new()
         targets.push(some_bb as i32)
@@ -11874,7 +11875,7 @@ impl MirBuilder:
         let join_bb = self.new_block()
 
         let disc = self.lower_enum_discriminant(value_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(self.success_variant_index())
         let targets: Vec[i32] = Vec.new()
         targets.push(pass_bb as i32)
@@ -12043,7 +12044,7 @@ impl MirBuilder:
         let join_bb = self.new_block()
 
         let disc = self.lower_enum_discriminant(value_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(self.success_variant_index())
         let targets: Vec[i32] = Vec.new()
         targets.push(some_bb as i32)
@@ -12245,7 +12246,7 @@ impl MirBuilder:
         let join_bb = self.new_block()
 
         let disc = self.lower_enum_discriminant(value_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(self.enum_variant_discriminant_for_type(value_ty, self.sema.syms.some))
         let targets: Vec[i32] = Vec.new()
         targets.push(some_bb as i32)
@@ -12267,7 +12268,7 @@ impl MirBuilder:
         let some_downcast = self.body.new_downcast_place(value_place, some_idx)
         let inner_result_place = self.body.new_field_place(some_downcast, 0, inner_result_ty)
         let inner_disc = self.lower_enum_discriminant(inner_result_place)
-        let inner_vals: Vec[i32] = Vec.new()
+        let inner_vals: Vec[i64] = Vec.new()
         inner_vals.push(self.enum_variant_discriminant_for_type(inner_result_ty, self.sema.syms.ok))
         let inner_targets: Vec[i32] = Vec.new()
         inner_targets.push(inner_ok_bb as i32)
@@ -12328,7 +12329,7 @@ impl MirBuilder:
         let join_bb = self.new_block()
 
         let disc = self.lower_enum_discriminant(value_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(self.enum_variant_discriminant_for_type(value_ty, self.sema.syms.ok))
         let targets: Vec[i32] = Vec.new()
         targets.push(ok_bb as i32)
@@ -12354,7 +12355,7 @@ impl MirBuilder:
         let ok_downcast = self.body.new_downcast_place(value_place, ok_idx)
         let inner_option_place = self.body.new_field_place(ok_downcast, 0, inner_option_ty)
         let inner_disc = self.lower_enum_discriminant(inner_option_place)
-        let inner_vals: Vec[i32] = Vec.new()
+        let inner_vals: Vec[i64] = Vec.new()
         inner_vals.push(self.enum_variant_discriminant_for_type(inner_option_ty, self.sema.syms.some))
         let inner_targets: Vec[i32] = Vec.new()
         inner_targets.push(inner_some_bb as i32)
@@ -12432,7 +12433,7 @@ impl MirBuilder:
         let none_bb = self.new_block()
         let join_bb = self.new_block()
         let disc = self.lower_enum_discriminant(value_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(self.enum_variant_discriminant_for_type(value_ty, self.sema.syms.some))
         let targets: Vec[i32] = Vec.new()
         targets.push(some_bb as i32)
@@ -12484,7 +12485,7 @@ impl MirBuilder:
         let join_bb = self.new_block()
         let wanted_variant = if method_name == "ok": self.sema.syms.ok else: self.sema.syms.err
         let disc = self.lower_enum_discriminant(value_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(self.enum_variant_discriminant_for_type(value_ty, wanted_variant))
         let targets: Vec[i32] = Vec.new()
         targets.push(wanted_bb as i32)
@@ -12541,7 +12542,7 @@ impl MirBuilder:
         let join_bb = self.new_block()
 
         let left_disc = self.lower_enum_discriminant(left_place)
-        let left_vals: Vec[i32] = Vec.new()
+        let left_vals: Vec[i64] = Vec.new()
         left_vals.push(self.enum_variant_discriminant_for_type(left_ty, self.sema.syms.some))
         let left_targets: Vec[i32] = Vec.new()
         left_targets.push(left_some_bb as i32)
@@ -12550,7 +12551,7 @@ impl MirBuilder:
 
         self.switch_to(left_some_bb)
         let right_disc = self.lower_enum_discriminant(right_place)
-        let right_vals: Vec[i32] = Vec.new()
+        let right_vals: Vec[i64] = Vec.new()
         right_vals.push(self.enum_variant_discriminant_for_type(right_ty, self.sema.syms.some))
         let right_targets: Vec[i32] = Vec.new()
         right_targets.push(right_some_bb as i32)
@@ -12611,7 +12612,7 @@ impl MirBuilder:
         let join_bb = self.new_block()
 
         let disc = self.lower_enum_discriminant(value_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(self.enum_variant_discriminant_for_type(value_ty, self.sema.syms.some))
         let targets: Vec[i32] = Vec.new()
         targets.push(some_bb as i32)
@@ -12736,7 +12737,7 @@ impl MirBuilder:
         let cmp_place = self.place_for_local(cmp_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, span)
         let cmp_read = self.body.new_operand(OperandKind.OK_COPY, cmp_place)
-        let header_vals: Vec[i32] = Vec.new()
+        let header_vals: Vec[i64] = Vec.new()
         header_vals.push(1)
         let header_targets: Vec[i32] = Vec.new()
         header_targets.push(body_bb as i32)
@@ -12754,7 +12755,7 @@ impl MirBuilder:
             let wrapper_op = self.lower_call_with_operand_args(mapper_op, call_args, wrapper_ty, node)
             wrapper_place = self.materialize_operand(wrapper_op, wrapper_ty, span)
         let item_disc = self.lower_enum_discriminant(wrapper_place)
-        let item_vals: Vec[i32] = Vec.new()
+        let item_vals: Vec[i64] = Vec.new()
         item_vals.push(self.enum_variant_discriminant_for_type(wrapper_ty, success_variant))
         let item_targets: Vec[i32] = Vec.new()
         item_targets.push(item_success_bb as i32)
@@ -12831,7 +12832,7 @@ impl MirBuilder:
         let result_place = self.place_for_local(result_local)
 
         let disc = self.lower_enum_discriminant(value_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(self.enum_variant_discriminant_for_type(value_ty, self.sema.syms.some))
         let targets: Vec[i32] = Vec.new()
         targets.push(some_bb as i32)
@@ -12863,7 +12864,7 @@ impl MirBuilder:
             let keep_op = self.lower_call_with_operand_args(mapper_op, filter_args, self.sema.ty_bool as i32, node)
             let keep_bb = self.new_block()
             let reject_bb = self.new_block()
-            let keep_vals: Vec[i32] = Vec.new()
+            let keep_vals: Vec[i64] = Vec.new()
             keep_vals.push(1)
             let keep_targets: Vec[i32] = Vec.new()
             keep_targets.push(keep_bb as i32)
@@ -12985,7 +12986,7 @@ impl MirBuilder:
         let result_place = self.place_for_local(result_local)
 
         let disc = self.lower_enum_discriminant(value_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(self.enum_variant_discriminant_for_type(value_ty, self.sema.syms.ok))
         let targets: Vec[i32] = Vec.new()
         targets.push(ok_bb as i32)
@@ -13111,7 +13112,7 @@ impl MirBuilder:
         let join_bb = self.new_block()
 
         let disc = self.lower_enum_discriminant(value_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(self.success_variant_index())
         let targets: Vec[i32] = Vec.new()
         targets.push(some_bb as i32)
@@ -13203,7 +13204,7 @@ impl MirBuilder:
         let result_place = self.place_for_local(result_local)
 
         let disc = self.lower_enum_discriminant(value_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(self.success_variant_index())
         let targets: Vec[i32] = Vec.new()
         targets.push(success_bb as i32)
@@ -13940,7 +13941,7 @@ impl MirBuilder:
         let join_bb = self.new_block()
 
         let disc = self.lower_enum_discriminant(base_place)
-        let vals: Vec[i32] = Vec.new()
+        let vals: Vec[i64] = Vec.new()
         vals.push(success_idx)
         let targets: Vec[i32] = Vec.new()
         targets.push(success_bb as i32)
@@ -14134,7 +14135,13 @@ impl MirBuilder:
                 let fa_base_ast_sym = self.ast.get_data0(fa_base)
                 let fa_base_sym = self.sema.pool_lookup_symbol(self.pool.resolve(fa_base_ast_sym))
                 if self.sema.named_types.contains(fa_base_sym):
-                    let fa_base_ty: i32 = self.sema.named_types.get(fa_base_sym).unwrap()
+                    // The enum Sema resolved for this expression: named_types
+                    // by bare name answers for whichever module last declared
+                    // `Kind` (#1446's two-module fixture — module a's `Kind.Hi`
+                    // was module b's 20, which a's by-name match then matched).
+                    let fa_expr_ty = self.expr_type(node)
+                    let fa_expr_is_enum = fa_expr_ty > 0 and self.sema.get_type_kind(self.sema.resolve_alias(fa_expr_ty)) == TypeKind.TY_ENUM
+                    let fa_base_ty: i32 = if fa_expr_is_enum: fa_expr_ty else: self.sema.named_types.get(fa_base_sym).unwrap()
                     let fa_resolved = self.sema.resolve_alias(fa_base_ty)
                     let fa_tk = self.sema.get_type_kind(fa_resolved)
                     if fa_tk == TypeKind.TY_ENUM:
@@ -14433,7 +14440,7 @@ impl MirBuilder:
                     // aggregate as a non-enum and codegen has no destination.
                     // The sema-level lookup is the strict one; the MirLower
                     // wrapper falls back to a by-symbol index for ANY type.
-                    if self.expected_type != 0 and self.sema.enum_variant_discriminant_for_type(self.expected_type, vc_sym) >= 0:
+                    if self.expected_type != 0 and self.sema.enum_variant_index_for_type(self.expected_type, vc_sym) >= 0:
                         vc_result_ty = self.expected_type
                     if vc_result_ty == 0 or vc_result_ty == self.sema.ty_void as i32:
                         vc_result_ty = self.sema.variant_type_ids.get(vc_sym).unwrap()
@@ -15158,7 +15165,7 @@ impl MirBuilder:
 
             // 3. Create basic blocks for each arm + join
             var arm_bbs: Vec[i32] = Vec.new()
-            var switch_vals: Vec[i32] = Vec.new()
+            var switch_vals: Vec[i64] = Vec.new()
             for ai in 0..arm_count:
                 let arm_bb = self.new_block()
                 arm_bbs.push(arm_bb)
@@ -15882,7 +15889,7 @@ fn lower_generator_next_body(sema: &Sema, source: &MirBody, fn_node: i32) -> Mir
     for bb in 0..source.block_count():
         let _ = out.new_block()
 
-    let switch_vals: Vec[i32] = Vec.new()
+    let switch_vals: Vec[i64] = Vec.new()
     let switch_targets: Vec[i32] = Vec.new()
     switch_vals.push(0)
     switch_targets.push(1)
@@ -15923,7 +15930,7 @@ fn lower_generator_next_body(sema: &Sema, source: &MirBody, fn_node: i32) -> Mir
             out.set_terminator(new_bb, tk, d0 + 1, d1, d2, d3, span)
             continue
         if tk == TermKind.TK_SWITCH_INT:
-            let vals: Vec[i32] = Vec.new()
+            let vals: Vec[i64] = Vec.new()
             let targets: Vec[i32] = Vec.new()
             let sw_start = source.switch_table_starts[d1]
             let sw_count = source.switch_table_counts[d1]
