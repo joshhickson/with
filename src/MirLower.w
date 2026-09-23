@@ -94,6 +94,16 @@ type MirBuilder = ephemeral {
     // guarded per-field drop skips it — the field analogue of pending_reset_locals.
     pending_reset_field_places: Vec[i32],
     pending_reset_field_types: Vec[i32],
+    // #1394: variant-payload moves awaiting their reset-on-move blank (§2.5.1),
+    // each with the block it happened in. A payload slot overlaps the other
+    // variants' payloads, so the blank must land on the moving path while the
+    // enum still holds that variant: it is emitted before the moving block's
+    // terminator (carried across a call into its continuation), and before
+    // any earlier drop or overwrite of the same base in that block — never
+    // at a statement flush that may sit after a join.
+    pending_payload_reset_places: Vec[i32],
+    pending_payload_reset_types: Vec[i32],
+    pending_payload_reset_blocks: Vec[i32],
     // D16 (rvalue-uniform `move`): temps holding a value moved into a
     // share-place callee. Dropped at the same flush points as the pending
     // resets (statement end, or branch-scoped on the moving path), AFTER the
@@ -109,6 +119,9 @@ type MirBuilder = ephemeral {
     pattern_subject_observed: i32,
     // 1 while lowering a `var PATTERN` let: its binding locals are mutable (#1354).
     pattern_bind_mut: i32,
+    // Pairs (binding local, subject place) of every value a pattern binding
+    // moved out of its subject, in order (bind_pattern_value).
+    pattern_move_log: Vec[i32],
     with_cleanup_guard_locals: Vec[i32],
     with_cleanup_payload_locals: Vec[i32],
     with_cleanup_method_syms: Vec[i32],
@@ -215,10 +228,14 @@ fn MirBuilder.init(sema: &Sema, ast: AstPool, pool: InternPool, fn_sym: i32) -> 
         stmt_reset_temp_starts: Vec.new(),
         pending_reset_field_places: Vec.new(),
         pending_reset_field_types: Vec.new(),
+        pending_payload_reset_places: Vec.new(),
+        pending_payload_reset_types: Vec.new(),
+        pending_payload_reset_blocks: Vec.new(),
         pending_move_temp_locals: Vec.new(),
         field_move_in_branch: 0,
         pattern_subject_observed: 0,
         pattern_bind_mut: 0,
+        pattern_move_log: Vec.new(),
         with_cleanup_guard_locals: Vec.new(),
         with_cleanup_payload_locals: Vec.new(),
         with_cleanup_method_syms: Vec.new(),
@@ -307,10 +324,12 @@ impl MirBuilder:
 
     mut fn terminate(kind: i32, d0: i32, d1: i32, d2: i32, d3: i32):
         let span = if self.cur_node > 0: self.ast.get_start(self.cur_node) else: 0
+        self.settle_payload_resets_at_terminator(kind, d2, d3)
         self.body.set_terminator(self.cur_bb, kind, d0, d1, d2, d3, span)
         self.mark_no_suspend_terminator()
 
     mut fn terminate_with_span(kind: i32, d0: i32, d1: i32, d2: i32, d3: i32, span: i32):
+        self.settle_payload_resets_at_terminator(kind, d2, d3)
         self.body.set_terminator(self.cur_bb, kind, d0, d1, d2, d3, span)
         self.mark_no_suspend_terminator()
 
@@ -705,6 +724,10 @@ impl MirBuilder:
             self.emit_drop_stmt(place, "scope-exit", 0)
 
     mut fn emit_drop_stmt(place: i32, origin_kind: &str, span: i32):
+        // A payload moved out of this place's base in this block is blanked
+        // before the drop glue runs over it (#1394).
+        if self.pending_payload_reset_places.len() > 0 and place >= 0 and place < self.body.place_locals.len():
+            self.emit_payload_resets(self.body.place_locals[place])
         let stmt_id = self.body.stmt_count()
         let place_text = mir_place_text(&self.body, place)
         let origin = self.pool.intern(f"drop#{stmt_id} {origin_kind} {place_text}")
@@ -818,6 +841,98 @@ impl MirBuilder:
             // drop is in this function may elide the blank in favor of the static
             // exclusion.
             self.queue_field_move_reset(place)
+            return
+        if self.place_is_variant_payload(place):
+            self.queue_payload_move_reset(place)
+
+    // A sub-place inside an enum variant's payload: field/tuple projections
+    // with at least one downcast, ending in a field of the variant (not the
+    // downcast itself). place_field_projection_count is -1 for it.
+    fn place_is_variant_payload(place: i32) -> bool:
+        if place < 0 or place >= self.body.place_locals.len():
+            return false
+        let proj_start = self.body.place_proj_starts[place]
+        let proj_count = self.body.place_proj_counts[place]
+        if proj_count < 2:
+            return false
+        var downcasts = 0
+        for i in 0..proj_count:
+            let kind = self.body.proj_kinds[(proj_start + i)]
+            if kind == ProjKind.PK_DOWNCAST:
+                downcasts += 1
+            else if kind != ProjKind.PK_FIELD and kind != ProjKind.PK_TUPLE_INDEX:
+                return false
+        downcasts > 0 and self.body.proj_kinds[(proj_start + proj_count - 1)] != ProjKind.PK_DOWNCAST
+
+    // #1394: reset-on-move (§2.5.1) for a value moved out of a variant
+    // payload. Before, such a move registered nothing, so every carrier
+    // eliminator had to hand-roll the subject's ownership, and the ones that
+    // did not (`unwrap_or`, `map`'s Err arm, `context`, `?.`) left the enum's
+    // drop glue to free the payload again.
+    mut fn queue_payload_move_reset(place: i32) -> Unit:
+        let payload_ty = self.place_local_type(place)
+        if payload_ty <= 0 or self.sema.type_needs_drop_frozen(payload_ty) == 0:
+            return
+        self.pending_payload_reset_places.push(place)
+        self.pending_payload_reset_types.push(payload_ty)
+        self.pending_payload_reset_blocks.push(self.cur_bb as i32)
+        let base_local: i32 = self.body.place_locals[place]
+        if base_local >= 0:
+            self.body.mark_local_ever_moved(base_local)
+
+    // Blank the payloads moved out in the current block (of `base_local`
+    // only, when it is >= 0), in the order they were moved.
+    mut fn emit_payload_resets(base_local: i32):
+        self.emit_payload_resets_before(base_local, self.pending_payload_reset_places.len() as i32)
+
+    // The same, for the entries queued before index `limit`.
+    mut fn emit_payload_resets_before(base_local: i32, limit: i32):
+        var i = 0
+        var end = limit
+        while i < end:
+            let place: i32 = self.pending_payload_reset_places[i]
+            if self.pending_payload_reset_blocks[i] != self.cur_bb as i32 or (base_local >= 0 and self.body.place_locals[place] != base_local):
+                i = i + 1
+                continue
+            let payload_ty: i32 = self.pending_payload_reset_types[i]
+            self.remove_payload_reset(i)
+            end = end - 1
+            let zop = self.body.gen_zero_operand(payload_ty)
+            let rval = self.body.new_rvalue(RvalueKind.RK_USE, zop, 0, 0)
+            self.body.push_stmt(self.cur_bb, StmtKind.Assign, place, rval, 0)
+
+    // Drop the current block's entries of `base_local` queued at `from` or
+    // later without blanking: the base was overwritten whole.
+    mut fn discard_payload_resets_from(base_local: i32, from: i32):
+        var i = self.pending_payload_reset_places.len() as i32 - 1
+        while i >= from:
+            if self.pending_payload_reset_blocks[i] == self.cur_bb as i32 and self.body.place_locals[self.pending_payload_reset_places[i]] == base_local:
+                self.remove_payload_reset(i)
+            i = i - 1
+
+    mut fn remove_payload_reset(i: i32):
+        let _p = self.pending_payload_reset_places.remove(i)
+        let _t = self.pending_payload_reset_types.remove(i)
+        let _b = self.pending_payload_reset_blocks.remove(i)
+
+    // A terminator ends the moving block: blank its moved payloads first,
+    // except across a call, whose arguments may be the moved payloads — the
+    // blank then opens the call's continuation, the call's only successor.
+    mut fn settle_payload_resets_at_terminator(kind: i32, call_dest: i32, call_next: i32):
+        if self.pending_payload_reset_places.len() == 0:
+            return
+        if kind != TermKind.TK_CALL:
+            self.emit_payload_resets(-1)
+            return
+        let dest_local = if call_dest >= 0 and call_dest < self.body.place_locals.len(): self.body.place_locals[call_dest] else: -1
+        for i in 0..self.pending_payload_reset_places.len():
+            if self.pending_payload_reset_blocks[i] != self.cur_bb as i32:
+                continue
+            let place: i32 = self.pending_payload_reset_places[i]
+            // The call would overwrite the enum the blank still has to reach.
+            if dest_local >= 0 and self.body.place_locals[place] == dest_local:
+                sema_phase_bug(f"BUG: call result overwrites _{dest_local} while its moved variant payload awaits reset-on-move (#1394)")
+            self.pending_payload_reset_blocks[i] = call_next
 
     // #697/D17: blank every moved-out Drop-bearing field at the next
     // pending-reset flush. §2.5.1 makes the runtime reset unconditional: the
@@ -3199,6 +3314,12 @@ impl MirBuilder:
                 let expr_node = self.ast.get_extra(pos + 1)
                 let spec_node = self.ast.get_extra(pos + 2)
                 var expr_op = self.lower_expr(expr_node)
+                // Formatting observes its interpolant: every FmtBuffer writer
+                // and fmt_to_str read the value and leave it to its owner. A
+                // place lowered as a value read `move u.name` (#1394), a move no
+                // reset follows, and the owner's drop frees it as a live value.
+                if expr_op >= 0 and expr_op < self.body.operand_kinds.len() and self.body.operand_kinds[expr_op] == OperandKind.OK_MOVE:
+                    expr_op = self.body.new_operand(OperandKind.OK_COPY, self.body.operand_d0[expr_op])
                 var resolved_ty = if self.expr_type(expr_node) > 0: self.sema.resolve_alias(self.expr_type(expr_node)) else: 0
                 var borrowed_str_ref_op = -1
                 // A view interpolant formats its POINTEE — formatting observes
@@ -3593,12 +3714,20 @@ impl MirBuilder:
             if self.body.operand_kinds[operand_id] == OperandKind.OK_MOVE:
                 if self.places_are_identical(place, self.body.operand_d0[operand_id]) != 0:
                     return
+        let payload_resets_before = self.pending_payload_reset_places.len() as i32
         self.consume_moved_operand(operand_id)
         self.update_string_alias_after_assignment(place, operand_id)
+        // #1394: a payload moved out of the destination's base earlier in this
+        // block is blanked before the base is written, not after.
+        if payload_resets_before > 0 and place >= 0 and place < self.body.place_locals.len():
+            self.emit_payload_resets_before(self.body.place_locals[place], payload_resets_before)
         let rval = self.body.new_rvalue(RvalueKind.RK_USE, operand_id, 0, 0)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, place, rval, span)
         let dest_local = mir_place_plain_local(&self.body, place)
         if dest_local >= 0:
+            // `x = move x<as v>.f0`: the payload moved into x's own storage,
+            // which the blank must not reach.
+            self.discard_payload_resets_from(dest_local, payload_resets_before)
             self.clear_local_value_moved(dest_local)
             self.clear_moved_fields_for_local(dest_local)
         else:
@@ -3654,6 +3783,16 @@ impl MirBuilder:
             return 0
         let resolved = self.sema.resolve_alias(tid as TypeId)
         if self.sema.get_type_kind(resolved) == TypeKind.TY_STR: 1 else: 0
+
+    fn type_id_is_str_or_str_ref(tid: i32) -> i32:
+        if self.type_id_is_str(tid) != 0:
+            return 1
+        if tid == 0:
+            return 0
+        let resolved = self.sema.resolve_alias(tid as TypeId)
+        if self.sema.get_type_kind(resolved) != TypeKind.TY_REF:
+            return 0
+        self.type_id_is_str(self.sema.get_type_d0(resolved))
 
     fn string_alias_index(local_id: i32) -> i32:
         for i in 0..self.string_alias_local_ids.len():
@@ -4373,15 +4512,18 @@ impl MirBuilder:
             self.expected_type = saved_expected
         // String comparisons observe places. The opposite operand supplies
         // type context, but that context does not demand an owned string copy.
-        let observes_strings = is_cmp and self.type_id_is_str(lhs_ty) != 0 and self.type_id_is_str(rhs_ty) != 0
-        let lhs = if observes_strings: self.lower_observer_probe_arg(lhs_expr) else: self.lower_expr(lhs_expr)
+        // An owned side compared with a `&str` observes too: lowered as a
+        // value it read `move v.text` (#1394), a move no reset follows and
+        // the owner's drop frees again.
+        let observes_strings = is_cmp and self.type_id_is_str_or_str_ref(lhs_ty) != 0 and self.type_id_is_str_or_str_ref(rhs_ty) != 0
+        let lhs = if observes_strings and self.type_id_is_str(lhs_ty) != 0: self.lower_observer_probe_arg(lhs_expr) else: self.lower_expr(lhs_expr)
         if self.is_bare_none(rhs_expr) and (lhs_tk == TypeKind.TY_PTR or lhs_tk == TypeKind.TY_REF):
             self.expected_type = lhs_ty
         else if is_cmp and lhs_ty != 0:
             self.expected_type = lhs_ty
         else:
             self.expected_type = saved_expected
-        let rhs = if observes_strings: self.lower_observer_probe_arg(rhs_expr) else: self.lower_expr(rhs_expr)
+        let rhs = if observes_strings and self.type_id_is_str(rhs_ty) != 0: self.lower_observer_probe_arg(rhs_expr) else: self.lower_expr(rhs_expr)
         self.expected_type = saved_expected
         let rv = self.body.new_rvalue(RvalueKind.RK_BIN_OP, op, lhs, rhs)
         var ty = self.expr_type(node)
@@ -4747,7 +4889,7 @@ impl MirBuilder:
         self.switch_to(fail_bb)
         let ret_place = self.place_for_local(0)
         let ret_ty: i32 = self.body.local_type_ids.get(0)
-        let break_downcast = self.body.new_downcast_place(branch_place, break_idx, branch_ty)
+        let break_downcast = self.body.new_downcast_place(branch_place, break_idx)
         let break_payload_place = self.body.new_field_place(break_downcast, 0, break_ty)
         let break_op = self.operand_for_place(break_payload_place, break_ty)
         let from_break_args: Vec[i32] = Vec.new()
@@ -4763,7 +4905,7 @@ impl MirBuilder:
         self.switch_to(pass_bb)
         let result_local = self.new_temp(continue_ty)
         let result_place = self.place_for_local(result_local)
-        let continue_downcast = self.body.new_downcast_place(branch_place, continue_idx, branch_ty)
+        let continue_downcast = self.body.new_downcast_place(branch_place, continue_idx)
         let payload_place = self.body.new_field_place(continue_downcast, 0, continue_ty)
         let pass_op = self.operand_for_place(payload_place, continue_ty)
         self.assign_operand_to_place(result_place, pass_op, self.ast.get_start(expr))
@@ -6821,7 +6963,7 @@ impl MirBuilder:
         self.switch_to(body_bb)
         let item_local = self.new_temp(elem_ty)
         let item_place = self.place_for_local(item_local)
-        let downcast_place = self.body.new_downcast_place(next_place, some_idx, next_ret_ty)
+        let downcast_place = self.body.new_downcast_place(next_place, some_idx)
         let payload_place = self.body.new_field_place(downcast_place, 0, elem_ty)
         // Drop-class elements MOVE out of the Option temp (the `?` idiom) —
         // a copy leaves the stale Some to double-drop the payload at cleanup.
@@ -7299,7 +7441,7 @@ impl MirBuilder:
         self.switch_to(body_bb)
         let item_local = self.new_temp(elem_ty)
         let item_place = self.place_for_local(item_local)
-        let downcast_place = self.body.new_downcast_place(next_place, some_idx, next_ret_ty)
+        let downcast_place = self.body.new_downcast_place(next_place, some_idx)
         let payload_place = self.body.new_field_place(downcast_place, 0, elem_ty)
         // Drop-class elements MOVE out of the Option temp (the `?` idiom) —
         // a copy leaves the stale Some to double-drop the payload at cleanup.
@@ -8193,7 +8335,7 @@ impl MirBuilder:
         self.terminate(TermKind.TK_SWITCH_INT, disc, table, exit_bb, 0)
         self.switch_to(bind_bb)
         let some_index = self.enum_variant_index_for_type(opt_ty, self.sema.syms.some)
-        let downcast_place = self.body.new_downcast_place(opt_place, some_index, opt_ty)
+        let downcast_place = self.body.new_downcast_place(opt_place, some_index)
         let payload_place = self.body.new_field_place(downcast_place, 0, elem_ty)
         self.bind_for_element_or_skip(for_node, pat_or_sym, payload_place, elem_ty, body_expr, header_bb)
         // #771 (the #729 loop shape): stmt temps created INSIDE the body must
@@ -8731,7 +8873,7 @@ impl MirBuilder:
                     disc_idx = self.sema.disc_values.get(variant_sym).unwrap()
             var success_bb = arm_bb
             var needs_payload_checks = false
-            let variant_place = self.body.new_downcast_place(variant_subject_place, variant_idx, 0)
+            let variant_place = self.body.new_downcast_place(variant_subject_place, variant_idx)
             for bi in 0..payload_count:
                 let inner_pat = self.pattern_payload_node(pat_node, self.ast.get_extra(payload_start + bi))
                 if inner_pat == 0:
@@ -8978,6 +9120,33 @@ impl MirBuilder:
         self.mark_unsupported()
         0
 
+    // A pattern binding takes its value out of the subject. The move is
+    // logged (binding local, subject place) so a failed match guard can put
+    // it back (see lower_match).
+    mut fn bind_pattern_value(local_place: i32, op: i32, span: i32):
+        if op >= 0 and op < self.body.operand_kinds.len() and self.body.operand_kinds[op] == OperandKind.OK_MOVE:
+            self.pattern_move_log.push(self.body.place_locals[local_place])
+            self.pattern_move_log.push(self.body.operand_d0[op])
+        self.assign_operand_to_place(local_place, op, span)
+
+    // Undo the binding moves logged since `start`, newest first: each value
+    // goes back to the subject place it came from and its binding is blanked,
+    // so the binding's scheduled drop frees nothing.
+    mut fn restore_pattern_moves(start: i32):
+        var i = self.pattern_move_log.len() as i32 - 2
+        while i >= start:
+            let local: i32 = self.pattern_move_log[i]
+            let src_place: i32 = self.pattern_move_log[i + 1]
+            let local_place = self.place_for_local(local)
+            let back = self.body.new_operand(OperandKind.OK_MOVE, local_place)
+            let back_rv = self.body.new_rvalue(RvalueKind.RK_USE, back, 0, 0)
+            self.body.push_stmt(self.cur_bb, StmtKind.Assign, src_place, back_rv, 0)
+            let zop = self.body.gen_zero_operand(self.local_type(local))
+            let blank_rv = self.body.new_rvalue(RvalueKind.RK_USE, zop, 0, 0)
+            self.body.push_stmt(self.cur_bb, StmtKind.Assign, local_place, blank_rv, 0)
+            self.body.mark_local_ever_moved(local)
+            i = i - 2
+
     mut fn lower_pattern(pat_node: i32, scrutinee_place: i32) -> Vec[i32]:
         let out: Vec[i32] = Vec.new()
         if pat_node == 0:
@@ -8998,7 +9167,7 @@ impl MirBuilder:
                 self.schedule_drop(wc_local, DropKind.DK_VALUE)
                 let wc_op = self.body.new_operand(OperandKind.OK_MOVE, scrutinee_place)
                 let wc_place = self.place_for_local(wc_local)
-                self.assign_operand_to_place(wc_place, wc_op, self.ast.get_start(pat_node))
+                self.bind_pattern_value(wc_place, wc_op, self.ast.get_start(pat_node))
             return out
 
         if pk == NodeKind.NK_PAT_IDENT:
@@ -9011,7 +9180,7 @@ impl MirBuilder:
                 self.schedule_drop(local_id, DropKind.DK_VALUE)
             let src_op = self.body.new_operand(if self.type_needs_value_drop(bind_ty) == 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, scrutinee_place)
             let local_place = self.place_for_local(local_id)
-            self.assign_operand_to_place(local_place, src_op, self.ast.get_start(pat_node))
+            self.bind_pattern_value(local_place, src_op, self.ast.get_start(pat_node))
             out.push(local_id)
             out.push(scrutinee_place)
             return out
@@ -9026,7 +9195,7 @@ impl MirBuilder:
                 self.schedule_drop(outer_local, DropKind.DK_VALUE)
             let outer_op = self.body.new_operand(if self.type_needs_value_drop(outer_ty) == 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, scrutinee_place)
             let outer_place = self.place_for_local(outer_local)
-            self.assign_operand_to_place(outer_place, outer_op, self.ast.get_start(pat_node))
+            self.bind_pattern_value(outer_place, outer_op, self.ast.get_start(pat_node))
             out.push(outer_local)
             out.push(scrutinee_place)
             let inner = self.lower_pattern(self.ast.get_data1(pat_node), scrutinee_place)
@@ -9060,7 +9229,7 @@ impl MirBuilder:
             let bind_start = self.ast.get_data1(pat_node)
             let bind_count = self.ast.get_data2(pat_node)
             let variant_subject_place = self.pattern_shape_place(scrutinee_place)
-            let variant_place = self.body.new_downcast_place(variant_subject_place, self.variant_index(variant_sym), 0)
+            let variant_place = self.body.new_downcast_place(variant_subject_place, self.variant_index(variant_sym))
             for bi in 0..bind_count:
                 let raw = self.ast.get_extra(bind_start + bi)
                 let inner_pat = self.pattern_payload_node(pat_node, raw)
@@ -9082,7 +9251,7 @@ impl MirBuilder:
                                 self.schedule_drop(rp_local, DropKind.DK_VALUE)
                                 let rp_local_place = self.place_for_local(rp_local)
                                 let rp_op = self.body.new_operand(OperandKind.OK_MOVE, rp_place)
-                                self.assign_operand_to_place(rp_local_place, rp_op, self.ast.get_start(pat_node))
+                                self.bind_pattern_value(rp_local_place, rp_op, self.ast.get_start(pat_node))
                             rpi = rpi + 1
                     continue
                 let field_place = self.body.new_field_place(variant_place, bi, 0)
@@ -9100,7 +9269,7 @@ impl MirBuilder:
                     self.schedule_drop(local_id, DropKind.DK_VALUE)
                 let src_op = self.body.new_operand(if self.sema.is_copy_frozen(bind_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, child_place)
                 let local_place = self.place_for_local(local_id)
-                self.assign_operand_to_place(local_place, src_op, self.ast.get_start(pat_node))
+                self.bind_pattern_value(local_place, src_op, self.ast.get_start(pat_node))
                 out.push(local_id)
                 out.push(child_place)
             return out
@@ -9163,7 +9332,7 @@ impl MirBuilder:
                         self.schedule_drop(local_id, DropKind.DK_VALUE)
                     let src_op = self.body.new_operand(if self.sema.is_copy_frozen(bind_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, child_place)
                     let local_place = self.place_for_local(local_id)
-                    self.assign_operand_to_place(local_place, src_op, self.ast.get_start(pat_node))
+                    self.bind_pattern_value(local_place, src_op, self.ast.get_start(pat_node))
                     out.push(local_id)
                     out.push(child_place)
             // A7 (#606): `..` discards every unmentioned field. In a consuming
@@ -9191,7 +9360,7 @@ impl MirBuilder:
                     self.schedule_drop(rest_local, DropKind.DK_VALUE)
                     let rest_op = self.body.new_operand(OperandKind.OK_MOVE, rest_fplace)
                     let rest_place = self.place_for_local(rest_local)
-                    self.assign_operand_to_place(rest_place, rest_op, self.ast.get_start(pat_node))
+                    self.bind_pattern_value(rest_place, rest_op, self.ast.get_start(pat_node))
             return out
 
         if pk == NodeKind.NK_PAT_OR:
@@ -9402,6 +9571,7 @@ impl MirBuilder:
             // path leaving the match — dropping uninitialized garbage when a
             // different arm was taken (memory corruption for Drop-typed payloads).
             self.push_scope()
+            let move_log_start = self.pattern_move_log.len() as i32
             let _ = self.lower_pattern(pat_node, scrutinee_place)
             self.pattern_subject_observed = saved_observed
             self.field_move_in_branch = self.field_move_in_branch + 1
@@ -9425,6 +9595,12 @@ impl MirBuilder:
                 // drop them before falling through to the next arm (without popping
                 // the scope — that happens once on the guard-pass path below).
                 self.switch_to(guard_fail_bb)
+                // The next arm matches the same subject again, so what the
+                // bindings took out of it goes back (#1394). Dropping them
+                // freed the payload the next arm then bound again — a double
+                // free — and since a moved payload is blanked (§2.5.1), the
+                // next arm would bind the blank.
+                self.restore_pattern_moves(move_log_start)
                 let gscope_idx = self.drop_scope_starts.len() as i32 - 1
                 let gdrop_start: i32 = self.drop_scope_starts[gscope_idx]
                 self.emit_drops_for_range(gdrop_start, self.drop_local_ids.len() as i32)
@@ -9461,6 +9637,8 @@ impl MirBuilder:
             self.field_move_in_branch = self.field_move_in_branch - 1
             self.pop_scope_with_goto(join_bb)
             self.restore_move_state(&branch_move_state)
+            while self.pattern_move_log.len() as i32 > move_log_start:
+                let _ = self.pattern_move_log.pop()
 
             dispatch_bb = fail_bb
 
@@ -11249,7 +11427,7 @@ impl MirBuilder:
             self.mark_unsupported()
             return self.unit_operand()
 
-        let variant_place = self.body.new_downcast_place(enum_place, variant_index, enum_ty)
+        let variant_place = self.body.new_downcast_place(enum_place, variant_index)
         if payload_count == 1:
             let payload_ty = payloads.get(0)
             let field_place = self.body.new_field_place(variant_place, 0, payload_ty)
@@ -11313,6 +11491,10 @@ impl MirBuilder:
         let tmp = self.new_temp(context_error_ty)
         let place = self.place_for_local(tmp)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, place, rv, span)
+        // The source moves out of the Err payload into the ContextError: its
+        // reset-on-move keeps the receiver's scope-exit drop from freeing it
+        // again (#1394: `.context(..)` on an Err double-freed the error).
+        self.consume_moved_operand(source_op)
         self.operand_for_place(place, context_error_ty)
 
     mut fn lower_enum_accessor_call(self_expr: i32, method_sym: i32, node: i32) -> i32:
@@ -11435,7 +11617,7 @@ impl MirBuilder:
                 if err_idx < 0:
                     self.mark_unsupported()
                 else:
-                    let err_downcast = self.body.new_downcast_place(value_place, err_idx, value_ty)
+                    let err_downcast = self.body.new_downcast_place(value_place, err_idx)
                     let err_payload_place = self.body.new_field_place(err_downcast, 0, source_err_ty)
                     var target_err_op = self.operand_for_place(err_payload_place, source_err_ty)
                     let conversion_chain = self.sema.error_conversion_chain_frozen(target_err_ty, source_err_ty)
@@ -11496,7 +11678,7 @@ impl MirBuilder:
         self.switch_to(pass_bb)
         let result_local = self.new_temp(result_ty)
         let result_place = self.place_for_local(result_local)
-        let downcast_place = self.body.new_downcast_place(value_place, self.success_variant_index(), value_ty)
+        let downcast_place = self.body.new_downcast_place(value_place, self.success_variant_index())
         let payload_place = self.body.new_field_place(downcast_place, 0, result_ty)
         let pass_op = self.body.new_operand(if self.sema.is_copy_frozen(result_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, payload_place)
         self.assign_operand_to_place(result_place, pass_op, self.ast.get_start(span_node))
@@ -11598,7 +11780,7 @@ impl MirBuilder:
         let result_place = self.place_for_local(result_local)
 
         self.switch_to(some_bb)
-        let downcast_place = self.body.new_downcast_place(value_place, self.success_variant_index(), value_ty)
+        let downcast_place = self.body.new_downcast_place(value_place, self.success_variant_index())
         let payload_place = self.body.new_field_place(downcast_place, 0, payload_ty)
         let some_op = self.lower_contextual_join_place_arm(node, D22_JOIN_ROLE_CARRIER_PAYLOAD, payload_place, self.ast.get_start(expr))
         self.assign_operand_to_place(result_place, some_op, self.ast.get_start(expr))
@@ -11803,7 +11985,7 @@ impl MirBuilder:
 
         self.switch_to(some_bb)
         let some_idx = self.enum_variant_index_for_type(value_ty, self.sema.syms.some)
-        let some_downcast = self.body.new_downcast_place(value_place, some_idx, value_ty)
+        let some_downcast = self.body.new_downcast_place(value_place, some_idx)
         let inner_result_place = self.body.new_field_place(some_downcast, 0, inner_result_ty)
         let inner_disc = self.lower_enum_discriminant(inner_result_place)
         let inner_vals: Vec[i32] = Vec.new()
@@ -11815,7 +11997,7 @@ impl MirBuilder:
 
         self.switch_to(inner_ok_bb)
         let ok_idx = self.enum_variant_index_for_type(inner_result_ty, self.sema.syms.ok)
-        let ok_downcast = self.body.new_downcast_place(inner_result_place, ok_idx, inner_result_ty)
+        let ok_downcast = self.body.new_downcast_place(inner_result_place, ok_idx)
         let ok_payload_place = self.body.new_field_place(ok_downcast, 0, inner_ok_ty)
         let some_option_local = self.new_temp(result_ok_ty)
         let some_option_place = self.place_for_local(some_option_local)
@@ -11829,7 +12011,7 @@ impl MirBuilder:
 
         self.switch_to(inner_err_bb)
         let err_idx = self.enum_variant_index_for_type(inner_result_ty, self.sema.syms.err)
-        let err_downcast = self.body.new_downcast_place(inner_result_place, err_idx, inner_result_ty)
+        let err_downcast = self.body.new_downcast_place(inner_result_place, err_idx)
         let err_payload_place = self.body.new_field_place(err_downcast, 0, inner_err_ty)
         let err_fields: Vec[i32] = Vec.new()
         err_fields.push(self.operand_for_place(err_payload_place, inner_err_ty))
@@ -11876,7 +12058,7 @@ impl MirBuilder:
 
         self.switch_to(err_bb)
         let err_idx = self.enum_variant_index_for_type(value_ty, self.sema.syms.err)
-        let err_downcast = self.body.new_downcast_place(value_place, err_idx, value_ty)
+        let err_downcast = self.body.new_downcast_place(value_place, err_idx)
         let err_payload_place = self.body.new_field_place(err_downcast, 0, inner_err_ty)
         let err_result_local = self.new_temp(result_some_ty)
         let err_result_place = self.place_for_local(err_result_local)
@@ -11890,7 +12072,7 @@ impl MirBuilder:
 
         self.switch_to(ok_bb)
         let ok_idx = self.enum_variant_index_for_type(value_ty, self.sema.syms.ok)
-        let ok_downcast = self.body.new_downcast_place(value_place, ok_idx, value_ty)
+        let ok_downcast = self.body.new_downcast_place(value_place, ok_idx)
         let inner_option_place = self.body.new_field_place(ok_downcast, 0, inner_option_ty)
         let inner_disc = self.lower_enum_discriminant(inner_option_place)
         let inner_vals: Vec[i32] = Vec.new()
@@ -11907,7 +12089,7 @@ impl MirBuilder:
 
         self.switch_to(inner_some_bb)
         let some_idx = self.enum_variant_index_for_type(inner_option_ty, self.sema.syms.some)
-        let some_downcast = self.body.new_downcast_place(inner_option_place, some_idx, inner_option_ty)
+        let some_downcast = self.body.new_downcast_place(inner_option_place, some_idx)
         let some_payload_place = self.body.new_field_place(some_downcast, 0, inner_some_ty)
         let ok_result_local = self.new_temp(result_some_ty)
         let ok_result_place = self.place_for_local(ok_result_local)
@@ -11985,7 +12167,7 @@ impl MirBuilder:
 
         self.switch_to(some_bb)
         let some_idx = self.enum_variant_index_for_type(value_ty, self.sema.syms.some)
-        let some_downcast = self.body.new_downcast_place(value_place, some_idx, value_ty)
+        let some_downcast = self.body.new_downcast_place(value_place, some_idx)
         let inner_place = self.body.new_field_place(some_downcast, 0, inner_option_ty)
         let inner_op = self.operand_for_place(inner_place, inner_option_ty)
         self.assign_operand_to_place(result_place, inner_op, span)
@@ -12037,23 +12219,17 @@ impl MirBuilder:
 
         self.switch_to(wanted_bb)
         let variant_idx = self.enum_variant_index_for_type(value_ty, wanted_variant)
-        let downcast = self.body.new_downcast_place(value_place, variant_idx, value_ty)
+        let downcast = self.body.new_downcast_place(value_place, variant_idx)
         let payload_place = self.body.new_field_place(downcast, 0, payload_ty)
         let some_fields: Vec[i32] = Vec.new()
         let ok_err_payload_op = self.operand_for_place(payload_place, payload_ty)
-        // Register the payload move so the materialized receiver temp's
-        // drop skips what the Option now owns.
-        self.consume_moved_operand(ok_err_payload_op)
         some_fields.push(ok_err_payload_op)
+        // Consuming the payload into the Option queues its reset-on-move
+        // (§2.5.1): the blank lands on this path, before the goto, so the
+        // receiver temp's whole-enum scope drop frees nothing here. (The
+        // other_bb path keeps its payload — err() on an Ok value must still
+        // drop the un-extracted Ok payload.)
         self.assign_enum_variant_to_place(result_place, result_ty, self.sema.syms.some, some_fields, span)
-        // §2.5.1 reset-on-move, emitted directly on the moving path: blank
-        // the extracted payload so the receiver temp's whole-enum scope drop
-        // frees nothing. (The other_bb path keeps its payload — err() on an
-        // Ok value must still drop the un-extracted Ok payload.)
-        if self.sema.is_copy_frozen(payload_ty) == 0:
-            let blank_zop = self.body.gen_zero_operand(payload_ty)
-            let blank_rv = self.body.new_rvalue(RvalueKind.RK_USE, blank_zop, 0, 0)
-            self.body.push_stmt(self.cur_bb, StmtKind.Assign, payload_place, blank_rv, span)
         self.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
 
         self.switch_to(join_bb)
@@ -12109,10 +12285,10 @@ impl MirBuilder:
 
         self.switch_to(right_some_bb)
         let left_idx = self.enum_variant_index_for_type(left_ty, self.sema.syms.some)
-        let left_downcast = self.body.new_downcast_place(left_place, left_idx, left_ty)
+        let left_downcast = self.body.new_downcast_place(left_place, left_idx)
         let left_payload_place = self.body.new_field_place(left_downcast, 0, left_elem_ty)
         let right_idx = self.enum_variant_index_for_type(right_ty, self.sema.syms.some)
-        let right_downcast = self.body.new_downcast_place(right_place, right_idx, right_ty)
+        let right_downcast = self.body.new_downcast_place(right_place, right_idx)
         let right_payload_place = self.body.new_field_place(right_downcast, 0, right_elem_ty)
         let tuple_fields: Vec[i32] = Vec.new()
         tuple_fields.push(self.operand_for_place(left_payload_place, left_elem_ty))
@@ -12181,7 +12357,7 @@ impl MirBuilder:
 
         self.switch_to(some_bb)
         let some_idx = self.enum_variant_index_for_type(value_ty, self.sema.syms.some)
-        let some_downcast = self.body.new_downcast_place(value_place, some_idx, value_ty)
+        let some_downcast = self.body.new_downcast_place(value_place, some_idx)
         let tuple_place = self.body.new_field_place(some_downcast, 0, tuple_ty)
         let left_place = self.body.new_tuple_index_place(tuple_place, 0, left_elem_ty)
         let right_place = self.body.new_tuple_index_place(tuple_place, 1, right_elem_ty)
@@ -12308,7 +12484,7 @@ impl MirBuilder:
 
         self.switch_to(item_success_bb)
         let success_idx = self.enum_variant_index_for_type(wrapper_ty, success_variant)
-        let success_downcast = self.body.new_downcast_place(wrapper_place, success_idx, wrapper_ty)
+        let success_downcast = self.body.new_downcast_place(wrapper_place, success_idx)
         let success_payload_place = self.body.new_field_place(success_downcast, 0, output_elem_ty)
         let success_payload_op = self.operand_for_place(success_payload_place, output_elem_ty)
         self.emit_vec_push(out_vec_place, success_payload_op, span)
@@ -12320,7 +12496,7 @@ impl MirBuilder:
             self.assign_enum_variant_to_place(result_place, result_ty, failure_variant, fail_fields, span)
         else:
             let failure_idx = self.enum_variant_index_for_type(wrapper_ty, failure_variant)
-            let failure_downcast = self.body.new_downcast_place(wrapper_place, failure_idx, wrapper_ty)
+            let failure_downcast = self.body.new_downcast_place(wrapper_place, failure_idx)
             let failure_payload_place = self.body.new_field_place(failure_downcast, 0, failure_payload_ty)
             let fail_fields2: Vec[i32] = Vec.new()
             fail_fields2.push(self.operand_for_place(failure_payload_place, failure_payload_ty))
@@ -12395,7 +12571,7 @@ impl MirBuilder:
 
         self.switch_to(some_bb)
         let some_idx = self.enum_variant_index_for_type(value_ty, self.sema.syms.some)
-        let downcast_place = self.body.new_downcast_place(value_place, some_idx, value_ty)
+        let downcast_place = self.body.new_downcast_place(value_place, some_idx)
         let payload_place = self.body.new_field_place(downcast_place, 0, payload_ty)
         if method_name == "filter":
             let filter_args: Vec[i32] = Vec.new()
@@ -12505,8 +12681,19 @@ impl MirBuilder:
         var mapper_op = 0
         var context_message_op = 0
         var context_fn_op = 0
+        // `context(message)` owns its message on both paths: the Err arm
+        // moves it into the ContextError, the Ok arm drops it. Held in the
+        // call's own local, it was a statement temp the flush dropped after
+        // the Err arm had moved it (a DOUBLE FREE of the message).
+        var context_message_local = -1
         if method_name == "context":
             context_message_op = self.lower_expr(self.ast.get_extra(arg_start))
+            let message_ty = self.operand_type(context_message_op)
+            if self.body.operand_kinds[context_message_op] == OperandKind.OK_MOVE and self.sema.type_needs_drop_frozen(message_ty) != 0:
+                context_message_local = self.new_temp(message_ty)
+                let message_place = self.place_for_local(context_message_local)
+                self.assign_operand_to_place(message_place, context_message_op, span)
+                context_message_op = self.body.new_operand(OperandKind.OK_MOVE, message_place)
         else if method_name == "with_context":
             context_fn_op = self.lower_expr(self.ast.get_extra(arg_start))
         else:
@@ -12528,7 +12715,7 @@ impl MirBuilder:
 
         self.switch_to(ok_bb)
         let ok_idx = self.enum_variant_index_for_type(value_ty, self.sema.syms.ok)
-        let ok_downcast = self.body.new_downcast_place(value_place, ok_idx, value_ty)
+        let ok_downcast = self.body.new_downcast_place(value_place, ok_idx)
         let ok_payload_place = self.body.new_field_place(ok_downcast, 0, source_ok_ty)
         let ok_fields: Vec[i32] = Vec.new()
         if method_name == "map":
@@ -12543,7 +12730,7 @@ impl MirBuilder:
             self.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
             self.switch_to(err_bb)
             let err_idx2 = self.enum_variant_index_for_type(value_ty, self.sema.syms.err)
-            let err_downcast2 = self.body.new_downcast_place(value_place, err_idx2, value_ty)
+            let err_downcast2 = self.body.new_downcast_place(value_place, err_idx2)
             let err_payload_place2 = self.body.new_field_place(err_downcast2, 0, source_err_ty)
             let err_fields2: Vec[i32] = Vec.new()
             err_fields2.push(self.operand_for_place(err_payload_place2, source_err_ty))
@@ -12561,11 +12748,14 @@ impl MirBuilder:
         else:
             ok_fields.push(self.operand_for_place(ok_payload_place, source_ok_ty))
         self.assign_enum_variant_to_place(result_place, result_ty, self.sema.syms.ok, ok_fields, span)
+        if context_message_local >= 0:
+            let unused_message = self.place_for_local(context_message_local)
+            self.emit_drop_stmt(unused_message, "context-message-unused", span)
         self.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
 
         self.switch_to(err_bb)
         let err_idx = self.enum_variant_index_for_type(value_ty, self.sema.syms.err)
-        let err_downcast = self.body.new_downcast_place(value_place, err_idx, value_ty)
+        let err_downcast = self.body.new_downcast_place(value_place, err_idx)
         let err_payload_place = self.body.new_field_place(err_downcast, 0, source_err_ty)
         let err_fields: Vec[i32] = Vec.new()
         if method_name == "map_err":
@@ -12675,7 +12865,7 @@ impl MirBuilder:
         let result_place = self.place_for_local(result_local)
 
         self.switch_to(some_bb)
-        let downcast_place = self.body.new_downcast_place(value_place, self.success_variant_index(), value_ty)
+        let downcast_place = self.body.new_downcast_place(value_place, self.success_variant_index())
         let payload_place = self.body.new_field_place(downcast_place, 0, payload_ty)
         let some_op = self.lower_contextual_join_place_arm(node, D22_JOIN_ROLE_CARRIER_PAYLOAD, payload_place, self.ast.get_start(self_expr))
         self.assign_operand_to_place(result_place, some_op, self.ast.get_start(self_expr))
@@ -12742,7 +12932,7 @@ impl MirBuilder:
         self.terminate(TermKind.TK_SWITCH_INT, disc, table, failure_bb, 0)
 
         self.switch_to(success_bb)
-        let success_downcast = self.body.new_downcast_place(value_place, self.success_variant_index(), value_ty)
+        let success_downcast = self.body.new_downcast_place(value_place, self.success_variant_index())
         let success_payload_place = self.body.new_field_place(success_downcast, 0, payload_ty)
         let success_payload_op = self.lower_contextual_join_place_arm(node, D22_JOIN_ROLE_CARRIER_PAYLOAD, success_payload_place, span)
         self.assign_operand_to_place(result_place, success_payload_op, span)
@@ -12762,7 +12952,7 @@ impl MirBuilder:
                 self.mark_unsupported()
                 return self.unit_operand()
             let err_idx = self.enum_variant_index_for_type(value_ty, self.sema.syms.err)
-            let err_downcast = self.body.new_downcast_place(value_place, err_idx, value_ty)
+            let err_downcast = self.body.new_downcast_place(value_place, err_idx)
             let err_payload_place = self.body.new_field_place(err_downcast, 0, err_ty)
             call_args.push(self.operand_for_place(err_payload_place, err_ty))
         let lazy_exact_op = self.lower_call_with_operand_args(fallback_op, call_args, lazy_ty, node)
@@ -13091,7 +13281,7 @@ impl MirBuilder:
         self.success_variant_index()
 
     mut fn lower_optional_chain_field(result_place: i32, result_ty: i32, base_place: i32, base_ty: i32, payload_ty: i32, success_idx: i32, success_sym: i32, member_sym: i32, span: i32):
-        let downcast_place = self.body.new_downcast_place(base_place, success_idx, base_ty)
+        let downcast_place = self.body.new_downcast_place(base_place, success_idx)
         let payload_place = self.body.new_field_place(downcast_place, 0, payload_ty)
         let field_ty = self.sema.struct_field_type_frozen(payload_ty, member_sym)
         if field_ty == 0:
@@ -13285,7 +13475,7 @@ impl MirBuilder:
             self.mark_unsupported()
             return
 
-        let downcast_place = self.body.new_downcast_place(base_place, success_idx, base_ty)
+        let downcast_place = self.body.new_downcast_place(base_place, success_idx)
         let payload_place = self.body.new_field_place(downcast_place, 0, payload_ty)
         let method_name = self.pool.resolve_symbol(member_sym)
         let arg_count = self.ast.optional_chain_arg_count(extra_start)
@@ -13495,7 +13685,7 @@ impl MirBuilder:
             if err_idx < 0:
                 self.mark_unsupported()
             else:
-                let err_downcast = self.body.new_downcast_place(base_place, err_idx, base_ty)
+                let err_downcast = self.body.new_downcast_place(base_place, err_idx)
                 let err_payload_place = self.body.new_field_place(err_downcast, 0, result_err_ty)
                 let err_fields: Vec[i32] = Vec.new()
                 err_fields.push(self.operand_for_place(err_payload_place, result_err_ty))
