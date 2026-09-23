@@ -854,7 +854,7 @@ fn compilation_compiler_hook_call_args(pool: AstPool, intern: InternPool, hook_n
 impl Compilation:
     fn compiler_hook_runner_source(pool: AstPool, source_path: &str, diag_path: &str, emitted_source_path: &str, token: &str) -> str:
         let zcu = &self.zcu
-        let root = if zcu.project_config.root_dir.len() > 0: zcu.project_config.root_dir else: frontend_dirname(source_path)
+        let root = if zcu.project_config.root_dir.len() > 0: zcu.project_config.root_dir.clone() else: frontend_dirname(source_path)
         let hook_count = pool.compiler_hook_count()
         var out = "use std.compiler\n"
         let imported: HashMap[str, i32] = HashMap.new()
@@ -923,7 +923,7 @@ impl Compilation:
             return true
         if not self.config.compiler_hooks_enabled:
             return true
-        let root = if self.zcu.project_config.root_dir.len() > 0: self.zcu.project_config.root_dir else: frontend_dirname(source_path)
+        let root = if self.zcu.project_config.root_dir.len() > 0: self.zcu.project_config.root_dir.clone() else: frontend_dirname(source_path)
         // Hook scratch lives in the system temp dir, never beside the source:
         // rooting it at frontend_dirname scattered pid-stamped runners and
         // dSYM bundles into source test directories (#741). The stamped dir
@@ -995,7 +995,7 @@ impl Compilation:
             return AstPool.new()
         if self.compiler_hook_emitted_source.len() == 0:
             return pool
-        let base_source = if self.zcu.current_source_text.len() > 0: self.zcu.current_source_text else: runtime_read_file(source_path)
+        let base_source = if self.zcu.current_source_text.len() > 0: self.zcu.current_source_text.clone() else: runtime_read_file(source_path)
         let cfg = self.zcu.project_config
         let combined = base_source ++ "\n\n// <with compiler hook emitted source>\n" ++ self.compiler_hook_emitted_source
         self.compiler_hook_emitted_source = ""
@@ -1251,9 +1251,17 @@ fn compilation_execute_binary_link_plan(debug_info: bool, plan: CompilationBinar
     var owned = move plan
     let t_link = profile_now()
     let link_result = link_stage_result_for_command(move owned.command)
+    let keep_units = runtime_getenv("WITH_KEEP_UNIT_OBJECTS").len() > 0
     if not link_result.ok:
         compilation_debug_init("build_binary_to_path:link FAILED")
-        compilation_cleanup_build_products(owned.obj_path, owned.bin_path)
+        // A failed link is when the unit objects are needed most: an
+        // undefined or duplicate symbol across codegen units is read off
+        // them with nm (#1331).
+        if keep_units:
+            runtime_eprint(f"note: WITH_KEEP_UNIT_OBJECTS: the unit objects are kept at {owned.obj_path} and {owned.obj_path}.u<k>.o")
+            compilation_cleanup_build_products("", owned.bin_path)
+        else:
+            compilation_cleanup_build_products(owned.obj_path, owned.bin_path)
         return link_result
     if profile_enabled():
         profile_emit("link", t_link, "")
@@ -1266,7 +1274,7 @@ fn compilation_execute_binary_link_plan(debug_info: bool, plan: CompilationBinar
         return link_stage_result_fail()
     // WITH_KEEP_UNIT_OBJECTS=1 leaves the linked objects beside the binary, for
     // diffing the unit a failed fixpoint names.
-    if runtime_getenv("WITH_KEEP_UNIT_OBJECTS").len() > 0: return link_result
+    if keep_units: return link_result
     compilation_remove_file_best_effort(owned.obj_path)
     compilation_remove_unit_objects_best_effort(owned.obj_path)
     link_result

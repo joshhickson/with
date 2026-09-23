@@ -2835,13 +2835,13 @@ impl MirBuilder:
 
 impl MirBuilder:
     mut fn source_location_operand(node: i32) -> i32:
-        let path = if self.sema.current_module_path.len() > 0: self.sema.current_module_path else: "<unknown>"
+        let path = if self.sema.current_module_path.len() > 0: self.sema.current_module_path.clone() else: "<unknown>"
         let loc = self.sema.source_location_for_file_id(self.sema.local_file_id, self.ast.get_start(node))
         self.lower_str_lit(self.pool.intern(f"{path}:{loc.line + 1}:{loc.col + 1}"))
 
     mut fn source_file_operand(node: i32) -> i32:
         let _ = node
-        let path = if self.sema.current_module_path.len() > 0: self.sema.current_module_path else: "<unknown>"
+        let path = if self.sema.current_module_path.len() > 0: self.sema.current_module_path.clone() else: "<unknown>"
         self.lower_str_lit(self.pool.intern(path))
 
     mut fn source_line_operand(node: i32) -> i32:
@@ -8909,7 +8909,8 @@ impl MirBuilder:
             let sp_has_rest = self.ast.get_extra(sp_extra)
             let sp_tail_count = self.ast.get_extra(sp_extra + 1 + sp_head)
             // Get array length from scrutinee sema type
-            let sp_arr_ty = self.place_local_type(scrutinee_place)
+            let sp_shape_place = self.pattern_shape_place(scrutinee_place)
+            let sp_arr_ty = self.sema.resolve_alias(self.place_local_type(sp_shape_place) as TypeId) as i32
             let sp_arr_tk = self.sema.get_type_kind(sp_arr_ty)
             if sp_arr_tk == TypeKind.TY_ARRAY:
                 let sp_arr_len = self.sema.get_type_d1(sp_arr_ty)
@@ -8927,8 +8928,55 @@ impl MirBuilder:
                         self.terminate(TermKind.TK_GOTO, fail_bb, 0, 0, 0)
                 return
 
-        // Other patterns (struct) are conservatively accepted here.
-        self.terminate(TermKind.TK_GOTO, arm_bb, 0, 0, 0)
+        // #1388: a named-field struct pattern tests every refutable field
+        // sub-pattern, exactly as the positional and tuple forms do. This
+        // used to fall into the accept-everything default below, so
+        // `Point { x: 0, y }` matched any `x`.
+        if pk == NodeKind.NK_PAT_STRUCT:
+            let s_start = self.ast.get_data1(pat_node)
+            let s_count = self.ast.get_data2(pat_node)
+            let struct_subject_place = self.pattern_shape_place(scrutinee_place)
+            let struct_ty = self.place_local_type(struct_subject_place)
+            var cur_test_bb = self.cur_bb
+            for si in 0..s_count:
+                let field_pat = self.ast.get_extra(s_start + 1 + si * 2 + 1)
+                if field_pat == 0:
+                    continue
+                let field_pk = self.ast.kind(field_pat)
+                if field_pk == NodeKind.NK_PAT_WILDCARD or field_pk == NodeKind.NK_PAT_IDENT:
+                    continue
+                let field_name = self.ast.get_extra(s_start + 1 + si * 2)
+                let field_ty = self.struct_pattern_field_type(struct_ty, field_name)
+                if field_ty == 0:
+                    self.terminate(TermKind.TK_GOTO, fail_bb, 0, 0, 0)
+                    return
+                let field_place = self.body.new_field_place(struct_subject_place, field_name, field_ty)
+                let child_place = self.pattern_child_subject_place(scrutinee_place, field_place, self.ast.get_start(pat_node))
+                let next_test_bb = self.new_block()
+                self.switch_to(cur_test_bb)
+                self.lower_pattern_match(child_place, field_pat, next_test_bb, fail_bb)
+                cur_test_bb = next_test_bb
+            self.switch_to(cur_test_bb)
+            self.terminate(TermKind.TK_GOTO, arm_bb, 0, 0, 0)
+            return
+
+        // A pattern with no test lowering must not match silently: a
+        // pattern that reaches here would otherwise accept every value.
+        eprint(f"error: pattern kind {pk as i32} has no match-test lowering")
+        self.mark_unsupported()
+        self.terminate(TermKind.TK_GOTO, fail_bb, 0, 0, 0)
+
+    // The type of the field a named-field struct pattern names, read from
+    // the subject's struct (or generic struct instance) type. Sema has
+    // rejected an unknown field; reaching one here is loud.
+    mut fn struct_pattern_field_type(struct_ty: i32, field_name: i32) -> i32:
+        let resolved = self.sema.resolve_alias(struct_ty as TypeId) as i32
+        for fi in 0..self.sema.type_reflection_field_count(resolved):
+            if self.sema.type_reflection_field_name(resolved, fi) == field_name:
+                return self.sema.type_reflection_field_type_frozen(resolved, fi)
+        eprint("error: struct pattern field reached MIR lowering without a field of the subject type")
+        self.mark_unsupported()
+        0
 
     mut fn lower_pattern(pat_node: i32, scrutinee_place: i32) -> Vec[i32]:
         let out: Vec[i32] = Vec.new()
@@ -9091,10 +9139,16 @@ impl MirBuilder:
             let s_start = self.ast.get_data1(pat_node)
             let s_count = self.ast.get_data2(pat_node)
             let struct_subject_place = self.pattern_shape_place(scrutinee_place)
+            let struct_ty = self.place_local_type(struct_subject_place)
             for si in 0..s_count:
                 let field_name = self.ast.get_extra(s_start + 1 + si * 2)
                 let field_pat = self.ast.get_extra(s_start + 1 + si * 2 + 1)
-                let field_place = self.body.new_field_place(struct_subject_place, field_name, 0)
+                // A generic struct instance's field type is the substituted
+                // one; left 0 the place had no MIR type.
+                let field_ty = self.struct_pattern_field_type(struct_ty, field_name)
+                if field_ty == 0:
+                    return out
+                let field_place = self.body.new_field_place(struct_subject_place, field_name, field_ty)
                 let child_place = self.pattern_child_subject_place(scrutinee_place, field_place, self.ast.get_start(pat_node))
                 if field_pat != 0:
                     let inner = self.lower_pattern(field_pat, child_place)
@@ -12345,12 +12399,12 @@ impl MirBuilder:
         let payload_place = self.body.new_field_place(downcast_place, 0, payload_ty)
         if method_name == "filter":
             let filter_args: Vec[i32] = Vec.new()
-            // Sema types the predicate's parameter OWNED (`x => x > 3` checks x
-            // as T), so pass by value. The old &T spelling was dormant: before
-            // D22 `find_exact_type(TY_REF, T)` found nothing (no &T in the type
-            // table) and fell back to by-value; D22 programs mint &T constantly,
-            // which activated the mismatch (ptr passed, i32 expected).
-            filter_args.push(self.operand_for_place(payload_place, payload_ty))
+            // §10.5 `(fn(&T) -> bool)`: the predicate observes the payload in
+            // place, like `inspect`; Sema types its parameter `&T`. Passing
+            // it by value moved the payload into the predicate, which freed
+            // it, and then moved it again into the kept `Some` (#1379).
+            let filter_ref_ty = self.sema.find_exact_type(TypeKind.TY_REF, payload_ty, 0, 0) as i32
+            filter_args.push(self.operand_for_place_arg(payload_place, payload_ty, filter_ref_ty, span))
             let keep_op = self.lower_call_with_operand_args(mapper_op, filter_args, self.sema.ty_bool as i32, node)
             let keep_bb = self.new_block()
             let reject_bb = self.new_block()
@@ -12367,12 +12421,22 @@ impl MirBuilder:
             self.assign_enum_variant_to_place(result_place, result_ty, self.sema.syms.some, kept_fields, span)
             self.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
 
+            // The predicate only observed: a rejected payload is still the
+            // subject's, and is dropped here, once.
             self.switch_to(reject_bb)
+            if mir_place_plain_local(&self.body, value_place) >= 0:
+                self.emit_drop_stmt(value_place, "filter-reject", span)
             let rejected_fields: Vec[i32] = Vec.new()
             self.assign_enum_variant_to_place(result_place, result_ty, self.sema.syms.none, rejected_fields, span)
             self.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
 
+            // #1379: every path decomposed the subject — kept moved the
+            // payload into the result, rejected dropped it, None owns
+            // nothing — so its own scope-exit drop is retired; left live, the
+            // enum glue freed the payload the kept `Some` owns (`drop(_7)`
+            // after `_9 = Some(move _7<as v0>.f0)`).
             self.switch_to(join_bb)
+            self.retire_decomposed_carrier(value_place)
             self.forget_string_flow_facts()
             return self.operand_for_place(result_place, result_ty)
         if method_name == "and_then":
@@ -12408,6 +12472,14 @@ impl MirBuilder:
         self.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
 
         self.switch_to(join_bb)
+        // `inspect` observes like `filter` and then moves the payload into
+        // the result's `Some`: the subject is decomposed (#1379 class; it was
+        // a DOUBLE FREE). map / and_then move the payload into a consuming
+        // closure whose body does not drop its owned parameter yet, so the
+        // subject's drop is what frees it; retiring it here would leak —
+        // those two move with the closure-parameter drop (#1363).
+        if method_name == "inspect":
+            self.retire_decomposed_carrier(value_place)
         self.forget_string_flow_facts()
         self.operand_for_place(result_place, result_ty)
 
@@ -12528,6 +12600,14 @@ impl MirBuilder:
         self.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
 
         self.switch_to(join_bb)
+        // inspect / inspect_err observe, then move each payload into the
+        // result; context / with_context move the Ok payload through and the
+        // Err payload into the context error. No path hands a payload to a
+        // consuming closure, so the subject is decomposed on every path
+        // (#1379 class; each was a DOUBLE FREE). map / map_err / and_then /
+        // or_else move one payload into a consuming closure (#1363).
+        if method_name == "inspect" or method_name == "inspect_err" or method_name == "context" or method_name == "with_context":
+            self.retire_decomposed_carrier(value_place)
         self.forget_string_flow_facts()
         self.operand_for_place(result_place, result_ty)
 
