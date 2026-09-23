@@ -7284,7 +7284,8 @@ fn ci_omitted_field(record: &str, idx: i32) -> str:
     record.slice((second + 1) as i64, n as i64)
 
 impl Sema:
-    mut fn check_ident(sym: i32, node: i32) -> i32:
+    mut fn check_ident(ident_sym: i32, node: i32) -> i32:
+        let sym = self.resolve_displaced_fn_ident(ident_sym, node)
         if sym == self.syms.file_magic:
             self.magic_ident_kinds.insert(node, SemaMagicIdentKind.FILE)
             self.typed_expr_types.insert(node, self.ty_str as i32)
@@ -14887,7 +14888,7 @@ impl Sema:
             args_count = self.ast.get_data2(rhs)
         if callee == 0 or self.ast.kind(callee) != NodeKind.NK_IDENT:
             return -1
-        let fn_sym = self.ast.get_data0(callee)
+        let fn_sym = self.resolve_displaced_fn_ident(self.ast.get_data0(callee), callee)
         let generic_fn_node = self.generic_fn_node_for_symbol(fn_sym)
         if generic_fn_node == 0:
             return -1
@@ -15940,7 +15941,7 @@ impl Sema:
         var callable_value_tid = 0
         var callable_closure_node = 0
         if self.ast.kind(callee) == NodeKind.NK_IDENT:
-            fn_sym = self.ast.get_data0(callee)
+            fn_sym = self.resolve_displaced_fn_ident(self.ast.get_data0(callee), callee)
             // Resolve for-comprehension _Payload marker to Some or Ok
             let call_name: str = with_str_clone_ref(self.pool_resolve(fn_sym))
             if self.require_std_tier_for_symbol(fn_sym, callee) == 0:
@@ -22281,7 +22282,7 @@ impl Sema:
             if comptime_value_is_valid(path_value) == 0 or path_value.kind != ComptimeValueKind.CV_STR:
                 self.emit_error("embed_file() argument must be a comptime string", path_node)
                 return self.ty_str as i32
-            let source_path = if self.current_module_path.len() > 0: self.current_module_path else: ""
+            let source_path = with_str_clone_ref(self.current_module_path)
             let read_result = self.read_tracked_embed_file(source_path, path_value.text)
             if not read_result.ok:
                 self.emit_error(read_result.error_msg, node)
