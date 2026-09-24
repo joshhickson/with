@@ -4253,6 +4253,27 @@ impl Parser:
             let n = self.expect_ident()
             if n == 0: return 0
             ops.push(n)
+        else if word == "valid":
+            // `valid on failed` (§16.2b.4: "unless the facade marks an
+            // operation as valid on the failure state"): the operation is
+            // presented on the failed-state resource (`FailedDatabase`) too.
+            kind = FACADE_CLAUSE_VALID_ON_FAILED
+            if not self.current_ident_is("on"):
+                self.emit_error("expected 'valid on failed' (§16.2b.4)")
+                return 0
+            self.advance()
+            if not self.current_ident_is("failed"):
+                self.emit_error("expected 'valid on failed' (§16.2b.4)")
+                return 0
+            self.advance()
+        else if word == "nullable":
+            // `nullable param N` (§16.2b.8: where the header does not
+            // establish nullability, the facade must): the parameter
+            // accepts NULL.
+            kind = FACADE_CLAUSE_NULLABLE
+            let r = self.parse_facade_param_ref()
+            if r == 0: return 0
+            ops.push(r)
         else if word == "thread":
             kind = FACADE_CLAUSE_THREAD
             while self.current_ident_is("creator") or self.current_ident_is("send") or self.current_ident_is("share") or self.current_ident_is("drop_any_thread"):

@@ -99,7 +99,7 @@ pub fn facade_render_block(pool: AstPool, intern: InternPool, facade: i32, ci: &
         let item = pool.get_extra(extra_start + i)
         if pool.kind(item as NodeId) == NodeKind.NK_FACADE_RESOURCE:
             let text_view = facade_render_text_view(pool, intern, item)
-            out = out ++ facade_render_resource(pool, intern, ci, item, facade_render_lend_methods(pool, intern, ci, item, true) ++ text_view ++ facade_render_callback_methods(pool, intern, ci, item), facade_render_lend_methods(pool, intern, ci, item, false) ++ text_view)
+            out = out ++ facade_render_resource(pool, intern, ci, item, facade_render_lend_methods(pool, intern, ci, item, true, false) ++ text_view ++ facade_render_callback_methods(pool, intern, ci, item), facade_render_lend_methods(pool, intern, ci, item, false, false) ++ text_view, facade_render_lend_methods(pool, intern, ci, item, false, true))
     facade_render_public(out)
 
 // Everything a facade renders is its module's public surface (spec
@@ -172,7 +172,13 @@ pub fn facade_render_text_view_name() -> str: "as_cstr"
 // consuming, destroying or retaining item is not a lend, a by-value token
 // is not recognized by its type, and an item describing a resource's own
 // producer, initializer or destroyer adds facts to that operation.
-fn facade_render_lend_methods(pool: AstPool, intern: InternPool, ci: &Vec[i32], resource: i32, with_borrowed_returns: bool) -> str:
+//
+// `failed_only` (stage 12b, #1612; spec §16.2b.4): the lends and text
+// views the facade marks `valid on failed`, rendered on the failed-state
+// type `Failed<R>` — the same body over the same `repr` field — and
+// nothing else (a borrowed-resource return holds a view of a live `R`;
+// Sema refuses the mark on one).
+fn facade_render_lend_methods(pool: AstPool, intern: InternPool, ci: &Vec[i32], resource: i32, with_borrowed_returns: bool, failed_only: bool) -> str:
     let repr_text = render_type_expr(pool, intern, pool.get_extra(pool.get_data1(resource as NodeId)) as NodeId)
     let repr = facade_render_unalias(pool, intern, repr_text)
     let in_place = not repr.starts_with("*") and facade_render_has_clause(pool, resource, FACADE_CLAUSE_INIT)
@@ -184,6 +190,8 @@ fn facade_render_lend_methods(pool: AstPool, intern: InternPool, ci: &Vec[i32], 
     for i in 0..items.len() as i32:
         let li = facade_render_lend_item(pool, intern, ci, items[i])
         if not facade_render_lend_hosted(pool, intern, &li, resource, repr):
+            continue
+        if failed_only and (not li.valid_on_failed or li.borrow_res != 0):
             continue
         let decl = li.decl
         let meta = pool.find_fn_meta(decl as NodeId)
@@ -295,7 +303,9 @@ fn facade_render_resources_wrapping(pool: AstPool, intern: InternPool, repr: &st
 // type by the naming convention §16.2a already applies to raw imports: the
 // C name less the representation's snake-case prefix (`db_count` on
 // `Database wraps *mut db` is `d.count()`, `sqlite3_prepare_v2` on `*mut
-// sqlite3` is `prepare_v2`), or the `rename` an fn item states. A producer
+// sqlite3` is `prepare_v2`) or less the library prefix the struct name
+// carries (`sqlite3_step` on `*mut sqlite3_stmt` is `step`,
+// facade_render_shorten), or the `rename` an fn item states. A producer
 // whose first parameter receives another resource is presented as a method
 // of that resource too (`db.prepare(sql)` beside `Statement.prepare(db,
 // sql)`, facade_render_receiver_method), and the constructor of a resource
@@ -496,15 +506,35 @@ fn facade_render_struct_name(text: &str) -> str:
 // snake case, `GHashTable` → `g_hash_table_`, or case-insensitively as
 // `Struct_`), or "" when none matches, the remainder is not an identifier,
 // or it is a With keyword or `drop`.
+//
+// The library prefix (#1610): a C library names its types and its
+// functions under one prefix, and an operation of a resource carries the
+// library's, not the struct's — `sqlite3_step(sqlite3_stmt *)`,
+// `curl_easy_perform(CURL *)`, `inflate(z_streamp)`. So each snake-case
+// component prefix of the struct name is tried too (`sqlite3_stmt` →
+// `sqlite3_`; `g_hash_table` → `g_hash_`, `g_`), and the longest matching
+// prefix wins. Being wrong here changes a spelling (§54), and a clash
+// between two operations still fails closed (facade_render_present).
 fn facade_render_shorten(cname: &str, names: &Vec[str]) -> str:
     var best = ""
     for i in 0..names.len() as i32:
         let sname = names[i]
-        var m = ci_strip_snake_prefix(cname, ci_compute_snake_prefix(sname))
+        let snake = ci_compute_snake_prefix(sname)
+        var m = ci_strip_snake_prefix(cname, snake)
         if m.len() == 0:
             m = ci_strip_struct_prefix(cname, sname)
         if m.len() > 0 and (best.len() == 0 or m.len() < best.len()):
             best = m
+        // `snake` ends with the `_` that closes the struct name; every
+        // earlier `_` closes a library prefix.
+        var end = snake.len() as i32 - 1
+        while end > 0:
+            end = end - 1
+            if snake[end] != '_':
+                continue
+            let lib = ci_strip_snake_prefix(cname, snake.slice(0, end + 1))
+            if lib.len() > 0 and (best.len() == 0 or lib.len() < best.len()):
+                best = lib
     if best.len() == 0 or keyword_lookup(best) >= 0:
         return ""
     let c0 = best[0]
@@ -598,10 +628,11 @@ type FacadeLendItem {
     borrow_res: i32,
     borrow_from: i32,
     text_view: bool,
+    valid_on_failed: bool,   // rendered on `Failed<R>` too (#1612)
 }
 
 fn facade_render_lend_item(pool: AstPool, intern: InternPool, ci: &Vec[i32], item: i32) -> FacadeLendItem:
-    var li = FacadeLendItem { decl: 0, of_sym: 0, rename: 0, lends: true, borrow_res: 0, borrow_from: 0, text_view: false }
+    var li = FacadeLendItem { decl: 0, of_sym: 0, rename: 0, lends: true, borrow_res: 0, borrow_from: 0, text_view: false, valid_on_failed: false }
     let cstart = pool.get_data1(item as NodeId)
     for k in 0..pool.get_data2(item as NodeId):
         let clause = pool.get_extra(cstart + k)
@@ -620,6 +651,7 @@ fn facade_render_lend_item(pool: AstPool, intern: InternPool, ci: &Vec[i32], ite
             // storage, no origin to keep it inside.
             if render_type_expr(pool, intern, pool.get_extra(ops) as NodeId) == "CStr": li.text_view = true
             else: li.lends = false
+        else if kind == FACADE_CLAUSE_VALID_ON_FAILED: li.valid_on_failed = true
         else if kind != FACADE_CLAUSE_LEND and kind != FACADE_CLAUSE_PRESERVES: li.lends = false
     if not li.lends:
         return li
@@ -672,7 +704,7 @@ fn facade_render_all_items(pool: AstPool, kind: NodeKind) -> Vec[i32]:
                 out.push(item)
     out
 
-fn facade_render_resource(pool: AstPool, intern: InternPool, ci: &Vec[i32], item: i32, methods: &str, plain_methods: &str) -> str:
+fn facade_render_resource(pool: AstPool, intern: InternPool, ci: &Vec[i32], item: i32, methods: &str, plain_methods: &str, failed_methods: &str) -> str:
     let name: str = intern.resolve(pool.get_data0(item as NodeId))
     let extra_start = pool.get_data1(item as NodeId)
     let clause_count = pool.get_data2(item as NodeId)
@@ -796,7 +828,7 @@ fn facade_render_resource(pool: AstPool, intern: InternPool, ci: &Vec[i32], item
     // `FailedWithResource`.
     let dependent = deps.slot_res.len() > 0
     if status_type.len() > 0:
-        out = out ++ facade_render_error_type(pool, intern, name, repr_text, status_type, failed_state, failed_state and not dependent, drop_fn)
+        out = out ++ facade_render_error_type(pool, intern, name, repr_text, status_type, failed_state, failed_state and not dependent, drop_fn, failed_methods)
     // Borrowed returns of this resource (ruling §26): `Borrowed<R>`.
     out = out ++ facade_render_borrowed_type(pool, intern, ci, item, repr_text, plain_methods)
     for pi in 0..producers.len() as i32:
@@ -1226,22 +1258,28 @@ pub fn facade_render_failed_name(name: &str) -> str: "Failed" ++ name
 // alone.
 //
 // The resource a failed producer still produced is `Failed<R>`, not `R`: the
-// failure state admits only the operations the facade states are valid on
-// it, the facade has no clause for that yet, and so it admits none — no lend
-// methods, no destroyers, only raw access to its representation under the
-// raw C rules. Its Drop runs the facade's `drop` exactly once: dropping the
-// error, or whatever took the resource out of it, destroys it.
+// failure state admits only the operations the facade marks `valid on
+// failed` (stage 12b, #1612; spec §16.2b.4) — the lends and text views of
+// `R` so marked, rendered here over the same `repr` field under the names
+// they have on `R` — and otherwise only raw access to its representation
+// under the raw C rules: no destroyers, no callbacks, no unmarked lend. Its
+// Drop runs the facade's `drop` exactly once: dropping the error, or
+// whatever took the resource out of it, destroys it.
 //
 //     type FailedDatabase { repr: *mut sqlite3 }
 //     impl Drop for FailedDatabase:
 //         move fn drop():
 //             unsafe { sqlite3_close(self.repr) }
-fn facade_render_error_type(pool: AstPool, intern: InternPool, name: &str, repr_text: &str, status_type: &str, out_param: bool, failed_state: bool, drop_fn: i32) -> str:
+//     impl FailedDatabase:
+//         fn errmsg() -> Option[CStr]: …                 // `valid on failed`
+fn facade_render_error_type(pool: AstPool, intern: InternPool, name: &str, repr_text: &str, status_type: &str, out_param: bool, failed_state: bool, drop_fn: i32, failed_methods: &str) -> str:
     let err = facade_render_error_name(name)
     var out = ""
     if failed_state:
         let failed = facade_render_failed_name(name)
         out = "type " ++ failed ++ " { repr: " ++ repr_text ++ " }\nimpl Drop for " ++ failed ++ ":\n    move fn drop():\n        " ++ facade_render_call(pool, intern, drop_fn, facade_render_repr_arg(pool, intern, drop_fn, repr_text, "self.repr", false)) ++ "\n"
+        if failed_methods.len() > 0:
+            out = out ++ "impl " ++ failed ++ ":\n" ++ failed_methods
     out = out ++ "error " ++ err ++ " =\n    | Failed(status: " ++ status_type ++ ")\n"
     if failed_state:
         out = out ++ "    | FailedWithResource(status: " ++ status_type ++ ", resource: " ++ facade_render_failed_name(name) ++ ")\n"
@@ -1562,10 +1600,11 @@ type FacadeCallbackItem {
     destroy: i32,     // the destroy callback a `consumes … destroyed_by` names (withheld), or -1
     retained: bool,
     consumed: bool,
+    nullable: bool,   // the paired callback is `nullable` (#1618): `Option[extern "C" fn(&U, …)]`, its userdata `Option[&U]`
 }
 
 fn facade_render_callback_item(pool: AstPool, intern: InternPool, ci: &Vec[i32], item: i32) -> FacadeCallbackItem:
-    var cbi = FacadeCallbackItem { decl: 0, of_sym: 0, rename: 0, userdata: -1, callback: -1, destroy: -1, retained: false, consumed: false }
+    var cbi = FacadeCallbackItem { decl: 0, of_sym: 0, rename: 0, userdata: -1, callback: -1, destroy: -1, retained: false, consumed: false, nullable: false }
     let cname: str = intern.resolve(pool.get_data0(item as NodeId))
     if facade_render_is_resource_op(pool, intern, cname):
         return cbi
@@ -1573,6 +1612,7 @@ fn facade_render_callback_item(pool: AstPool, intern: InternPool, ci: &Vec[i32],
     if decl == 0:
         return cbi
     var is_callback = false
+    var nullable_pi = -1
     let cstart = pool.get_data1(item as NodeId)
     for k in 0..pool.get_data2(item as NodeId):
         let clause = pool.get_extra(cstart + k)
@@ -1581,6 +1621,13 @@ fn facade_render_callback_item(pool: AstPool, intern: InternPool, ci: &Vec[i32],
         if kind == FACADE_CLAUSE_OF: cbi.of_sym = pool.get_extra(ops)
         else if kind == FACADE_CLAUSE_RENAME: cbi.rename = pool.get_extra(ops)
         else if kind == FACADE_CLAUSE_LEND or kind == FACADE_CLAUSE_PRESERVES: continue
+        else if kind == FACADE_CLAUSE_NULLABLE:
+            // Rendered for the paired callback alone (Sema refuses the
+            // rest, verify_facade_callback_items).
+            let npi = facade_render_param_ref(pool, intern, decl, pool.get_extra(ops))
+            if npi < 0 or nullable_pi >= 0:
+                return cbi
+            nullable_pi = npi
         else if kind == FACADE_CLAUSE_CALLBACK_THREAD: is_callback = true
         else if kind == FACADE_CLAUSE_CALLBACK_USERDATA:
             let cb = facade_render_param_ref(pool, intern, decl, pool.get_extra(ops))
@@ -1622,6 +1669,10 @@ fn facade_render_callback_item(pool: AstPool, intern: InternPool, ci: &Vec[i32],
             return cbi
     if not is_callback or (cbi.retained and cbi.consumed):
         return cbi
+    if nullable_pi >= 0:
+        if nullable_pi != cbi.callback or cbi.retained or cbi.consumed:
+            return cbi
+        cbi.nullable = true
     cbi.decl = decl
     cbi
 
@@ -1630,7 +1681,7 @@ fn facade_render_callback_item(pool: AstPool, intern: InternPool, ci: &Vec[i32],
 fn facade_render_callback_hosted(pool: AstPool, intern: InternPool, cbi: &FacadeCallbackItem, resource: i32, repr: &str) -> bool:
     if cbi.decl == 0:
         return false
-    let li = FacadeLendItem { decl: cbi.decl, of_sym: cbi.of_sym, rename: cbi.rename, lends: true, borrow_res: 0, borrow_from: 0, text_view: false }
+    let li = FacadeLendItem { decl: cbi.decl, of_sym: cbi.of_sym, rename: cbi.rename, lends: true, borrow_res: 0, borrow_from: 0, text_view: false, valid_on_failed: false }
     facade_render_lend_hosted(pool, intern, &li, resource, repr)
 
 // Whether some callback method of `resource` retains userdata: the
@@ -1737,6 +1788,10 @@ fn facade_render_callback_methods(pool: AstPool, intern: InternPool, ci: &Vec[i3
         let free = facade_render_fresh("facade_free", taken)
         let q = facade_render_fresh("facade_q", taken)
         let b = facade_render_fresh("facade_b", taken)
+        let ncb = facade_render_fresh("facade_cb", taken)
+        let nud = facade_render_fresh("facade_ud", taken)
+        let nf = facade_render_fresh("facade_f", taken)
+        let nu = facade_render_fresh("facade_u", taken)
         let generic = cbi.userdata >= 0
         let kept = cbi.retained or cbi.consumed
         let start = pool.fn_meta_param_start(meta)
@@ -1748,6 +1803,7 @@ fn facade_render_callback_methods(pool: AstPool, intern: InternPool, ci: &Vec[i3
         var params = ""
         var args = repr_arg.clone()
         var ud_name = ""
+        var cb_name = ""
         for pi in 1..pool.fn_meta_param_count(meta):
             args = args ++ ", "
             if pi == cbi.destroy:
@@ -1762,12 +1818,25 @@ fn facade_render_callback_methods(pool: AstPool, intern: InternPool, ci: &Vec[i3
                 if kept:
                     shown = "U"
                     arg = ptr.clone()
+                else if cbi.nullable:
+                    // A nullable callback's userdata (#1618): absent with
+                    // it — `Option[&U]`, NULL to C for None.
+                    shown = "Option[&U]"
+                    arg = nud.clone()
                 else:
                     shown = "&U"
                     arg = pname ++ " as *const U as " ++ facade_render_unalias(pool, intern, ptype)
             else if pi == cbi.callback:
-                shown = cb_type.clone()
-                arg = "transmute[" ++ facade_render_callback_raw_type(facade_render_unalias(pool, intern, ptype)) ++ "](" ++ pname ++ ")"
+                cb_name = pname.clone()
+                if cbi.nullable:
+                    // `nullable param N` on the paired callback (ruling
+                    // §43, spec §16.2b.8): `Option` of the typed callback,
+                    // NULL to C for None.
+                    shown = "Option[" ++ cb_type ++ "]"
+                    arg = ncb.clone()
+                else:
+                    shown = cb_type.clone()
+                    arg = "transmute[" ++ facade_render_callback_raw_type(facade_render_unalias(pool, intern, ptype)) ++ "](" ++ pname ++ ")"
             else:
                 let res = facade_render_received(pool, intern, ptype)
                 if res > 0:
@@ -1782,6 +1851,18 @@ fn facade_render_callback_methods(pool: AstPool, intern: InternPool, ci: &Vec[i3
             args = args ++ arg
         let head = (if cbi.retained: "    mut fn " else: "    fn ") ++ mname ++ (if generic: "[U]" else: "") ++ "(" ++ params ++ ")" ++ facade_render_return(pool, intern, decl) ++ ":\n"
         var body = ""
+        if cbi.nullable:
+            // The pair is present or absent together (Sema checks each
+            // call, SemaCheck.w check_method_call): each maps to its C
+            // value, NULL for None.
+            let raw_cb = facade_render_callback_raw_type(facade_render_unalias(pool, intern, facade_render_param_type(pool, intern, decl, cbi.callback)))
+            let ud_type = facade_render_unalias(pool, intern, facade_render_param_type(pool, intern, decl, cbi.userdata))
+            body = body ++ "        let " ++ ncb ++ ": " ++ raw_cb ++ " = match " ++ cb_name ++ ":\n            Some(" ++ nf ++ ") => unsafe { transmute[" ++ raw_cb ++ "](" ++ nf ++ ") }\n            None => null\n"
+            // The userdata by transmute, not `as *const U as …`: with no
+            // callback `U` is Unit, and a cast to `*const Unit` traps
+            // codegen (#1626), which a pointer-to-pointer transmute of the
+            // same representation does not.
+            body = body ++ "        let " ++ nud ++ ": " ++ ud_type ++ " = match " ++ ud_name ++ ":\n            Some(" ++ nu ++ ") => unsafe { transmute[" ++ ud_type ++ "](" ++ nu ++ ") }\n            None => null\n"
         if generic and kept:
             let ud_type = facade_render_unalias(pool, intern, facade_render_param_type(pool, intern, decl, cbi.userdata))
             body = body ++ "        let " ++ cell ++ " = Box.new(" ++ ud_name ++ ")\n"

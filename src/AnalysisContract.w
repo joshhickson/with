@@ -399,6 +399,10 @@ fn contract_collect_fn(report: &AnalysisReport, sema: &Sema, ci: i32, source_pat
     if c.rename != 0:
         let clause = contract_clause(sema, node, FACADE_CLAUSE_RENAME, 0)
         contract_row(report, sema, &site, subject, CONTRACT_FN, clause, c.rename, owner, -1, "presentation", "rename " ++ sema.safe_symbol_text(c.rename), contract_clause_at(sema, &site, clause))
+    // The failed state (§16.2b.4, #1612).
+    if c.valid_on_failed != 0:
+        let clause = contract_clause(sema, node, FACADE_CLAUSE_VALID_ON_FAILED, 0)
+        contract_row(report, sema, &site, subject, CONTRACT_FN, clause, c.fn_sym, owner, -1, "failed-state", "valid on the failed-state resource too (presented on Failed<R>)", contract_clause_at(sema, &site, clause))
     if hosts.len() == 1 and not sema.facade_fn_is_resource_op(c.fn_sym):
         let host = contract_resource_name(sema, hosts[0])
         let presented = sema.facade_presented(hosts[0], fname)
@@ -439,6 +443,12 @@ fn contract_collect_callback(report: &AnalysisReport, sema: &Sema, ci: i32, pi: 
         contract_row(report, sema, site, subject, CONTRACT_CALLBACK, clause, c.fn_sym, owner, pi, "ownership", "the callback owns what C passes it", contract_clause_at(sema, site, clause))
     if not role_stated:
         contract_row(report, sema, site, subject, CONTRACT_CALLBACK, node, c.fn_sym, owner, pi, "role", "used during this call only; not retained", "default:callback-scope borrow (§16.2b.9)")
+    // Nullability (§16.2b.8, #1618): the paired callback, absent with its
+    // userdata.
+    for k in 0..c.nullable_params.len() as i32:
+        if c.nullable_params[k] != pi: continue
+        let clause = contract_clause(sema, node, FACADE_CLAUSE_NULLABLE, k)
+        contract_row(report, sema, site, subject, CONTRACT_CALLBACK, clause, c.fn_sym, owner, pi, "nullability", "nullable; None for the callback is None for its userdata", contract_clause_at(sema, site, clause))
     if c.callback_thread_any != 0:
         let clause = contract_clause(sema, node, FACADE_CLAUSE_CALLBACK_THREAD, 0)
         contract_row(report, sema, site, subject, CONTRACT_CALLBACK, clause, c.fn_sym, owner, pi, "thread", "any; captured With state must be Send and Sync", contract_clause_at(sema, site, clause))

@@ -265,6 +265,56 @@ presentation override. It compiles and typechecks. **Only then**:
 and libcurl fixtures, `examples/c-interop`, the blog and documentation
 examples are rewritten, and `user-programs-safe` (`build.w:1836`) goes green.
 
+**Stage 12b — what the SQLite facade exposed (#1618, #1612, #1610).** Three
+facade-language gaps stage 12 found and left as findings, closed against
+the canon. Derived decisions (the ruling and the spec are silent on the
+exact spelling; each is recorded here, not in the spec, whose wording only
+Eric blesses):
+
+- **`valid on failed`** (#1612). Spec §16.2b.4: a failed-state resource
+  "admits raw access only, unless the facade marks an operation as valid on
+  the failure state"; D59 (amended): "raw access only, until the facade can
+  mark operations valid on the failure state: `sqlite3_errmsg` is,
+  `sqlite3_exec` meaningfully is not." The mark is the fn-item clause
+  `valid on failed`, named after the type it widens (`FailedDatabase`,
+  §16.2b.4). It renders the lend or text view on `Failed<R>` under the name
+  it has on `R`, with the same declared summary (a view of the failed
+  handle). Conservative bounds: only a lend or a text view, only of a
+  resource that has a failed state (an out-parameter producer under `ok`,
+  not dependent — ruling §18); a producing, destroying, consuming, retaining
+  or callback operation, or one returning a borrowed resource, is refused
+  (the failed state is destroyed by its error's Drop and owns nothing else;
+  `Borrowed<R>` holds a view of a live `R`). An unmarked operation stays
+  unavailable, and the diagnostic names the clause.
+- **`nullable param N`** (#1618). Ruling §43 / spec §16.2b.8: "Where safe
+  modeling requires nullability and the header does not establish it, the
+  facade or a trusted convention profile must"; `nullable -> Option`. The
+  clause is the facade's statement, in the ruling's own word, and the
+  rendering is the one nullability already has: `Option`. Rendered for one
+  shape in this stage — the callback of a `callback param N userdata param
+  M` pairing that C uses during the call only: `Option[extern "C" fn(&U,
+  …)]`, and its userdata `Option[&U]`, since the userdata is what the
+  callback receives and is absent with it (`db.exec(sql, None, None,
+  null)`). Sema binds `U` to Unit when both are `None`, and refuses one
+  without the other at the call, naming the pairing. A `nullable` on any
+  other parameter is refused rather than rendered as nothing: a raw pointer
+  accepts `null` as C declares it, and `Option[&str]` / `Option[&R]`
+  parameters are not modeled. Retained or consumed userdata's callbacks are
+  not nullable (C keeps them past the call).
+- **Library-prefix presentation** (#1610). Ruling §54 / spec §16.2b.11
+  permit "shortening prefixes" silently under "a recognizable
+  naming/receiver pattern". The renderer's convention shortens by the
+  representation's struct name (`sqlite3_` for `sqlite3`) and now also by
+  each snake-case component prefix of it (`sqlite3_stmt` → `sqlite3_`;
+  `g_hash_table` → `g_hash_`, `g_`), longest match winning, so
+  `sqlite3_step(sqlite3_stmt *)` is `stmt.step()` with no `rename`. The
+  prefix comes from the representation's struct name only, never from
+  another resource's: a child's producer presented on its parent shortens
+  by the parent's prefixes (`db_new` and `st_new` on `Database` stay
+  `new` and `st_new`, not a clash). Ambiguity keeps failing closed (§55).
+  The SQLite facade keeps the one explicit override §66 requires
+  (`rename prepare`).
+
 **Stage 13 — runtime audit (ruling §52).** Domain facts for the
 `rt_libc_*` / `with_libc_*` seams that touch `errno`, `environ`, `locale`,
 and an audit lane in the shape of `libc-surface-check` (`build/compiler.w:
