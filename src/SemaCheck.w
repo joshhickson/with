@@ -7060,7 +7060,9 @@ impl Sema:
                     self.emit_error("conditional move of Drop value requires drop-state tracking", node)
                     self.typed_expr_types.insert(node, ty as i32)
                     return ty
+                self.move_site_node = node
                 self.scope_set_state(sym, VarState.MOVED)
+                self.move_site_node = 0
             // If the moved binding is a parameter, record EFF_CONSUME
             self.effect_note_origin_node = node
             self.note_param_effect(sym, EFF_CONSUME)
@@ -11023,8 +11025,13 @@ impl Sema:
                 let origin_name: str = with_str_clone_ref(self.pool_resolve(origin_sym))
                 if self.expr_type_is_generator_state(expr_node) != 0:
                     self.emit_error("generator captures reference to '" ++ origin_name ++ "' that cannot escape", report_node)
-                else:
-                    self.emit_error("returned ephemeral value may outlive its origin '" ++ origin_name ++ "'", report_node)
+                else if self.suppress_errors == 0:
+                    // §8, §57: a facade resource that depends on the origin
+                    // says why it cannot escape.
+                    let ty = if self.typed_expr_types.contains(expr_node): self.typed_expr_types.get(expr_node).unwrap() else: 0
+                    var diag = Diagnostic.err("returned ephemeral value may outlive its origin '" ++ origin_name ++ "'", Span { file: self.local_file_id, start: self.ast.get_start(report_node), end: self.ast.get_end(report_node) })
+                    diag = self.with_facade_dependency_notes(move diag, ty)
+                    self.diags.emit(move diag)
                 return
 
     // D22: returning a transparent carrier of views is an escape_view effect
@@ -11089,10 +11096,29 @@ impl Sema:
                     union_mask = union_mask | self.compute_expr_view_origin_mask(origin_arg)
                     let dep_len_before = concrete_deps.len() as i32
                     concrete_deps = self.collect_expr_view_deps(origin_arg, move concrete_deps)
-                    if concrete_deps.len() as i32 == dep_len_before:
+                    // The result may reference the origin argument's own
+                    // storage, so a VALUE argument is an origin itself — an
+                    // ephemeral value carrying views (`tok`, a dependent
+                    // facade child) as much as an owned container with none.
+                    // Only a reference argument is transparent: its storage
+                    // is the pointee, whose origins the collect found. An
+                    // ephemeral receiver's deps alone let a view of it
+                    // outlive it (§21.1 Rule 6, §5.5).
+                    if concrete_deps.len() as i32 == dep_len_before or self.expr_type_is_value(origin_arg):
                         concrete_deps = self.push_unique_i32(move concrete_deps, self.place_root_sym(origin_arg))
         if union_mask != 0 or concrete_deps.len() > 0:
             self.set_expr_view_deps(call_node, union_mask, concrete_deps)
+
+    // Whether an argument expression is a value (not a reference or raw
+    // pointer): its own storage is what a view of it points into.
+    fn expr_type_is_value(node: i32) -> bool:
+        if not self.typed_expr_types.contains(node):
+            return false
+        let ty: i32 = self.typed_expr_types.get(node).unwrap()
+        if ty == 0:
+            return false
+        let tk = self.get_type_kind(self.resolve_alias(ty as TypeId))
+        tk != TypeKind.TY_REF and tk != TypeKind.TY_PTR
 
     fn record_generator_call_ref_origins(call_node: i32, sig_idx: i32, param_offset: i32, extra_start: i32, arg_count: i32, has_resolved: i32):
         if call_node == 0 or sig_idx < 0:
@@ -24059,7 +24085,9 @@ impl Sema:
                     let owned_name = self.type_name(pointee)
                     diag.add_note("take an independent Copy value with `let " ++ ref_name ++ ": " ++ owned_name ++ " = ...`")
                     diag.add_help("change the binding to `let " ++ ref_name ++ ": " ++ owned_name ++ " = ...`")
-            self.diags.emit(move diag)
+            // §8, §57: a facade resource that depends on the place says why.
+            let noted = self.with_facade_dependency_notes(move diag, self.scope_lookup(ref_sym))
+            self.diags.emit(move noted)
             return
 
     // Register a borrow with pre-computed place/kind/field/path.
@@ -25658,7 +25686,9 @@ impl Sema:
                         with_eprint(
                             f"[move] sym={name} tid={tid} resolved={resolved as i32} kind={self.get_type_kind(resolved)}"
                         )
+                    self.move_site_node = node
                     self.scope_set_state(sym, VarState.MOVED)
+                    self.move_site_node = 0
                     self.effect_note_origin_node = node
                     self.note_param_effect(sym, EFF_CONSUME)
                     self.effect_note_origin_node = 0
