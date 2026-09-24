@@ -129,14 +129,6 @@ fn rt_pow10_f64(precision: i32) -> f64:
         i = i + 1
     out
 
-fn u64_decimal_digits(n_arg: u64) -> i32:
-    var n = n_arg
-    var digits: i32 = 1
-    while n >= 10u64:
-        n = n / 10u64
-        digits = digits + 1
-    digits
-
 fn rt_f64_write_special(bits: u64, buf: *mut u8, bufsize: i64) -> i64:
     if f64_is_nan_bits(bits):
         return rt_buf_write_ascii(buf, bufsize, 0, "nan" as *const u8, 3)
@@ -209,19 +201,314 @@ fn rt_f64_write_exponent(exp: i32, buf: *mut u8, bufsize: i64, pos_arg: i64) -> 
     let elen = u64_to_buf_internal(e as u64, &eb as *mut u8)
     rt_buf_write_ascii(buf, bufsize, pos, &eb as *const u8, elen)
 
-fn rt_f64_write_scientific_abs(val: f64, precision: i32, trim: bool, buf: *mut u8, bufsize: i64, pos_arg: i64) -> i64:
-    var scaled = val
-    var exp: i32 = 0
-    while scaled >= 10.0:
-        scaled = scaled / 10.0
-        exp = exp + 1
-    while scaled < 1.0:
-        scaled = scaled * 10.0
-        exp = exp - 1
-    var pos = rt_f64_write_fixed_abs(scaled, precision, trim, buf, bufsize, pos_arg)
-    rt_f64_write_exponent(exp, buf, bufsize, pos)
+// ── Exact float digits ─────────────────────────────────────────────
+// Float display takes its digits from exact integer arithmetic on the value's
+// binary fraction, never from scaling the float, so no step rounds.
 
-// Format f64 to buffer in general display mode. Returns length.
+// A nonnegative integer of up to 41 32-bit limbs, least significant first. 41
+// limbs are 1312 bits; the largest value formed, r * 10 for the smallest
+// subnormal, stays under 1140.
+type RtBig:
+    limbs: [41]u32
+    len: i64
+
+// Decimal digits d1…dn (ASCII) of a float, with the value 0.d1…dn × 10^k.
+type RtDigits:
+    d: [24]u8
+    n: i64
+    k: i64
+
+// A finite positive f64 as f × 2^e, with its biased exponent field.
+type RtF64Parts:
+    f: u64
+    e: i64
+    biased: i64
+
+fn rt_big(v: u64) -> RtBig:
+    var b = RtBig { limbs: [0 as u32; 41], len: 0 }
+    b.set_u64(v)
+    b
+
+impl RtBig:
+    fn at(i: i64) -> u64: self.limbs[i] as u64
+
+    mut fn put(i: i64, v: u64): self.limbs[i] = (v & 0xffffffffu64) as u32
+
+    mut fn set_u64(v: u64):
+        self.put(0, v)
+        self.put(1, v >> 32)
+        self.len = if (v >> 32) != 0u64: 2 else if v != 0u64: 1 else: 0
+
+    mut fn copy_from(b: &RtBig):
+        var i: i64 = 0
+        while i < b.len:
+            self.limbs[i] = b.limbs[i]
+            i = i + 1
+        self.len = b.len
+
+    mut fn mul_small(m: u64):
+        var carry: u64 = 0
+        var i: i64 = 0
+        while i < self.len:
+            let t = self.at(i) * m + carry
+            self.put(i, t)
+            carry = t >> 32
+            i = i + 1
+        if carry != 0u64:
+            self.put(self.len, carry)
+            self.len = self.len + 1
+
+    mut fn mul_pow10(n: i64):
+        var left = n
+        while left >= 9:
+            self.mul_small(1000000000)
+            left = left - 9
+        if left > 0:
+            self.mul_small(rt_pow10_u64(left as i32))
+
+    mut fn shl(bits: i64):
+        if self.len > 0 and bits > 0:
+            let words = bits / 32
+            let sh = (bits % 32) as u64
+            var top: u64 = 0
+            if sh != 0u64:
+                top = self.at(self.len - 1) >> (32 - sh)
+            var i = self.len - 1
+            while i >= 0:
+                var v = self.at(i) << sh
+                if sh != 0u64 and i > 0:
+                    v = v | (self.at(i - 1) >> (32 - sh))
+                self.put(i + words, v)
+                i = i - 1
+            var z: i64 = 0
+            while z < words:
+                self.put(z, 0)
+                z = z + 1
+            self.len = self.len + words
+            if top != 0u64:
+                self.put(self.len, top)
+                self.len = self.len + 1
+
+    fn cmp(b: &RtBig) -> i32:
+        if self.len != b.len:
+            return if self.len > b.len: 1 else: -1
+        var i = self.len - 1
+        while i >= 0:
+            let x = self.limbs[i]
+            let y = b.limbs[i]
+            if x != y:
+                return if x > y: 1 else: -1
+            i = i - 1
+        0
+
+    // self -= b, for self >= b.
+    mut fn sub(b: &RtBig):
+        var borrow: u64 = 0
+        var i: i64 = 0
+        while i < self.len:
+            var take = borrow
+            if i < b.len:
+                take = take + b.at(i)
+            let x = self.at(i)
+            if x >= take:
+                self.put(i, x - take)
+                borrow = 0
+            else:
+                self.put(i, x + 4294967296 - take)
+                borrow = 1
+            i = i + 1
+        while self.len > 0 and self.limbs[self.len - 1] == 0:
+            self.len = self.len - 1
+
+    mut fn set_sum(a: &RtBig, b: &RtBig):
+        let n = if a.len > b.len: a.len else: b.len
+        var carry: u64 = 0
+        var i: i64 = 0
+        while i < n:
+            var t = carry
+            if i < a.len:
+                t = t + a.at(i)
+            if i < b.len:
+                t = t + b.at(i)
+            self.put(i, t)
+            carry = t >> 32
+            i = i + 1
+        self.len = n
+        if carry != 0u64:
+            self.put(n, carry)
+            self.len = n + 1
+
+    // The next decimal digit, self / s for self < 10 * s, leaving self mod s.
+    mut fn take_digit(s: &RtBig) -> i32:
+        var d: i32 = 0
+        while self.cmp(s) >= 0:
+            self.sub(s)
+            d = d + 1
+        d
+
+fn rt_f64_parts(v: f64) -> RtF64Parts:
+    let bits = f64_bits(v)
+    let biased = ((bits >> 52) & 0x7ffu64) as i64
+    let frac = bits & 0xfffffffffffffu64
+    if biased == 0: RtF64Parts { f: frac, e: -1074, biased } else: RtF64Parts { f: frac | 0x10000000000000u64, e: biased - 1075, biased }
+
+// A lower bound on the decimal exponent k with v < 10^k: floor(log2 v) times
+// 78913 / 2^18, which is just under log10(2). Callers raise it to the exact k.
+fn rt_f64_k_estimate(p: &RtF64Parts) -> i64:
+    var log2v = p.biased - 1023
+    if p.biased == 0:
+        var bits: i64 = 0
+        var t = p.f
+        while t != 0u64:
+            bits = bits + 1
+            t = t >> 1
+        log2v = bits - 1075
+    if log2v >= 0: (log2v * 78913) >> 18 else: 0 - (((0 - log2v) * 78913) >> 18) - 1
+
+// The shortest decimal that reads back as v (finite, v > 0), and the closest to v
+// when several are that short. Burger & Dybvig, "Printing Floating-Point Numbers
+// Quickly and Accurately" (PLDI 1996), on exact integers, so no step rounds.
+fn rt_f64_shortest_digits(v: f64) -> RtDigits:
+    let p = rt_f64_parts(v)
+    // A round-half-even reader maps the interval's ends to v when f is even.
+    let even = (p.f & 1u64) == 0u64
+    // Just above a power of two, the gap below v is half the gap above it.
+    let uneven = p.biased > 1 and p.f == 0x10000000000000u64
+    // v = r / s, and v's rounding interval runs from (r - mm) / s to (r + mp) / s.
+    var r = rt_big(p.f)
+    var s = rt_big(1)
+    var mp = rt_big(1)
+    var mm = rt_big(1)
+    if p.e >= 0:
+        r.shl(p.e)
+        mp.shl(p.e)
+        mm.shl(p.e)
+    else:
+        s.shl(0 - p.e)
+    r.shl(1)
+    s.shl(1)
+    if uneven:
+        r.shl(1)
+        s.shl(1)
+        mp.shl(1)
+    var k = rt_f64_k_estimate(p)
+    if k >= 0:
+        s.mul_pow10(k)
+    else:
+        r.mul_pow10(0 - k)
+        mp.mul_pow10(0 - k)
+        mm.mul_pow10(0 - k)
+    // Raise k until the top of the interval is below 10^k.
+    var t = rt_big(0)
+    t.set_sum(r, mp)
+    var c = t.cmp(s)
+    while c > 0 or (even and c == 0):
+        s.mul_small(10)
+        k = k + 1
+        c = t.cmp(s)
+    var out = RtDigits { d: [0 as u8; 24], n: 0, k }
+    var done = false
+    while not done:
+        r.mul_small(10)
+        mp.mul_small(10)
+        mm.mul_small(10)
+        var d = r.take_digit(s)
+        let cl = r.cmp(mm)
+        let low = cl < 0 or (even and cl == 0)
+        t.set_sum(r, mp)
+        let ch = t.cmp(s)
+        let high = ch > 0 or (even and ch == 0)
+        if low and high:
+            // d and d + 1 both read back as v: take the closer, the even one on a tie.
+            t.copy_from(r)
+            t.shl(1)
+            let half = t.cmp(s)
+            if half > 0 or (half == 0 and d % 2 == 1):
+                d = d + 1
+        else if high:
+            d = d + 1
+        out.d[out.n] = (48 + d) as u8
+        out.n = out.n + 1
+        done = low or high
+    out
+
+// v's first `count` significant digits (1 <= count <= 24), correctly rounded, ties to even.
+fn rt_f64_fixed_digits(v: f64, count: i64) -> RtDigits:
+    let p = rt_f64_parts(v)
+    var r = rt_big(p.f)
+    var s = rt_big(1)
+    if p.e >= 0:
+        r.shl(p.e)
+    else:
+        s.shl(0 - p.e)
+    var k = rt_f64_k_estimate(p)
+    if k >= 0:
+        s.mul_pow10(k)
+    else:
+        r.mul_pow10(0 - k)
+    while r.cmp(s) >= 0:
+        s.mul_small(10)
+        k = k + 1
+    var out = RtDigits { d: [0 as u8; 24], n: count, k }
+    var i: i64 = 0
+    while i < count:
+        r.mul_small(10)
+        out.d[i] = (48 + r.take_digit(s)) as u8
+        i = i + 1
+    // Round the last digit: up past the half, and to even on it.
+    r.shl(1)
+    let half = r.cmp(s)
+    if half > 0 or (half == 0 and (out.d[count - 1] - 48) % 2 == 1):
+        var j = count - 1
+        var carry = true
+        while carry and j >= 0:
+            if out.d[j] == 57:
+                out.d[j] = 48
+                j = j - 1
+            else:
+                out.d[j] = out.d[j] + 1
+                carry = false
+        if carry:
+            // 99…9 rounded up to 100…0: one more power of ten.
+            out.d[0] = 49
+            out.k = out.k + 1
+    out
+
+// d1[.d2…dn]e±XX from the first n digits of ds.
+fn rt_f64_write_scientific(ds: &RtDigits, n: i64, buf: *mut u8, bufsize: i64, pos_arg: i64) -> i64:
+    var pos = rt_buf_put(buf, bufsize, pos_arg, ds.d[0])
+    if n > 1:
+        pos = rt_buf_put(buf, bufsize, pos, 46)  // '.'
+        var i: i64 = 1
+        while i < n:
+            pos = rt_buf_put(buf, bufsize, pos, ds.d[i])
+            i = i + 1
+    rt_f64_write_exponent((ds.k - 1) as i32, buf, bufsize, pos)
+
+// ds in positional notation: no exponent, no trailing zeros after a '.'.
+fn rt_f64_write_positional(ds: &RtDigits, buf: *mut u8, bufsize: i64, pos_arg: i64) -> i64:
+    var pos = pos_arg
+    if ds.k <= 0:
+        pos = rt_buf_put(buf, bufsize, pos, 48)
+        pos = rt_buf_put(buf, bufsize, pos, 46)  // '.'
+        var z = ds.k
+        while z < 0:
+            pos = rt_buf_put(buf, bufsize, pos, 48)
+            z = z + 1
+    var i: i64 = 0
+    while i < ds.n:
+        if i == ds.k and i > 0:
+            pos = rt_buf_put(buf, bufsize, pos, 46)  // '.'
+        pos = rt_buf_put(buf, bufsize, pos, ds.d[i])
+        i = i + 1
+    while i < ds.k:
+        pos = rt_buf_put(buf, bufsize, pos, 48)
+        i = i + 1
+    pos
+
+// Format f64 to buffer in general display mode: the shortest decimal that reads
+// back as the same f64, positional for 1e-6 <= |v| < 1e15 and scientific
+// otherwise. Returns length.
 fn rt_f64_to_buf(val: f64, buf: *mut u8, bufsize: i64) -> i64:
     let bits = f64_bits(val)
     if f64_is_nan_bits(bits) or f64_is_inf_bits(bits):
@@ -232,15 +519,10 @@ fn rt_f64_to_buf(val: f64, buf: *mut u8, bufsize: i64) -> i64:
     let v = rt_f64_abs_value(val, bits)
     if v == 0.0:
         return rt_buf_put(buf, bufsize, pos, 48)
+    let ds = rt_f64_shortest_digits(v)
     if v >= 1000000000000000.0 or v < 0.000001:
-        return rt_f64_write_scientific_abs(v, 14, true, buf, bufsize, pos)
-    let int_digits = u64_decimal_digits(v as u64)
-    var precision = 15 - int_digits
-    if precision < 0:
-        precision = 0
-    if precision > 15:
-        precision = 15
-    rt_f64_write_fixed_abs(v, precision, true, buf, bufsize, pos)
+        return rt_f64_write_scientific(ds, ds.n, buf, bufsize, pos)
+    rt_f64_write_positional(ds, buf, bufsize, pos)
 
 // Format f64 with fixed precision. Returns length.
 fn rt_f64_to_fixed_buf(val: f64, precision: i32, buf: *mut u8, bufsize: i64) -> i64:
@@ -265,7 +547,10 @@ fn rt_f64_to_scientific_buf(val: f64, precision: i32, buf: *mut u8, bufsize: i64
     if v == 0.0:
         pos = rt_f64_write_fixed_abs(0.0, precision, false, buf, bufsize, pos)
         return rt_f64_write_exponent(0, buf, bufsize, pos)
-    rt_f64_write_scientific_abs(v, precision, false, buf, bufsize, pos)
+    // The fraction keeps at most 18 digits, as rt_f64_write_fixed_abs does.
+    let fraction = if precision < 0: 0 else if precision > 18: 18 else: precision
+    let ds = rt_f64_fixed_digits(v, (fraction + 1) as i64)
+    rt_f64_write_scientific(ds, ds.n, buf, bufsize, pos)
 
 // Internal helper for u64-to-decimal (used by float formatting)
 fn u64_to_buf_internal(n: u64, buf: *mut u8) -> i64:
