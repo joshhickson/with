@@ -1,10 +1,17 @@
+//! expect-stdout: bzip2 UAT passed
+
+// D64 (spec §16.2b.8): the release UAT program for bzip2, verbatim below
+// (build/release_uat_fixtures/bzip2_main.w), against the host library through
+// lib/facades/bzip2.w — zero unsafe, zero pointers, zero lengths. The one
+// difference: the host has no `with get` package, so the import names the
+// system library to link.
 // Release UAT: bzip2 through its facade (D64, spec §16.2b.8). The program an
 // application developer writes over `with get c.bzip2`: the facade
 // `facades.bzip2` is the project's own (§16.2b.1). No `unsafe`, no pointer,
 // no length: the one-shot calls take two slices and the tuning integers,
 // return the bytes they wrote, and leave the caller's buffers as they were.
 use facades.bzip2
-use c_import("bzlib.h")
+use c_import("bzlib.h", link: "bz2")   // the host library; the UAT project gets it from `with get c.bzip2`
 
 fn main:
     let input = "with bzip2 roundtrip"
