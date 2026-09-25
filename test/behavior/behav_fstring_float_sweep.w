@@ -1,311 +1,38 @@
-//! expect-stdout: 1
-//! expect-stdout: 1.0000000000000003e-11
-//! expect-stdout: 1e-22
-//! expect-stdout: 1.0000000000000004e-33
-//! expect-stdout: 1.0000000000000003e-44
-//! expect-stdout: 1.0000000000000004e-55
-//! expect-stdout: 1.0000000000000005e-66
-//! expect-stdout: 1.0000000000000005e-77
-//! expect-stdout: 1.0000000000000006e-88
-//! expect-stdout: 1.0000000000000008e-99
-//! expect-stdout: 1.000000000000001e-110
-//! expect-stdout: 1.0000000000000008e-121
-//! expect-stdout: 1.000000000000001e-132
-//! expect-stdout: 1.000000000000001e-143
-//! expect-stdout: 1.0000000000000011e-154
-//! expect-stdout: 1.000000000000001e-165
-//! expect-stdout: 1.000000000000001e-176
-//! expect-stdout: 1.0000000000000012e-187
-//! expect-stdout: 1.0000000000000012e-198
-//! expect-stdout: 1.0000000000000014e-209
-//! expect-stdout: 1.0000000000000014e-220
-//! expect-stdout: 1.0000000000000016e-231
-//! expect-stdout: 1.0000000000000018e-242
-//! expect-stdout: 1.000000000000002e-253
-//! expect-stdout: 1.0000000000000022e-264
-//! expect-stdout: 1.0000000000000022e-275
-//! expect-stdout: 1.0000000000000022e-286
-//! expect-stdout: 1.0000000000000022e-297
-//! expect-stdout: 1.000000000000002e-308
-//! expect-stdout: 1e-319
-//! expect-stdout: 100000000000
-//! expect-stdout: 1e+22
-//! expect-stdout: 1e+33
-//! expect-stdout: 9.999999999999999e+43
-//! expect-stdout: 1.0000000000000001e+55
-//! expect-stdout: 1.0000000000000001e+66
-//! expect-stdout: 1.0000000000000001e+77
-//! expect-stdout: 1.0000000000000005e+88
-//! expect-stdout: 1.0000000000000006e+99
-//! expect-stdout: 1.0000000000000007e+110
-//! expect-stdout: 1.0000000000000006e+121
-//! expect-stdout: 1.0000000000000005e+132
-//! expect-stdout: 1.0000000000000005e+143
-//! expect-stdout: 1.0000000000000005e+154
-//! expect-stdout: 1.0000000000000005e+165
-//! expect-stdout: 1.0000000000000004e+176
-//! expect-stdout: 1.0000000000000005e+187
-//! expect-stdout: 1.0000000000000003e+198
-//! expect-stdout: 1.0000000000000003e+209
-//! expect-stdout: 1.0000000000000002e+220
-//! expect-stdout: 1e+231
-//! expect-stdout: 1.0000000000000002e+242
-//! expect-stdout: 1.0000000000000001e+253
-//! expect-stdout: 1.0000000000000002e+264
-//! expect-stdout: 1.0000000000000003e+275
-//! expect-stdout: 1.0000000000000002e+286
-//! expect-stdout: 1.0000000000000002e+297
-//! expect-stdout: 9.999999999999998e+307
-//! expect-stdout: 1.5
-//! expect-stdout: 1.5000000000000003e-11
-//! expect-stdout: 1.5000000000000002e-22
-//! expect-stdout: 1.5000000000000006e-33
-//! expect-stdout: 1.5000000000000009e-44
-//! expect-stdout: 1.500000000000001e-55
-//! expect-stdout: 1.5000000000000011e-66
-//! expect-stdout: 1.5000000000000014e-77
-//! expect-stdout: 1.5000000000000014e-88
-//! expect-stdout: 1.5000000000000012e-99
-//! expect-stdout: 1.5000000000000014e-110
-//! expect-stdout: 1.5000000000000017e-121
-//! expect-stdout: 1.500000000000002e-132
-//! expect-stdout: 1.5000000000000017e-143
-//! expect-stdout: 1.5000000000000014e-154
-//! expect-stdout: 1.5000000000000013e-165
-//! expect-stdout: 1.500000000000001e-176
-//! expect-stdout: 1.500000000000001e-187
-//! expect-stdout: 1.500000000000001e-198
-//! expect-stdout: 1.5000000000000013e-209
-//! expect-stdout: 1.500000000000001e-220
-//! expect-stdout: 1.500000000000001e-231
-//! expect-stdout: 1.500000000000001e-242
-//! expect-stdout: 1.5000000000000013e-253
-//! expect-stdout: 1.5000000000000013e-264
-//! expect-stdout: 1.5000000000000014e-275
-//! expect-stdout: 1.5000000000000014e-286
-//! expect-stdout: 1.5000000000000015e-297
-//! expect-stdout: 1.500000000000002e-308
-//! expect-stdout: 1.5e-319
-//! expect-stdout: 150000000000
-//! expect-stdout: 1.5e+22
-//! expect-stdout: 1.5e+33
-//! expect-stdout: 1.4999999999999995e+44
-//! expect-stdout: 1.4999999999999993e+55
-//! expect-stdout: 1.4999999999999996e+66
-//! expect-stdout: 1.5e+77
-//! expect-stdout: 1.5000000000000002e+88
-//! expect-stdout: 1.5000000000000003e+99
-//! expect-stdout: 1.5000000000000005e+110
-//! expect-stdout: 1.5000000000000006e+121
-//! expect-stdout: 1.5000000000000005e+132
-//! expect-stdout: 1.5000000000000007e+143
-//! expect-stdout: 1.5000000000000007e+154
-//! expect-stdout: 1.5000000000000002e+165
-//! expect-stdout: 1.5000000000000006e+176
-//! expect-stdout: 1.5000000000000007e+187
-//! expect-stdout: 1.500000000000001e+198
-//! expect-stdout: 1.5000000000000012e+209
-//! expect-stdout: 1.5000000000000014e+220
-//! expect-stdout: 1.5000000000000013e+231
-//! expect-stdout: 1.5000000000000014e+242
-//! expect-stdout: 1.500000000000002e+253
-//! expect-stdout: 1.5000000000000022e+264
-//! expect-stdout: 1.5000000000000025e+275
-//! expect-stdout: 1.5000000000000025e+286
-//! expect-stdout: 1.500000000000003e+297
-//! expect-stdout: 1.5000000000000032e+308
-//! expect-stdout: 6.666666666666667
-//! expect-stdout: 6.666666666666667e-11
-//! expect-stdout: 6.666666666666667e-22
-//! expect-stdout: 6.666666666666668e-33
-//! expect-stdout: 6.666666666666668e-44
-//! expect-stdout: 6.666666666666668e-55
-//! expect-stdout: 6.666666666666667e-66
-//! expect-stdout: 6.666666666666667e-77
-//! expect-stdout: 6.666666666666668e-88
-//! expect-stdout: 6.666666666666667e-99
-//! expect-stdout: 6.666666666666668e-110
-//! expect-stdout: 6.666666666666668e-121
-//! expect-stdout: 6.666666666666667e-132
-//! expect-stdout: 6.666666666666666e-143
-//! expect-stdout: 6.666666666666666e-154
-//! expect-stdout: 6.666666666666667e-165
-//! expect-stdout: 6.666666666666668e-176
-//! expect-stdout: 6.666666666666669e-187
-//! expect-stdout: 6.666666666666669e-198
-//! expect-stdout: 6.66666666666667e-209
-//! expect-stdout: 6.6666666666666695e-220
-//! expect-stdout: 6.666666666666672e-231
-//! expect-stdout: 6.666666666666673e-242
-//! expect-stdout: 6.666666666666674e-253
-//! expect-stdout: 6.666666666666674e-264
-//! expect-stdout: 6.666666666666675e-275
-//! expect-stdout: 6.666666666666676e-286
-//! expect-stdout: 6.666666666666675e-297
-//! expect-stdout: 6.666666666666675e-308
-//! expect-stdout: 6.66667e-319
-//! expect-stdout: 666666666666.6669
-//! expect-stdout: 6.666666666666669e+22
-//! expect-stdout: 6.66666666666667e+33
-//! expect-stdout: 6.666666666666671e+44
-//! expect-stdout: 6.666666666666671e+55
-//! expect-stdout: 6.666666666666671e+66
-//! expect-stdout: 6.666666666666672e+77
-//! expect-stdout: 6.666666666666672e+88
-//! expect-stdout: 6.666666666666672e+99
-//! expect-stdout: 6.666666666666672e+110
-//! expect-stdout: 6.666666666666671e+121
-//! expect-stdout: 6.66666666666667e+132
-//! expect-stdout: 6.666666666666671e+143
-//! expect-stdout: 6.666666666666671e+154
-//! expect-stdout: 6.6666666666666715e+165
-//! expect-stdout: 6.666666666666672e+176
-//! expect-stdout: 6.666666666666672e+187
-//! expect-stdout: 6.666666666666671e+198
-//! expect-stdout: 6.66666666666667e+209
-//! expect-stdout: 6.66666666666667e+220
-//! expect-stdout: 6.66666666666667e+231
-//! expect-stdout: 6.666666666666672e+242
-//! expect-stdout: 6.666666666666672e+253
-//! expect-stdout: 6.666666666666673e+264
-//! expect-stdout: 6.666666666666675e+275
-//! expect-stdout: 6.666666666666675e+286
-//! expect-stdout: 6.666666666666674e+297
-//! expect-stdout: inf
-//! expect-stdout: 4.285714285714286
-//! expect-stdout: 4.2857142857142864e-11
-//! expect-stdout: 4.285714285714286e-22
-//! expect-stdout: 4.285714285714286e-33
-//! expect-stdout: 4.2857142857142856e-44
-//! expect-stdout: 4.285714285714285e-55
-//! expect-stdout: 4.285714285714285e-66
-//! expect-stdout: 4.285714285714285e-77
-//! expect-stdout: 4.285714285714285e-88
-//! expect-stdout: 4.285714285714285e-99
-//! expect-stdout: 4.285714285714285e-110
-//! expect-stdout: 4.2857142857142855e-121
-//! expect-stdout: 4.2857142857142857e-132
-//! expect-stdout: 4.285714285714286e-143
-//! expect-stdout: 4.2857142857142855e-154
-//! expect-stdout: 4.285714285714286e-165
-//! expect-stdout: 4.285714285714286e-176
-//! expect-stdout: 4.285714285714287e-187
-//! expect-stdout: 4.285714285714288e-198
-//! expect-stdout: 4.285714285714288e-209
-//! expect-stdout: 4.285714285714288e-220
-//! expect-stdout: 4.285714285714288e-231
-//! expect-stdout: 4.285714285714289e-242
-//! expect-stdout: 4.2857142857142896e-253
-//! expect-stdout: 4.2857142857142895e-264
-//! expect-stdout: 4.285714285714289e-275
-//! expect-stdout: 4.285714285714289e-286
-//! expect-stdout: 4.285714285714288e-297
-//! expect-stdout: 4.2857142857142874e-308
-//! expect-stdout: 4.2857e-319
-//! expect-stdout: 428571428571.4285
-//! expect-stdout: 4.285714285714285e+22
-//! expect-stdout: 4.285714285714284e+33
-//! expect-stdout: 4.2857142857142845e+44
-//! expect-stdout: 4.285714285714284e+55
-//! expect-stdout: 4.285714285714285e+66
-//! expect-stdout: 4.2857142857142847e+77
-//! expect-stdout: 4.285714285714284e+88
-//! expect-stdout: 4.285714285714285e+99
-//! expect-stdout: 4.285714285714286e+110
-//! expect-stdout: 4.285714285714286e+121
-//! expect-stdout: 4.285714285714286e+132
-//! expect-stdout: 4.285714285714286e+143
-//! expect-stdout: 4.285714285714286e+154
-//! expect-stdout: 4.2857142857142855e+165
-//! expect-stdout: 4.2857142857142833e+176
-//! expect-stdout: 4.285714285714283e+187
-//! expect-stdout: 4.2857142857142826e+198
-//! expect-stdout: 4.2857142857142835e+209
-//! expect-stdout: 4.285714285714285e+220
-//! expect-stdout: 4.2857142857142845e+231
-//! expect-stdout: 4.285714285714285e+242
-//! expect-stdout: 4.2857142857142864e+253
-//! expect-stdout: 4.285714285714288e+264
-//! expect-stdout: 4.285714285714287e+275
-//! expect-stdout: 4.2857142857142865e+286
-//! expect-stdout: 4.285714285714287e+297
-//! expect-stdout: inf
-//! expect-stdout: 3.1415929203539825
-//! expect-stdout: 3.1415929203539825e-11
-//! expect-stdout: 3.1415929203539816e-22
-//! expect-stdout: 3.1415929203539816e-33
-//! expect-stdout: 3.1415929203539825e-44
-//! expect-stdout: 3.1415929203539818e-55
-//! expect-stdout: 3.141592920353982e-66
-//! expect-stdout: 3.1415929203539822e-77
-//! expect-stdout: 3.141592920353982e-88
-//! expect-stdout: 3.1415929203539823e-99
-//! expect-stdout: 3.1415929203539826e-110
-//! expect-stdout: 3.141592920353983e-121
-//! expect-stdout: 3.141592920353984e-132
-//! expect-stdout: 3.1415929203539836e-143
-//! expect-stdout: 3.1415929203539836e-154
-//! expect-stdout: 3.1415929203539835e-165
-//! expect-stdout: 3.1415929203539834e-176
-//! expect-stdout: 3.1415929203539827e-187
-//! expect-stdout: 3.141592920353982e-198
-//! expect-stdout: 3.141592920353982e-209
-//! expect-stdout: 3.1415929203539823e-220
-//! expect-stdout: 3.1415929203539826e-231
-//! expect-stdout: 3.141592920353983e-242
-//! expect-stdout: 3.141592920353983e-253
-//! expect-stdout: 3.1415929203539828e-264
-//! expect-stdout: 3.141592920353983e-275
-//! expect-stdout: 3.1415929203539827e-286
-//! expect-stdout: 3.141592920353982e-297
-//! expect-stdout: 3.1415929203539826e-308
-//! expect-stdout: 3.1416e-319
-//! expect-stdout: 314159292035.39825
-//! expect-stdout: 3.141592920353983e+22
-//! expect-stdout: 3.1415929203539825e+33
-//! expect-stdout: 3.1415929203539817e+44
-//! expect-stdout: 3.1415929203539825e+55
-//! expect-stdout: 3.1415929203539824e+66
-//! expect-stdout: 3.1415929203539827e+77
-//! expect-stdout: 3.141592920353983e+88
-//! expect-stdout: 3.1415929203539837e+99
-//! expect-stdout: 3.141592920353983e+110
-//! expect-stdout: 3.1415929203539823e+121
-//! expect-stdout: 3.141592920353982e+132
-//! expect-stdout: 3.1415929203539814e+143
-//! expect-stdout: 3.141592920353981e+154
-//! expect-stdout: 3.141592920353981e+165
-//! expect-stdout: 3.141592920353981e+176
-//! expect-stdout: 3.1415929203539807e+187
-//! expect-stdout: 3.141592920353981e+198
-//! expect-stdout: 3.1415929203539815e+209
-//! expect-stdout: 3.141592920353981e+220
-//! expect-stdout: 3.1415929203539814e+231
-//! expect-stdout: 3.14159292035398e+242
-//! expect-stdout: 3.141592920353981e+253
-//! expect-stdout: 3.141592920353981e+264
-//! expect-stdout: 3.1415929203539806e+275
-//! expect-stdout: 3.1415929203539807e+286
-//! expect-stdout: 3.141592920353981e+297
-//! expect-stdout: inf
+//! expect-stdout: ok
 
-// Golden table: the default display of 290 values across the whole f64 range,
-// five mantissas at every 11th power of ten. Each expected line is the shortest
-// round-trip text of the identical IEEE value, in With's float layout.
+// D68: use C itself as the oracle, across the binary64 range. This is a
+// compiler/runtime conformance test, so the raw foreign buffer stays here.
+extern fn snprintf(buffer: *mut u8, capacity: usize, format: *const u8, ...) -> i32
+
+fn compare_c(x: f64):
+    var buffer: [1100]u8 = [0 as u8; 1100]
+    let n = unsafe { snprintf(&raw mut buffer as *mut u8, 1100 as usize, c"%g".ptr, x) }
+    assert(n >= 0 and n < 1100)
+    let actual = f"{x}"
+    assert(actual.len() == n as i64)
+    for i in 0..n as i64:
+        assert(actual.byte_at(i) == buffer[i] as i32)
+    let precise_n = unsafe { snprintf(&raw mut buffer as *mut u8, 1100 as usize, c"%.30g".ptr, x) }
+    let precise = f"{x:.30g}"
+    assert(precise.len() == precise_n as i64)
+    for i in 0..precise_n as i64:
+        assert(precise.byte_at(i) == buffer[i] as i32)
 
 fn sweep(start: f64):
     var x = start
     var i = 0
     while i < 320:
         if i % 11 == 0:
-            print(f"{x}")
+            compare_c(x)
+            compare_c(-x)
         x = x / 10.0
         i = i + 1
     x = start * 10.0
     i = 1
     while i < 309:
         if i % 11 == 0:
-            print(f"{x}")
+            compare_c(x)
+            compare_c(-x)
         x = x * 10.0
         i = i + 1
 
@@ -315,3 +42,10 @@ fn main:
     sweep(20.0 / 3.0)
     sweep(30.0 / 7.0)
     sweep(355.0 / 113.0)
+    compare_c(0.0)
+    compare_c(-0.0)
+    compare_c(5e-324)
+    compare_c(1.7976931348623157e308)
+    compare_c(0.00009999999)
+    compare_c(999999.9)
+    print("ok")

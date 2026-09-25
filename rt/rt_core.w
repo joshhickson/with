@@ -214,7 +214,9 @@ type RtBig:
 
 // Decimal digits d1…dn (ASCII) of a float, with the value 0.d1…dn × 10^k.
 type RtDigits:
-    d: [24]u8
+    // Every finite binary64 has a terminating decimal expansion with at most
+    // 1074 significant digits (the largest denominator is 2^1074).
+    d: [1074]u8
     n: i64
     k: i64
 
@@ -406,7 +408,7 @@ fn rt_f64_shortest_digits(v: f64) -> RtDigits:
         s.mul_small(10)
         k = k + 1
         c = t.cmp(s)
-    var out = RtDigits { d: [0 as u8; 24], n: 0, k }
+    var out = RtDigits { d: [0 as u8; 1074], n: 0, k }
     var done = false
     while not done:
         r.mul_small(10)
@@ -432,7 +434,7 @@ fn rt_f64_shortest_digits(v: f64) -> RtDigits:
         done = low or high
     out
 
-// v's first `count` significant digits (1 <= count <= 24), correctly rounded, ties to even.
+// v's first `count` significant digits (1 <= count <= 1074), rounded to even.
 fn rt_f64_fixed_digits(v: f64, count: i64) -> RtDigits:
     let p = rt_f64_parts(v)
     var r = rt_big(p.f)
@@ -449,7 +451,7 @@ fn rt_f64_fixed_digits(v: f64, count: i64) -> RtDigits:
     while r.cmp(s) >= 0:
         s.mul_small(10)
         k = k + 1
-    var out = RtDigits { d: [0 as u8; 24], n: count, k }
+    var out = RtDigits { d: [0 as u8; 1074], n: count, k }
     var i: i64 = 0
     while i < count:
         r.mul_small(10)
@@ -506,10 +508,12 @@ fn rt_f64_write_positional(ds: &RtDigits, buf: *mut u8, bufsize: i64, pos_arg: i
         i = i + 1
     pos
 
-// Format f64 to buffer in general display mode: the shortest decimal that reads
-// back as the same f64, positional for 1e-6 <= |v| < 1e15 and scientific
-// otherwise. Returns length.
+// Default display follows C printf("%g"): six significant digits, rounded
+// before choosing notation. A rounded exponent outside [-4, 6) uses e.
 fn rt_f64_to_buf(val: f64, buf: *mut u8, bufsize: i64) -> i64:
+    rt_f64_to_general_buf(val, 6, buf, bufsize)
+
+fn rt_f64_to_general_buf(val: f64, precision: i32, buf: *mut u8, bufsize: i64) -> i64:
     let bits = f64_bits(val)
     if f64_is_nan_bits(bits) or f64_is_inf_bits(bits):
         return rt_f64_write_special(bits, buf, bufsize)
@@ -519,8 +523,14 @@ fn rt_f64_to_buf(val: f64, buf: *mut u8, bufsize: i64) -> i64:
     let v = rt_f64_abs_value(val, bits)
     if v == 0.0:
         return rt_buf_put(buf, bufsize, pos, 48)
-    let ds = rt_f64_shortest_digits(v)
-    if v >= 1000000000000000.0 or v < 0.000001:
+    let significant = if precision < 0: 6 else if precision == 0: 1 else: precision
+    // Beyond the exact terminating expansion all digits are zero, and g
+    // removes them. Keep the requested precision for the notation decision.
+    let count = if significant > 1074: 1074 else: significant
+    var ds = rt_f64_fixed_digits(v, count as i64)
+    while ds.n > 1 and ds.d[ds.n - 1] == 48:
+        ds.n = ds.n - 1
+    if ds.k > significant as i64 or ds.k <= -4:
         return rt_f64_write_scientific(ds, ds.n, buf, bufsize, pos)
     rt_f64_write_positional(ds, buf, bufsize, pos)
 
@@ -2529,7 +2539,8 @@ pub fn with_fmt_int_spec(val_arg: i64, is_unsigned: i32, flags: i64, width: i32,
 // ── with_fmt_f64_spec ──────────────────────────────────────────────
 
 pub fn with_fmt_f64_spec(val: f64, flags: i64, width: i32, precision: i32, mode: i32) -> str:
-    var buf: [64]u8 = [0 as u8; 64]
+    // General formatting may expose the entire exact binary64 expansion.
+    var buf: [1100]u8 = [0 as u8; 1100]
     var len: i64 = 0
 
     if mode == 102:  // 'f'
@@ -2539,7 +2550,7 @@ pub fn with_fmt_f64_spec(val: f64, flags: i64, width: i32, precision: i32, mode:
         let scientific_precision = if precision >= 0: precision else: 6
         len = rt_f64_to_scientific_buf(val, scientific_precision, &buf as *mut u8, 64)
     else if mode == 103:  // 'g'
-        len = rt_f64_to_buf(val, &buf as *mut u8, 64)
+        len = rt_f64_to_general_buf(val, precision, &buf as *mut u8, 1100)
     else if precision >= 0:
         len = rt_f64_to_fixed_buf(val, precision, &buf as *mut u8, 64)
     else:
