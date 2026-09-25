@@ -52,6 +52,16 @@ fn test_explicit_general_precision:
     assert(f"{0.1:.30g}" == "0.100000000000000005551115123126")
     assert(f"{0.1:.1100g}" == "0.1000000000000000055511151231257827021181583404541015625")
 
+fn test_fixed_ties_and_large_integer:
+    assert(f"{0.125:.2f}" == "0.12")
+    assert(f"{0.375:.2f}" == "0.38")
+    assert(f"{0.5:.0f}" == "0")
+    assert(f"{1.5:.0f}" == "2")
+    assert(f"{2.5:.0f}" == "2")
+    assert(f"{1e30:.2f}" == "1000000000000000019884624838656.00")
+    assert(f"{0.1:.30e}" == "1.000000000000000055511151231258e-01")
+    assert(f"{3.14:+010.2f}" == "+000003.14")
+
 fn main:
     test_default_is_c_general()
     test_notation_uses_rounded_exponent()
@@ -59,4 +69,5 @@ fn main:
     test_debug_and_g_match_default()
     test_e_mode_rounds_exactly()
     test_explicit_general_precision()
+    test_fixed_ties_and_large_integer()
     print("ok")

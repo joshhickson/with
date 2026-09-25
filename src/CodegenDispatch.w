@@ -3887,7 +3887,9 @@ impl Codegen:
                 let ck = wl_get_type_kind(cast_ty)
                 // Float → Int
                 if (vk == wl_float_type_kind() or vk == wl_double_type_kind()) and ck == wl_integer_type_kind():
-                    if src_unsigned:
+                    // The integer destination determines FPToUI vs FPToSI.
+                    // A float source has no integer signedness to consult.
+                    if d1 > 0 and self.mir_sema_type_is_unsigned(d1):
                         return wl_build_fp_to_ui(self.builder, val, cast_ty)
                     return wl_build_fp_to_si(self.builder, val, cast_ty)
                 // Int → Float

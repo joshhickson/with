@@ -4,19 +4,31 @@
 // compiler/runtime conformance test, so the raw foreign buffer stays here.
 extern fn snprintf(buffer: *mut u8, capacity: usize, format: *const u8, ...) -> i32
 
-fn compare_c(x: f64):
-    var buffer: [1100]u8 = [0 as u8; 1100]
-    let n = unsafe { snprintf(&raw mut buffer as *mut u8, 1100 as usize, c"%g".ptr, x) }
-    assert(n >= 0 and n < 1100)
-    let actual = f"{x}"
+fn check_text(actual: &str, expected: &[2048]u8, n: i32):
+    assert(n >= 0 and n < 2048)
     assert(actual.len() == n as i64)
     for i in 0..n as i64:
-        assert(actual.byte_at(i) == buffer[i] as i32)
-    let precise_n = unsafe { snprintf(&raw mut buffer as *mut u8, 1100 as usize, c"%.30g".ptr, x) }
-    let precise = f"{x:.30g}"
-    assert(precise.len() == precise_n as i64)
-    for i in 0..precise_n as i64:
-        assert(precise.byte_at(i) == buffer[i] as i32)
+        assert(actual.byte_at(i) == expected[i] as i32)
+
+fn compare_c(x: f64):
+    var buffer: [2048]u8 = [0 as u8; 2048]
+    let ptr = &raw mut buffer as *mut u8
+    let n = unsafe { snprintf(ptr, 2048 as usize, c"%g".ptr, x) }
+    check_text(f"{x}", buffer, n)
+    let ng = unsafe { snprintf(ptr, 2048 as usize, c"%.30g".ptr, x) }
+    check_text(f"{x:.30g}", buffer, ng)
+    let nf0 = unsafe { snprintf(ptr, 2048 as usize, c"%.0f".ptr, x) }
+    check_text(f"{x:.0f}", buffer, nf0)
+    let nf = unsafe { snprintf(ptr, 2048 as usize, c"%.2f".ptr, x) }
+    check_text(f"{x:.2f}", buffer, nf)
+    let nf30 = unsafe { snprintf(ptr, 2048 as usize, c"%.30f".ptr, x) }
+    check_text(f"{x:.30f}", buffer, nf30)
+    let nf1100 = unsafe { snprintf(ptr, 2048 as usize, c"%.1100f".ptr, x) }
+    check_text(f"{x:.1100f}", buffer, nf1100)
+    let ne = unsafe { snprintf(ptr, 2048 as usize, c"%.30e".ptr, x) }
+    check_text(f"{x:.30e}", buffer, ne)
+    let ne1100 = unsafe { snprintf(ptr, 2048 as usize, c"%.1100e".ptr, x) }
+    check_text(f"{x:.1100e}", buffer, ne1100)
 
 fn sweep(start: f64):
     var x = start
@@ -48,4 +60,10 @@ fn main:
     compare_c(1.7976931348623157e308)
     compare_c(0.00009999999)
     compare_c(999999.9)
+    compare_c(0.125)
+    compare_c(0.375)
+    compare_c(0.5)
+    compare_c(1.5)
+    compare_c(2.5)
+    compare_c(9.9999)
     print("ok")
