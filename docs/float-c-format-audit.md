@@ -58,5 +58,14 @@ Local evidence in the float worktree:
 - `out/float-unsigned-before.ll`: wrong conversion instruction.
 - `out/float-unsigned-regression-before.log`: runtime conversion fails.
 
-The final combined change still requires its pinned-seed full battery;
-the local formatter evidence does not establish that the cast fix is verified.
+The combined code at `1012a32b` passed the pinned-seed build, byte-identical
+stage2/stage3 fixpoint, drop/move audits, full test suite, test-green,
+last-green and user-programs-safe. All 1,290 behavior files reran with a fresh
+C-import cache epoch. Evidence: `out/combined-battery.log` and
+`out/ready-battery-status.txt` (`all passed`).
+
+The rebuilt compiler also passes the runtime unsigned-cast regression
+(`out/float-unsigned-after.log`) and the C comparison sweep under the debug
+allocator (`out/c-float-final-sweep-alloc.log`, zero leaks). The literal
+regression passes through compiled emit-C output as well as LLVM
+(`out/float-literal-c-run.log`), including the f32 double-rounding case.
