@@ -498,6 +498,20 @@ pub type MirBody {
     // D21: for a Unit-returning `mut self` pipeline stage, the exact receiver
     // place carried after this call. -1 for ordinary return-value calls.
     call_pipeline_receiver_places: Vec[i32],
+    // D65 (#1647, interim until phase 5): 1 on a GENERIC_CALL that carries no
+    // contract because MirLower's single decision point
+    // (require_generic_call_contract) classified it as language machinery
+    // codegen dispatches by name and receiver (a Task, ScopedTask, channel
+    // endpoint or Atomic method, `track`, `spawn`, `join`). The typed
+    // validator and audit:resolution recognize the call by this mark; the
+    // unresolved-bare-function branch that produced #1635 never sets it.
+    call_machinery_dispatch: Vec[i32],
+    // D65 (#1647): call nodes Sema resolved that this body materializes
+    // without a call — `for x in v.iter()` and a comprehension over it are
+    // the index loop (`.iter()` is the implicit form, §13). MIR states the
+    // elision instead of staying silent; audit:resolution joins Sema's
+    // resolved call to it.
+    elided_call_nodes: Vec[i32],
 
     // Stage 4 (spec §2.5.2): locals that are ever moved — and therefore
     // reset-on-move (§2.5.1) — recorded at the single pending_reset_locals.push
@@ -539,7 +553,22 @@ pub type MirModule {
     // validator asks it whether a vacated sub-place is one the whole
     // value's drop would free again; MirCore has no Sema to ask.
     sema_moved_drop_types: HashMap[i32, i32],
+    // D65 (#1647, #1639): every symbol Sema accepts as a direct call target,
+    // keyed by this module's pool: MirCallableClass.Signature for a declared
+    // signature, Generic for a generic template, Intrinsic for a builtin
+    // Sema lowers itself. Propagated from Sema at lowering; the typed-MIR
+    // validator refuses a `const fn` callee outside it that has no body in
+    // the module and no intrinsic mark, so a callee re-derived from an AST
+    // spelling (#1635's `r(21)`) can never reach codegen silently.
+    sema_callable_syms: HashMap[i32, i32],
 }
+
+enum MirCallableClass: i32:
+    Signature = 1
+    Generic = 2
+    Intrinsic = 3
+
+impl Copy for MirCallableClass
 
 // ── MirModule helpers ────────────────────────────────────────────
 
@@ -562,6 +591,7 @@ fn MirModule.init -> MirModule:
         sema_task_sym: 0,
         sema_scoped_task_sym: 0,
         sema_moved_drop_types: HashMap.new(),
+        sema_callable_syms: HashMap.new(),
     }
 
 impl MirModule:
@@ -703,6 +733,8 @@ fn MirBody.init_for_fn(fn_sym: i32) -> MirBody:
         call_mono_syms: Vec.new(),
         call_contract_required: Vec.new(),
         call_pipeline_receiver_places: Vec.new(),
+        call_machinery_dispatch: Vec.new(),
+        elided_call_nodes: Vec.new(),
         ever_moved_locals: Vec.new(),
     }
 
@@ -929,6 +961,7 @@ impl MirBody:
         self.call_mono_syms.push(0)
         self.call_contract_required.push(0)
         self.call_pipeline_receiver_places.push(-1)
+        self.call_machinery_dispatch.push(0)
         for i in 0..count:
             self.call_arg_operands.push(operands[i])
         id
@@ -977,6 +1010,18 @@ impl MirBody:
         if call_id < 0 or call_id >= self.call_contract_required.len():
             return false
         self.call_contract_required[call_id] != 0
+
+    mut fn note_elided_call_node(node: i32):
+        if node > 0: self.elided_call_nodes.push(node)
+
+    mut fn set_call_machinery_dispatch(call_id: i32):
+        if call_id >= 0 and call_id < self.call_machinery_dispatch.len():
+            self.call_machinery_dispatch[call_id] = 1
+
+    fn call_is_machinery_dispatch(call_id: i32) -> bool:
+        if call_id < 0 or call_id >= self.call_machinery_dispatch.len():
+            return false
+        self.call_machinery_dispatch[call_id] != 0
 
     mut fn set_call_pipeline_receiver_place(call_id: i32, place_id: i32):
         if call_id < 0 or call_id >= self.call_pipeline_receiver_places.len():
@@ -3453,6 +3498,130 @@ fn mir_validate_call_missing_borrow(mir_mod: &MirModule, body: &MirBody, callee_
         if arg_resolved == mir_mod.mir_resolve_alias(mir_mod.mir_get_type_d0(param_ty)): return ai
     -1
 
+// The `const fn` symbol a call terminator invokes, or 0 when the callee is
+// a place (an indirect call) or a unit operand (an intrinsic with no callee).
+fn mir_call_const_fn_sym(body: &MirBody, callee_operand: i32) -> i32:
+    if callee_operand < 0 or callee_operand >= body.operand_kinds.len() or body.operand_kinds[callee_operand] != OperandKind.OK_CONSTANT: return 0
+    let callee_const = body.operand_d0[callee_operand]
+    if callee_const < 0 or callee_const >= body.const_kinds.len() or body.const_kinds[callee_const] != ConstKind.CK_FN: return 0
+    body.const_d0[callee_const]
+
+// D65 / #1639: a `const fn` callee names a function Sema accepts as a call
+// target, or a body of this module, or the call carries an intrinsic mark
+// codegen dispatches on. Nothing else reaches codegen: #1635's `r(21)` —
+// a GENERIC_CALL to a symbol named after a callable binding, with the
+// argument dropped — passed every validator and died in codegen. The
+// snapshot (`sema_callable_syms`) is Sema's fact, propagated at lowering;
+// this check names no builtin itself. A NONE-marked direct call needs a
+// signature or a body: a generic template cannot be called without the
+// concrete contract a GENERIC_CALL carries. Returns "" when the callee is
+// accounted for.
+fn mir_validate_call_callee_known(mir_mod: &MirModule, body: &MirBody, callee_operand: i32, call_id: i32) -> str:
+    if call_id < 0 or call_id >= body.call_arg_starts.len(): return ""
+    let intrinsic = body.call_intrinsic(call_id)
+    if intrinsic != MirIntrinsic.NONE and intrinsic != MirIntrinsic.GENERIC_CALL: return ""
+    let sym = mir_call_const_fn_sym(body, callee_operand)
+    if sym == 0:
+        if callee_operand < 0 or callee_operand >= body.operand_kinds.len() or body.operand_kinds[callee_operand] != OperandKind.OK_CONSTANT: return ""
+        return f"call has a constant callee that is no function symbol and no intrinsic mark (intrinsic={intrinsic as i32})"
+    if intrinsic == MirIntrinsic.GENERIC_CALL and (body.call_is_machinery_dispatch(call_id) or body.call_sig_index(call_id) >= 0 or body.call_mono_sym(call_id) != 0): return ""
+    if mir_mod.find_body(sym) >= 0: return ""
+    let class = mir_mod.sema_callable_syms.get(sym)
+    if class.is_none():
+        return f"call to symbol {sym} names no function Sema knows: no signature, no generic template, no intrinsic, and no body in the module (intrinsic={intrinsic as i32}, args={body.call_arg_counts[call_id]}); the callee was re-derived from a spelling, not read from Sema (D65, #1639)"
+    if intrinsic == MirIntrinsic.NONE and class.unwrap() != MirCallableClass.Signature as i32:
+        return f"direct call to symbol {sym} (callable class {class.unwrap()}) without a GENERIC_CALL mark: a generic template or builtin needs the concrete contract that mark carries"
+    ""
+
+// D65 / #1647 phase 1 (audit:resolution): Sema's answer for one MIR call.
+// AnalysisResolution gathers it from Sema; mir_resolution_check_call
+// compares it with the MIR without Sema, so a planted body and a planted
+// answer exercise the comparison alone (test/internals).
+enum CalleeResolutionKind: i32:
+    Unknown = 0
+    Signature = 1
+    Generic = 2
+    Intrinsic = 3
+    Callable = 4
+    Body = 5
+
+impl Copy for CalleeResolutionKind
+
+type CalleeResolution {
+    kind: CalleeResolutionKind,
+    // Sema's name for the callee (for the report), "" when it has none.
+    name: str,
+    // The parameter count Sema states, or -1 when it states no fixed count
+    // (a variadic signature, an extern fn type).
+    param_count: i32,
+    // Sema's signature index for a Signature answer, else -1.
+    sig: i32,
+    // Sema's symbol for the callee (its own pool), else 0.
+    sym: i32,
+    // The signature Sema resolved the call's own AST node to
+    // (resolved_call_sigs), else -1: a call node Sema resolved to one
+    // function must not lower to another.
+    node_sig: i32,
+}
+
+fn callee_resolution_unknown() -> CalleeResolution:
+    CalleeResolution { kind: CalleeResolutionKind.Unknown, name: "", param_count: -1, sig: -1, sym: 0, node_sig: -1 }
+
+fn callee_resolution_kind_name(kind: CalleeResolutionKind) -> str:
+    if kind == CalleeResolutionKind.Signature: return "signature"
+    if kind == CalleeResolutionKind.Generic: return "generic template"
+    if kind == CalleeResolutionKind.Intrinsic: return "builtin"
+    if kind == CalleeResolutionKind.Callable: return "callable value"
+    if kind == CalleeResolutionKind.Body: return "module body"
+    "unresolved"
+
+// The D65 rule broken, named for the report: what MIR resolved, what Sema
+// resolved, and the rule. "" when the call agrees with Sema. `bb` is the
+// block whose terminator is the call.
+fn mir_resolution_check_call(mir_mod: &MirModule, body: &MirBody, bb: i32, answer: &CalleeResolution) -> str:
+    let callee_operand = body.term_data0(bb)
+    let call_id = body.term_data1(bb)
+    if call_id < 0 or call_id >= body.call_arg_starts.len(): return ""
+    let intrinsic = body.call_intrinsic(call_id)
+    let argc = body.call_arg_counts[call_id]
+    let sym = mir_call_const_fn_sym(body, callee_operand)
+    let callee_kind = if callee_operand >= 0 and callee_operand < body.operand_kinds.len(): body.operand_kinds[callee_operand] else: -1
+    let is_place = callee_kind == OperandKind.OK_COPY or callee_kind == OperandKind.OK_MOVE
+    // An intrinsic call is recognized by its kind; its callee operand is
+    // documentation ("the CK_FN sym is meaningless — codegen dispatches by
+    // intrinsic kind"). DYN_CALL resolves its method through the vtable.
+    if intrinsic != MirIntrinsic.NONE and intrinsic != MirIntrinsic.GENERIC_CALL:
+        return ""
+    if intrinsic == MirIntrinsic.GENERIC_CALL and body.call_is_machinery_dispatch(call_id):
+        return ""
+    if is_place:
+        if answer.kind != CalleeResolutionKind.Callable:
+            return f"MIR calls through a place with {argc} argument(s), Sema resolved this call as " ++ callee_resolution_kind_name(answer.kind) ++ (if answer.name.len() > 0: " `" ++ answer.name ++ "`" else: "") ++ " — an indirect call needs Sema's callable type for the call (call_callable_types); the callee's meaning was re-derived by MIR (D65: MIR local-table lookup -> meaning of a name)"
+        if answer.param_count >= 0 and argc != answer.param_count:
+            return f"MIR calls through a place with {argc} argument(s), Sema's callable type takes {answer.param_count} (D65: Sema owns the call target; #1639's silent case)"
+        return ""
+    if sym == 0:
+        return f"call with no callee symbol and no intrinsic mark (intrinsic={intrinsic as i32}, args={argc})"
+    let mir_name = if answer.name.len() > 0: with_str_clone_ref(answer.name) else: f"symbol {sym}"
+    if answer.kind == CalleeResolutionKind.Unknown:
+        return "MIR calls `" ++ mir_name ++ f"` directly (intrinsic={intrinsic as i32}, args={argc}), Sema knows no such function: no signature, no generic template, no builtin, no callable binding for this call, no body in the module — the callee was re-derived from the AST spelling after Sema (D65; #1635, #1639)"
+    if answer.kind == CalleeResolutionKind.Callable:
+        return "MIR calls `" ++ mir_name ++ f"` directly (intrinsic={intrinsic as i32}, args={argc}), Sema resolved this call as an indirect call through a callable value taking {answer.param_count} argument(s) — a function was invented from a binding's name (D65: AST spelling -> resolved callee; #1635)"
+    if answer.kind == CalleeResolutionKind.Generic and intrinsic != MirIntrinsic.GENERIC_CALL:
+        return "MIR calls generic template `" ++ mir_name ++ f"` directly with no GENERIC_CALL mark (args={argc}); Sema resolved a generic call, which needs the concrete contract that mark carries (D65)"
+    if answer.kind == CalleeResolutionKind.Intrinsic and intrinsic != MirIntrinsic.GENERIC_CALL:
+        return "MIR calls builtin `" ++ mir_name ++ f"` as an ordinary function (intrinsic=NONE, args={argc}); Sema resolved a builtin, which the builtin branch marks GENERIC_CALL (D65)"
+    if answer.kind == CalleeResolutionKind.Signature:
+        let sig = body.call_sig_index(call_id)
+        let mono = body.call_mono_sym(call_id)
+        if sig >= 0 and answer.sig >= 0 and sig != answer.sig and mono == 0:
+            return "MIR recorded contract signature " ++ f"{sig}" ++ " for its call to `" ++ mir_name ++ "`, Sema's signature for that symbol is " ++ f"{answer.sig}" ++ " (D65: one contract per call)"
+        if answer.node_sig >= 0 and answer.sig >= 0 and answer.node_sig != answer.sig and mono == 0:
+            return "Sema resolved this call node to signature " ++ f"{answer.node_sig}" ++ ", MIR calls `" ++ mir_name ++ "` (signature " ++ f"{answer.sig}" ++ ") (D65: AST spelling -> resolved callee after Sema)"
+        if answer.param_count >= 0 and argc != answer.param_count:
+            return "MIR passes " ++ f"{argc}" ++ " argument(s) to `" ++ mir_name ++ "`, Sema's signature takes " ++ f"{answer.param_count}" ++ " (D65; #1639's silent case)"
+    ""
+
 // #1230: a call through a fn-typed VALUE passes exactly the arguments its
 // type declares; codegen adds the environment pointer itself. A lowering
 // that consulted a same-named module fn appended that fn's `loc = src()`
@@ -3712,6 +3881,9 @@ fn validate_typed_mir_body(mir_mod: &MirModule, body: &MirBody) -> MirValidation
             let unborrowed = mir_validate_call_missing_borrow(mir_mod, body, d0, d1)
             if unborrowed >= 0:
                 return mir_validation_fail(body.fn_sym, span, f"call argument {unborrowed} is a value where the callee parameter is a reference to it (a missing borrow)")
+            let unknown_callee = mir_validate_call_callee_known(mir_mod, body, d0, d1)
+            if unknown_callee.len() > 0:
+                return mir_validation_fail(body.fn_sym, span, unknown_callee)
 
             let carrier_place = body.call_pipeline_receiver_place(d1)
             if carrier_place >= 0:
