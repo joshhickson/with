@@ -38,6 +38,8 @@ extern fn rt_libc_munmap(addr: *mut u8, len: u64) -> i32
 extern fn rt_libc_getenv(name: *const u8) -> *const u8
 @[link_name("sysconf")]
 extern fn rt_libc_sysconf(name: i32) -> i64
+@[link_name("gethostname")]
+extern fn rt_libc_gethostname(name: *mut u8, len: u64) -> i32
 @[link_name("stat")]
 extern fn rt_libc_stat(path: *const u8, buf: *mut u8) -> i32
 @[link_name("chmod")]
@@ -939,6 +941,8 @@ pub fn rt_sysinfo_os() -> str:
 pub fn rt_sysinfo_arch() -> str:
     with_str_from_cstr(c"aarch64".ptr)
 
+pub fn rt_gethostname(name: *mut u8, len: u64) -> i32: rt_libc_gethostname(name, len)
+
 // ── Environment ─────────────────────────────────────────────────
 
 pub fn rt_getenv(name: *const u8) -> *const u8:
@@ -1486,6 +1490,16 @@ c facade libsystem:
         preserves domain children
         preserves domain stdio
     fn rt_libc_sysconf
+        preserves domain environ
+        preserves domain locale
+        preserves domain signals
+        preserves domain signal_mask
+        preserves domain cwd
+        preserves domain fds
+        preserves domain rlimits
+        preserves domain children
+        preserves domain stdio
+    fn rt_libc_gethostname
         preserves domain environ
         preserves domain locale
         preserves domain signals

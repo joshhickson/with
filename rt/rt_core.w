@@ -50,8 +50,11 @@ extern fn rt_raise(sig: i32) -> i32
 extern fn rt_kill(pid: i32, sig: i32) -> i32
 extern fn rt_sysinfo(out: *mut u8) -> i32
 extern fn rt_set_process_memory_limit_bytes(limit: i64) -> i32
-@[link_name("gethostname")]
-extern fn rt_libc_gethostname(name: *mut u8, len: u64) -> i32
+// The host name. POSIX backends forward to libc gethostname; Windows and wasm
+// have no libc one and implement it. Never the C symbol `gethostname` itself:
+// a runtime definition of it collides with Winsock's (ws2_32.lib is on every
+// Windows link) and takes the calls a program makes to Winsock.
+extern fn rt_gethostname(name: *mut u8, len: u64) -> i32
 extern fn rt_thread_spawn(start_routine: *mut u8, arg: *mut u8) -> i64
 extern fn rt_thread_join(handle: i64) -> i32
 // Prints the current call chain to stderr where the platform can walk the
@@ -4468,7 +4471,7 @@ pub fn with_sysinfo_arch() -> str:
 pub fn with_sysinfo_hostname() -> str:
     var buf: [256]u8 = [0 as u8; 256]
     let buf_ptr = (&raw mut buf) as *mut [256]u8 as *mut u8
-    if rt_libc_gethostname(buf_ptr, 256 as u64) != 0:
+    if rt_gethostname(buf_ptr, 256) != 0:
         return make_str("unknown" as *const u8, 7)
     buf[255] = 0
     alloc_str(buf_ptr as *const u8, cstr_len(buf_ptr as *const u8))
@@ -4797,16 +4800,6 @@ c facade libc:
         preserves domain children
         preserves domain stdio
     fn rt_libc_free
-        preserves domain environ
-        preserves domain locale
-        preserves domain signals
-        preserves domain signal_mask
-        preserves domain cwd
-        preserves domain fds
-        preserves domain rlimits
-        preserves domain children
-        preserves domain stdio
-    fn rt_libc_gethostname
         preserves domain environ
         preserves domain locale
         preserves domain signals

@@ -890,7 +890,7 @@ fn cc_is_public_abi_name(name: &str) -> i32:
         return 1
     if name.starts_with("migrate_") or name.starts_with("ci_"):
         return 1
-    if name == "gethostname" or name == "pthread_self":
+    if name == "pthread_self":
         return 1
     if name == "i32_to_str" or name == "i64_to_string" or name == "str_from_byte":
         return 1
