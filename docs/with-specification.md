@@ -8744,6 +8744,9 @@ structural representation:
 | `Vec[T]`, array, slice | `[elem, elem]` |
 | `HashMap[K, V]` | `{key: value, key: value}`, entries ordered by the Debug text of their keys |
 | `BTreeMap[K, V]` | `{key: value, key: value}`, in key order |
+| `HashSet[T]` | `{elem, elem}`, elements ordered by their Debug text |
+| `Box[T]`, `Rc[T]`, `Arc[T]` | The value they hold, formatted with `:?`: `Box.new(5)` is `5` |
+| raw pointer (`*const T`, `*mut T`) | Its address in hexadecimal: `0x16f3a2b40` |
 
 ```
 f"{42:?}"        // "42"
@@ -9441,7 +9444,9 @@ as well:
 fn sqlite3_errmsg
     returns borrow CStr from param 0
     valid on failed
-``` A facade that declares or imports a type with the generated name is a
+```
+
+A facade that declares or imports a type with the generated name is a
 compile-time error naming both. When `ok` is stated, the
 `(status, Option[Resource])` constructor is not generated.
 
@@ -10175,8 +10180,10 @@ reference would be unaligned).
 `@[repr(packed(N))]`, with `N` a power of two, caps every field's alignment
 at `N`: a field whose natural alignment exceeds `N` is placed at alignment
 `N`, and the record's alignment is at most `N`. It is the layout of C's
-`#pragma pack(N)` and `__attribute__((packed, aligned(N)))`, and `c_import`
-emits it for such records (e.g. `BITMAPFILEHEADER` under `pack(2)`). A
+`#pragma pack(N)`, and `c_import` emits it for a record whose clang layout
+it reproduces exactly (e.g. `BITMAPFILEHEADER` under `pack(2)`); a record it
+does not reproduce stays opaque. (`__attribute__((packed, aligned(N)))` is a
+different layout: it packs every field to 1 and aligns only the record.) A
 reference to a field whose natural alignment exceeds `N` is a compile error,
 as for `repr(packed)`.
 
