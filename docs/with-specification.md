@@ -1,4 +1,4 @@
-# The With Programming Language — Specification v7.5
+# The With Programming Language — Specification v7.6
 
 **Author:** Eric Hartford
 **Status:** Reference specification for prototype implementation
@@ -11,6 +11,12 @@ implementation is still in progress.** The D22 rules are normative now. The
 compiler, comptime evaluator, backends, standard library, diagnostics, and
 tests are NON-COMPLIANT wherever they do not yet implement them. Existing
 implementation behavior must not be treated as precedent against D22.
+**Changelog v7.6:** A module file holds declarations; a file with top-level
+executable statements is an entry source whose statements are its `main`,
+and every command applies the same rule (§18.5b, D74). An optional chain on
+a named place yields a view, `Option[&U]`; an owned demand on a non-`Copy`
+payload gets the clone fix-it (§10.3, D74). Examples track §3.8/D27's
+field-view binding (D74).
 **Changelog v7.5:** An assignment's value is a read of the place after the
 store — C's rule under With's view semantics (§9.1, D73); a `Drop` type whose
 all-zero storage is a live value gets a hidden liveness byte (§2.5.1, D72).
@@ -4844,6 +4850,15 @@ let zip = user.address?.city?.zip_code
 - If `field` has type `U` (non-Optional): `expr?.field` → `expr.map(v => v.field)` — result is `Option[U]`.
 - If `field` has type `Option[U]`: `expr?.field` → `expr.and_then(v => v.field)` — result is `Option[U]` (flattened).
 - `expr?.method(args)` → `expr.and_then(v => v.method(args))` when the method returns `Option`/`Result`.
+
+The desugar describes the result's shape, not a move of the base. A chain
+on a named place reads the place, as any place read does (§3.8, D22): the
+result of `expr?.field` is `Option[&U]`, a view into the base, so the base
+stays intact and usable; an owned demand on that view (`let city:
+Option[str] = profile.address?.city`) copies a `Copy` payload and, for a
+non-`Copy` payload, is refused with the clone fix-it. A chain on a
+temporary (`f()?.field`) yields the owned `Option[U]` (D74; D73 is the same
+rule for assignment).
 
 ```
 type Address { city: Option[str], zip: str }
@@ -11582,11 +11597,14 @@ One-liners are not interpreted and do not use a separate execution
 model. The CLI constructs a synthetic With entry source file, compiles
 it through the normal build/run pipeline, runs the resulting binary,
 and returns that binary's exit code. The generated source uses
-top-level executable statements — a form defined for CLI entry
-sources by this section; the CLI does not generate an explicit
-`fn main` wrapper. Ordinary module files require an explicit
-`fn main` (top-level executable statements are not a general module
-feature).
+top-level executable statements; the CLI does not generate an explicit
+`fn main` wrapper.
+
+A module file holds declarations. A file whose top level also holds
+executable statements is an entry source: those statements are its `main`,
+run in order, and it may not also declare `fn main`. An imported module may
+not hold executable statements. Every command that takes an entry file
+(`run`, `build`, `check`, `test`) applies the same rule (D74).
 
 Exactly one one-liner mode may be used in a single invocation:
 
