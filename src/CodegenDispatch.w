@@ -1128,26 +1128,8 @@ impl Codegen:
     mut fn audit_codegen_place_types(body: &MirBody):
         if self.analysis_enabled == 0 or self.analysis_query != "audit":
             return
-        // Stated exclusion (#1305): the async lowering projects
-        // `Task.fiber_id` (`.f0`) off a call-result local that MIR types as
-        // the awaited T, not Task[T]; codegen's FIBER_* intrinsics agree with
-        // it by convention. Those places are the argument of a fiber
-        // intrinsic call and nothing else; skip exactly them until #1305
-        // types the local as Task[T].
-        let intrinsic_places: HashMap[i32, i32] = HashMap.new()
-        for bb in 0..body.block_count():
-            if body.term_kind(bb) != TermKind.TK_CALL:
-                continue
-            let args_id = body.term_data1(bb)
-            if args_id < 0 or args_id >= body.call_arg_counts.len() as i32 or body.call_intrinsic(args_id) == MirIntrinsic.NONE:
-                continue
-            let arg_start = body.call_arg_starts[args_id]
-            for ai in 0..body.call_arg_counts[args_id]:
-                let op_id = body.call_arg_operands[(arg_start + ai)]
-                if op_id >= 0 and op_id < body.operand_d0.len() as i32:
-                    intrinsic_places.insert(body.operand_d0[op_id], 1)
         for place_id in 0..body.place_locals.len() as i32:
-            if body.place_proj_counts[place_id] == 0 or intrinsic_places.contains(place_id):
+            if body.place_proj_counts[place_id] == 0:
                 continue
             let sema_ty = body.place_sema_types[place_id]
             if sema_ty <= 0:
@@ -2895,7 +2877,7 @@ impl Codegen:
         let has_sret = if abi.ret.pass == PM_INDIRECT: 1 else: 0
         let sret_ty = abi.ret.source_ty
         let byval_types = self.fn_abi_byval_types(abi_index)
-        let fn_type = abi.llvm_ty
+        let fn_type: i64 = abi.llvm_ty
         let func = wl_add_function(self.llmod, name, fn_type)
         if has_sret != 0:
             wl_add_sret_attr(self.context, func, 0, sret_ty)
@@ -4531,7 +4513,7 @@ impl Codegen:
         // #697: element drops are member drops — always sentinel-guarded (#605
         // blanks a moved-out slot; the guard is what makes that skip real).
         self.member_drop_depth = self.member_drop_depth + 1
-        self.mir_emit_drop_ptr_for_sema_type(elem_ptr, elem_ty, elem_sema)
+        self.mir_emit_element_drop(elem_ptr, elem_ty, elem_sema)
         self.member_drop_depth = self.member_drop_depth - 1
         let one = wl_const_int(i64_ty, 1, 0)
         let next_idx = wl_build_add(self.builder, idx_phi, one)
@@ -4548,6 +4530,19 @@ impl Codegen:
         wl_add_incoming(idx_phi, vec_data_i64(&phi_vals), vec_data_i64(&phi_bbs), 2)
 
         wl_position_at_end(self.builder, done_bb)
+
+    // #1557: a collection element of struct type drops through the type's
+    // named drop fn (ensure_structural_drop_fn declares it before emitting
+    // its body). Inlined, a type recursive through its own collection
+    // (`N { next: Vec[N] }`) expanded N -> Vec[N] -> N without end and
+    // overflowed the compiler's stack.
+    mut fn mir_emit_element_drop(ptr: i64, ty: i64, sema_ty: i32):
+        if sema_ty > 0 and self.sema.get_type_kind(self.sema.resolve_alias(sema_ty as TypeId)) == TypeKind.TY_STRUCT:
+            let dfn = self.ensure_structural_drop_fn(sema_ty, ty)
+            if dfn != 0:
+                self.mir_emit_guarded_user_drop(ptr, ty, dfn, wl_global_get_value_type(dfn))
+                return
+        self.mir_emit_drop_ptr_for_sema_type(ptr, ty, sema_ty)
 
     // #747: free a str's buffer via the ownership-checked runtime helper and
     // blank the place. Mirrors the Vec pattern including drop-origin tagging.
@@ -4808,7 +4803,7 @@ impl Codegen:
             key_args.push(idx_phi)
             let key_ptr = wl_build_call(self.builder, key_fn_ty, key_fn, vec_data_i64(&key_args), 2)
             self.member_drop_depth = self.member_drop_depth + 1
-            self.mir_emit_drop_ptr_for_sema_type(key_ptr, key_ty, key_sema)
+            self.mir_emit_element_drop(key_ptr, key_ty, key_sema)
             self.member_drop_depth = self.member_drop_depth - 1
         if drop_value:
             let value_fn = self.ensure_hashmap_slot_runtime_fn("with_hashmap_value_ptr_at", ptr_ty)
@@ -4818,7 +4813,7 @@ impl Codegen:
             value_args.push(idx_phi)
             let value_ptr = wl_build_call(self.builder, value_fn_ty, value_fn, vec_data_i64(&value_args), 2)
             self.member_drop_depth = self.member_drop_depth + 1
-            self.mir_emit_drop_ptr_for_sema_type(value_ptr, value_ty, value_sema)
+            self.mir_emit_element_drop(value_ptr, value_ty, value_sema)
             self.member_drop_depth = self.member_drop_depth - 1
         wl_build_br(self.builder, advance_bb)
 
@@ -4935,7 +4930,7 @@ impl Codegen:
         value_args.push(idx_phi)
         let value_ptr = wl_build_call(self.builder, value_ty, value_fn, vec_data_i64(&value_args), 2)
         self.member_drop_depth = self.member_drop_depth + 1
-        self.mir_emit_drop_ptr_for_sema_type(value_ptr, elem_ty, elem_sema)
+        self.mir_emit_element_drop(value_ptr, elem_ty, elem_sema)
         self.member_drop_depth = self.member_drop_depth - 1
         wl_build_br(self.builder, advance_bb)
 
@@ -5102,12 +5097,12 @@ impl Codegen:
         let fn_ty = wl_function_type(wl_void_type(self.context), vec_data_i64(&params), 1, 0)
         let drop_fn = wl_add_function(self.llmod, fn_name, fn_ty)
 
-        let saved_fn = self.current_function
-        let saved_fn_name_sym = self.current_function_name_sym
-        let saved_fn_node = self.current_function_node
-        let saved_ret_ty = self.current_ret_type
+        let saved_fn: i64 = self.current_function
+        let saved_fn_name_sym: i32 = self.current_function_name_sym
+        let saved_fn_node: i32 = self.current_function_node
+        let saved_ret_ty: i64 = self.current_ret_type
         let saved_bb = wl_get_insert_block(self.builder)
-        let saved_member_depth = self.member_drop_depth
+        let saved_member_depth: i32 = self.member_drop_depth
 
         self.current_function = drop_fn
         self.current_function_name_sym = 0
@@ -5155,15 +5150,15 @@ impl Codegen:
         let drop_fn = wl_add_function(self.llmod, fn_name, fn_ty)
         wl_set_linkage(drop_fn, wl_internal_linkage())
 
-        let saved_fn = self.current_function
-        let saved_fn_name_sym = self.current_function_name_sym
-        let saved_fn_node = self.current_function_node
-        let saved_ret_ty = self.current_ret_type
+        let saved_fn: i64 = self.current_function
+        let saved_fn_name_sym: i32 = self.current_function_name_sym
+        let saved_fn_node: i32 = self.current_function_node
+        let saved_ret_ty: i64 = self.current_ret_type
         let saved_bb = wl_get_insert_block(self.builder)
-        let saved_needs_guard = self.current_drop_needs_guard
-        let saved_member_depth = self.member_drop_depth
-        let saved_origin_ptr = self.current_drop_origin_ptr
-        let saved_origin_len = self.current_drop_origin_len
+        let saved_needs_guard: bool = self.current_drop_needs_guard
+        let saved_member_depth: i32 = self.member_drop_depth
+        let saved_origin_ptr: i64 = self.current_drop_origin_ptr
+        let saved_origin_len: i64 = self.current_drop_origin_len
 
         self.current_function = drop_fn
         self.current_function_name_sym = 0
@@ -5227,15 +5222,15 @@ impl Codegen:
         self.bind_fn_abi(self.intern.intern(fn_name), abi_index, drop_fn)
         wl_set_linkage(drop_fn, wl_internal_linkage())
 
-        let saved_fn = self.current_function
-        let saved_fn_name_sym = self.current_function_name_sym
-        let saved_fn_node = self.current_function_node
-        let saved_ret_ty = self.current_ret_type
+        let saved_fn: i64 = self.current_function
+        let saved_fn_name_sym: i32 = self.current_function_name_sym
+        let saved_fn_node: i32 = self.current_function_node
+        let saved_ret_ty: i64 = self.current_ret_type
         let saved_bb = wl_get_insert_block(self.builder)
-        let saved_needs_guard = self.current_drop_needs_guard
-        let saved_member_depth = self.member_drop_depth
-        let saved_origin_ptr = self.current_drop_origin_ptr
-        let saved_origin_len = self.current_drop_origin_len
+        let saved_needs_guard: bool = self.current_drop_needs_guard
+        let saved_member_depth: i32 = self.member_drop_depth
+        let saved_origin_ptr: i64 = self.current_drop_origin_ptr
+        let saved_origin_len: i64 = self.current_drop_origin_len
 
         self.current_function = drop_fn
         self.current_function_name_sym = 0
@@ -5749,9 +5744,9 @@ impl Codegen:
             return true
 
         if sk == StmtKind.Drop:
-            let saved_origin_ptr = self.current_drop_origin_ptr
-            let saved_origin_len = self.current_drop_origin_len
-            let saved_needs_guard = self.current_drop_needs_guard
+            let saved_origin_ptr: i64 = self.current_drop_origin_ptr
+            let saved_origin_len: i64 = self.current_drop_origin_len
+            let saved_needs_guard: bool = self.current_drop_needs_guard
             self.mir_set_current_drop_origin(d1)
             // Stage 4 (§2.5.2): a local never recorded as moved can never be the
             // reset sentinel, so drop it unconditionally; otherwise keep the guard.
@@ -5769,12 +5764,48 @@ impl Codegen:
 
         false
 
+    // #1305: `T` of the awaited `Task[T]`/`ScopedTask[T]`; 0 if the operand
+    // is not a task.
+    fn mir_task_awaited_sema_type(task_sema_ty: i32) -> i32:
+        if task_sema_ty <= 0:
+            return 0
+        let resolved = self.sema.resolve_alias(task_sema_ty as TypeId) as i32
+        if self.sema.type_is_task(resolved) == 0 and self.sema.type_is_scoped_task(resolved) == 0:
+            return 0
+        if self.sema.get_generic_inst_arg_count(resolved) < 1:
+            return 0
+        self.sema.get_generic_inst_arg(resolved, 0)
+
     fn mir_default_unreachable_bb_value() -> i64:
         if self.mir_default_unreachable_bbs.len() as i32 > 0:
             return self.mir_default_unreachable_bbs.get(0)
         let bb = wl_append_bb(self.context, self.current_function, "mir.default.unreachable")
         self.mir_default_unreachable_bbs.push(bb)
         bb
+
+    // Every MIR body emitter starts with this: a module global a body names
+    // is a proxy local bound to the global's storage. The generic
+    // specialization emitter skipped it, so a generic body reading its
+    // module's `global var` read an unbound stack slot (#1743).
+    mut fn mir_bind_global_locals(body: &MirBody):
+        for gli in 0..body.local_names.len() as i32:
+            let gl_name = body.local_names[gli]
+            if gl_name != 0 and body.local_is_global[gli] != 0:
+                let gl_mc = self.module_constants.get(gl_name)
+                if gl_mc.is_some():
+                    let global_value: i64 = gl_mc.unwrap()
+                    self.mir_local_ptrs.insert(gli, global_value)
+
+    // Every MIR body emitter ends with this: a switch lowering creates the
+    // shared default block on demand, and it has no terminator until the body
+    // is done. The const-initializer and default-method emitters skipped it,
+    // so an `or`/`if` in a module `let` failed LLVM verification (#1483).
+    fn mir_terminate_default_unreachable():
+        if self.mir_default_unreachable_bbs.len() as i32 > 0:
+            let ubb = self.mir_default_unreachable_bbs.get(0)
+            if wl_get_bb_terminator(ubb) == 0:
+                wl_position_at_end(self.builder, ubb)
+                wl_build_unreachable(self.builder)
 
     mut fn mir_try_place_ptr_for_ref(body: &MirBody, operand_id: i32) -> i64:
         if operand_id < 0 or operand_id >= body.operand_kinds.len() as i32:
@@ -5979,8 +6010,22 @@ impl Codegen:
             let marshaled = self.marshal_ref_addr(body, operand, raw)
             self.record_codegen_call_argument(body, args_id, operand, param_index, self.analysis_last_marshal_strategy, raw, marshaled)
             return marshaled
-        self.record_codegen_call_argument(body, args_id, operand, param_index, AnalysisMarshalStrategy.DirectValue, raw, raw)
-        raw
+        // #1740: a scalar argument takes the parameter's own width here, as
+        // the direct call path's operand evaluation does. An i32 index
+        // widened to a generic method's `index: i64` (BTreeMap.key_at) went
+        // to the call at its source width, and the audit caught the
+        // disagreement with the callee's FnAbi.
+        var marshaled = raw
+        if param_index < self.sema.sig_get_param_count(sig_idx):
+            let param_sema = self.sema.sig_param_type(sig_idx, param_index)
+            let param_kind = self.sema.get_type_kind(self.sema.resolve_alias(param_sema as TypeId))
+            if param_kind == TypeKind.TY_INT or param_kind == TypeKind.TY_FLOAT:
+                let want = self.mir_sema_type_to_llvm(param_sema)
+                if want != 0 and wl_type_of(raw) != want:
+                    let src_unsigned = self.mir_sema_type_is_unsigned(self.mir_operand_sema_type(body, operand))
+                    marshaled = self.mir_coerce_value_to_sema_type(raw, want, param_sema, src_unsigned)
+        self.record_codegen_call_argument(body, args_id, operand, param_index, AnalysisMarshalStrategy.DirectValue, raw, marshaled)
+        marshaled
 
     // Evaluate a contiguous MIR call-argument range under the concrete signature
     // captured in that MIR body. Every user call path uses this function for
@@ -6156,7 +6201,7 @@ impl Codegen:
             if not src_unsigned:
                 src_unsigned = self.mir_operand_is_str_byte(body, operand_id)
             out = self.mir_coerce_value_to_sema_type(out, expected_ty, expected_sema_ty, src_unsigned)
-        let had_error_before = self.had_error
+        let had_error_before: i32 = self.had_error
         let coerced = self.enforce_coerced_type(out, expected_ty, "wrong argument type")
         if self.had_error != had_error_before:
             self.debug_call_coerce_failure(call_context, 0, arg_index, 0, out, expected_ty)
@@ -7043,7 +7088,7 @@ impl Codegen:
         let mi_kind = self.pool.kind(mi_node)
         let specs_start = if mi_kind == NodeKind.NK_MULTI_INDEX: self.pool.get_data1(mi_node) else: 0
         let specs_count = if mi_kind == NodeKind.NK_INDEX: 2 else: self.pool.get_data2(mi_node)
-        let ctx = self.context
+        let ctx: i64 = self.context
         let spec_fields: Vec[i64] = Vec.new()
         spec_fields.push(wl_i32_type(ctx))
         spec_fields.push(wl_i64_type(ctx))
@@ -10477,14 +10522,8 @@ impl Codegen:
             // intrinsics emitted by MirLower, with defers in the unwind BB).
             let task_op = self.mir_intrinsic_arg(body, args_id, 0)
             let task_ty = wl_type_of(task_op)
-            // Find the MIR local for the Task to look up its result type
-            var task_mir_local: i32 = -1
             let await_arg_start = body.call_arg_starts[args_id]
             let await_op_id = body.call_arg_operands[await_arg_start]
-            if await_op_id >= 0 and await_op_id < body.operand_d0.len() as i32:
-                let await_place_id = body.operand_d0[await_op_id]
-                if await_place_id >= 0 and await_place_id < body.place_locals.len() as i32:
-                    task_mir_local = body.place_locals[await_place_id]
             // Task = { i32 fiber_id, i8* result_buf }
             let task_alloca = self.create_entry_alloca(task_ty)
             wl_build_store(self.builder, task_op, task_alloca)
@@ -10534,20 +10573,16 @@ impl Codegen:
                         ignore_result = true
             // Load result from buffer, free buffer, store to dest
             if not ignore_result and dest_place >= 0 and dest_place < body.place_locals.len() as i32:
-                var dst_llvm_ty: i64 = 0
-                if task_mir_local >= 0:
-                    let trt_opt = self.async_task_result_types.get(task_mir_local)
-                    if trt_opt.is_some():
-                        dst_llvm_ty = trt_opt.unwrap() as i64
+                // #1305: the awaited value is the Task's own type argument
+                // (Sema's Task[T] / ScopedTask[T] on the awaited operand) —
+                // never a side table keyed by a local id, the last spawn's
+                // type, or an i32 guess.
+                let awaited_sema_ty = self.mir_task_awaited_sema_type(await_task_sema_ty)
+                let dst_llvm_ty = if awaited_sema_ty > 0: self.mir_sema_type_to_llvm(awaited_sema_ty) else: 0
                 if dst_llvm_ty == 0 or dst_llvm_ty == wl_void_type(self.context):
-                    let dst_local = body.place_locals[dest_place]
-                    let dst_sema_ty = body.local_type_ids[dst_local]
-                    dst_llvm_ty = self.mir_sema_type_to_llvm(dst_sema_ty)
-                if dst_llvm_ty == 0 or dst_llvm_ty == wl_void_type(self.context):
-                    if self.last_async_spawn_ret_ty != 0:
-                        dst_llvm_ty = self.last_async_spawn_ret_ty
-                if dst_llvm_ty == 0 or dst_llvm_ty == wl_void_type(self.context):
-                    dst_llvm_ty = wl_i32_type(self.context)
+                    with_eprint(f"error: code generation failed: cannot type the value awaited from `{self.sema.type_name(await_task_sema_ty)}` in '{self.intern.resolve(self.current_function_name_sym)}'")
+                    self.had_error = 1
+                    return false
                 let result_val = wl_build_load(self.builder, dst_llvm_ty, rbuf)
                 let dst_alloca = self.create_entry_alloca(dst_llvm_ty)
                 wl_build_store(self.builder, result_val, dst_alloca)
@@ -11984,10 +12019,10 @@ impl Codegen:
         let fn_ty = wl_function_type(ptr_ty, vec_data_i64(&params), 1, 0)
         let clone_fn = wl_add_function(self.llmod, fn_name, fn_ty)
         wl_set_linkage(clone_fn, wl_internal_linkage())
-        let saved_fn = self.current_function
-        let saved_fn_name_sym = self.current_function_name_sym
-        let saved_fn_node = self.current_function_node
-        let saved_ret_ty = self.current_ret_type
+        let saved_fn: i64 = self.current_function
+        let saved_fn_name_sym: i32 = self.current_function_name_sym
+        let saved_fn_node: i32 = self.current_function_node
+        let saved_ret_ty: i64 = self.current_ret_type
         let saved_bb = wl_get_insert_block(self.builder)
         self.current_function = clone_fn
         self.current_function_name_sym = 0
@@ -15746,7 +15781,7 @@ impl Codegen:
                 let place = if codegen_c_abi_needs_byval_attr(): self.mir_try_place_ptr_for_ref(body, operand_id) else: 0
                 let val = if place == 0: self.mir_eval_operand(body, operand_id, 0) else: 0
                 let arg_ptr = self.push_call_arg(call_abi, ai, val, place)
-                let byval_strategy = self.analysis_last_marshal_strategy
+                let byval_strategy: AnalysisMarshalStrategy = self.analysis_last_marshal_strategy
                 self.record_codegen_call_argument(body, args_id, operand_id, ai, byval_strategy, arg_ptr, arg_ptr)
                 args.push(arg_ptr)
                 continue
@@ -16135,10 +16170,11 @@ impl Codegen:
         self.current_function = function
         self.current_function_name_sym = name_sym
         self.current_function_node = fn_node
+        self.current_function_tier_node = fn_node
         self.current_ret_type = wl_get_return_type(fn_type)
         let saved_tb_syms = move self.type_binding_syms
         let saved_tb_tys = move self.type_binding_types
-        let saved_tb_len = self.type_bindings_len
+        let saved_tb_len: i32 = self.type_bindings_len
         self.set_mono_type_bindings(name_sym)
         let fn_has_sret_opt = self.fn_abi_has_sret(name_sym)
         let fn_has_sret = if fn_has_sret_opt.is_some(): fn_has_sret_opt.unwrap() else: 0
@@ -16179,18 +16215,18 @@ impl Codegen:
         self.enum_local_types = fresh_enum_local_types
         self.scope_local_count = 0
 
-        let saved_expected = self.expected_type
-        let saved_expected_node = self.expected_type_node
+        let saved_expected: i64 = self.expected_type
+        let saved_expected_node: i32 = self.expected_type_node
         self.expected_type = self.current_ret_type
         self.expected_type_node = 0
-        let saved_result_err = self.current_result_err_symbol
-        let saved_returns_result = self.current_fn_returns_result
-        let saved_saw_return = self.current_fn_saw_explicit_return
+        let saved_result_err: i32 = self.current_result_err_symbol
+        let saved_returns_result: bool = self.current_fn_returns_result
+        let saved_saw_return: bool = self.current_fn_saw_explicit_return
         self.current_result_err_symbol = 0
         self.current_fn_returns_result = false
         self.current_fn_saw_explicit_return = false
-        let saved_tailrec_bb = self.tailrec_body_bb
-        let saved_tailrec_sym = self.tailrec_fn_sym
+        let saved_tailrec_bb: i64 = self.tailrec_body_bb
+        let saved_tailrec_sym: i32 = self.tailrec_fn_sym
         self.tailrec_body_bb = 0
         self.tailrec_fn_sym = 0
 
@@ -16220,14 +16256,7 @@ impl Codegen:
         self.mir_local_types.insert(0, ret_store_ty)
         self.mir_scan_memory_locals(body)
 
-        // Pre-populate mir_local_ptrs for global variable proxy locals
-        for gli in 0..body.local_names.len() as i32:
-            let gl_name = body.local_names[gli]
-            if gl_name != 0 and body.local_is_global[gli] != 0:
-                let gl_mc = self.module_constants.get(gl_name)
-                if gl_mc.is_some():
-                    let global_value: i64 = gl_mc.unwrap()
-                    self.mir_local_ptrs.insert(gli, global_value)
+        self.mir_bind_global_locals(body)
 
         let meta = self.pool.find_fn_meta(fn_node)
         var param_start = 0
@@ -16448,7 +16477,7 @@ impl Codegen:
                 let _ = wl_build_ret(self.builder, self.build_default_value(self.current_ret_type))
 
         let reachable_bbs = self.mir_reachable_blocks(body)
-        let saved_fn_scope = self.di_current_scope
+        let saved_fn_scope: i64 = self.di_current_scope
         for bb in 0..body.block_count():
             if bb < 0 or bb >= self.mir_bb_values.len() as i32:
                 continue
@@ -16508,11 +16537,7 @@ impl Codegen:
 
         self.di_current_scope = saved_fn_scope
 
-        if self.mir_default_unreachable_bbs.len() as i32 > 0:
-            let ubb = self.mir_default_unreachable_bbs.get(0)
-            if wl_get_bb_terminator(ubb) == 0:
-                wl_position_at_end(self.builder, ubb)
-                wl_build_unreachable(self.builder)
+        self.mir_terminate_default_unreachable()
 
         self.debug_declare_mir_locals(body, function, 1, param_count)
         self.run_mir_cleanup_passes(function, name_str)
@@ -16548,11 +16573,11 @@ impl Codegen:
         let fn_type = ft.unwrap() as i64
 
         // Save all codegen state (will be restored at end)
-        let saved_fn = self.current_function
-        let saved_fn_name_sym = self.current_function_name_sym
-        let saved_fn_node = self.current_function_node
-        let saved_ret = self.current_ret_type
-        let saved_owner = self.current_method_owner_sym
+        let saved_fn: i64 = self.current_function
+        let saved_fn_name_sym: i32 = self.current_function_name_sym
+        let saved_fn_node: i32 = self.current_function_node
+        let saved_ret: i64 = self.current_ret_type
+        let saved_owner: i32 = self.current_method_owner_sym
         let saved_allocas = move self.local_allocas
         let saved_types = move self.local_types
         let saved_muts = move self.local_muts
@@ -16564,18 +16589,18 @@ impl Codegen:
         let saved_scope_syms = move self.scope_local_syms
         let saved_scope_allocas = move self.scope_local_allocas
         let saved_scope_types = move self.scope_local_types
-        let saved_scope_count = self.scope_local_count
+        let saved_scope_count: i32 = self.scope_local_count
         let saved_defer = move self.defer_stack
         let saved_errdefer = move self.errdefer_stack
         let saved_enum_local_types = move self.enum_local_types
         let saved_sema_local_types = move self.local_sema_types
-        let saved_expected = self.expected_type
-        let saved_expected_node = self.expected_type_node
-        let saved_result_err = self.current_result_err_symbol
-        let saved_returns_result = self.current_fn_returns_result
-        let saved_saw_return = self.current_fn_saw_explicit_return
-        let saved_tail_bb = self.tailrec_body_bb
-        let saved_tail_sym = self.tailrec_fn_sym
+        let saved_expected: i64 = self.expected_type
+        let saved_expected_node: i32 = self.expected_type_node
+        let saved_result_err: i32 = self.current_result_err_symbol
+        let saved_returns_result: bool = self.current_fn_returns_result
+        let saved_saw_return: bool = self.current_fn_saw_explicit_return
+        let saved_tail_bb: i64 = self.tailrec_body_bb
+        let saved_tail_sym: i32 = self.tailrec_fn_sym
         let saved_tail_allocas = move self.tailrec_param_allocas
         let saved_loops = self.capture_loop_state()
         let saved_bb = wl_get_insert_block(self.builder)
@@ -16585,6 +16610,10 @@ impl Codegen:
         self.current_function = function
         self.current_function_name_sym = mono_sym
         self.current_function_node = fn_node
+        let saved_tier_node: i32 = self.current_function_tier_node
+        var tier_node = if fn_node > 0: fn_node else: self.debug_decl_node_for(body.fn_sym)
+        if tier_node <= 0: tier_node = self.debug_decl_node_for(mono_sym)
+        self.current_function_tier_node = tier_node
         // #1348: a specialization is a function of its own in the debug info:
         // a subprogram in its template's file, its statements' lines, its
         // variables. It is emitted in the middle of another function, whose
@@ -16603,7 +16632,7 @@ impl Codegen:
         self.current_ret_type = wl_get_return_type(fn_type)
         let saved_tb_syms = move self.type_binding_syms
         let saved_tb_tys = move self.type_binding_types
-        let saved_tb_len = self.type_bindings_len
+        let saved_tb_len: i32 = self.type_bindings_len
         self.set_mono_type_bindings(mono_sym)
         let fn_has_sret_opt = self.fn_abi_has_sret(mono_sym)
         let fn_has_sret = if fn_has_sret_opt.is_some(): fn_has_sret_opt.unwrap() else: 0
@@ -16693,6 +16722,7 @@ impl Codegen:
         self.mir_local_ptrs.insert(0, ret_alloca)
         self.mir_local_types.insert(0, ret_store_ty)
         self.mir_scan_memory_locals(body)
+        self.mir_bind_global_locals(body)
 
         let meta = if fn_node > 0: self.pool.find_fn_meta(fn_node) else: -1
         var param_start = 0
@@ -16910,7 +16940,7 @@ impl Codegen:
                 let _ = wl_build_ret(self.builder, self.build_default_value(self.current_ret_type))
 
         let reachable_bbs = self.mir_reachable_blocks(body)
-        let mono_fn_scope = self.di_current_scope
+        let mono_fn_scope: i64 = self.di_current_scope
         for bb in 0..body.block_count():
             if bb < 0 or bb >= self.mir_bb_values.len() as i32:
                 continue
@@ -16941,11 +16971,7 @@ impl Codegen:
                     wl_build_unreachable(self.builder)
         self.di_current_scope = mono_fn_scope
 
-        if self.mir_default_unreachable_bbs.len() as i32 > 0:
-            let ubb = self.mir_default_unreachable_bbs.get(0)
-            if wl_get_bb_terminator(ubb) == 0:
-                wl_position_at_end(self.builder, ubb)
-                wl_build_unreachable(self.builder)
+        self.mir_terminate_default_unreachable()
 
         self.debug_declare_mir_locals(body, function, 1, param_count)
         self.run_mir_cleanup_passes(function, name_str)
@@ -16955,6 +16981,7 @@ impl Codegen:
         self.current_function = saved_fn
         self.current_function_name_sym = saved_fn_name_sym
         self.current_function_node = saved_fn_node
+        self.current_function_tier_node = saved_tier_node
         self.current_ret_type = saved_ret
         self.current_method_owner_sym = saved_owner
         self.local_allocas = saved_allocas
@@ -17312,7 +17339,7 @@ impl Codegen:
 
         let saved_bind_syms = move self.type_binding_syms
         let saved_bind_tys = move self.type_binding_types
-        let saved_bind_len = self.type_bindings_len
+        let saved_bind_len: i32 = self.type_bindings_len
         let fresh_bind_syms: Vec[i32] = Vec.new()
         let fresh_bind_tys: Vec[i64] = Vec.new()
         self.type_binding_syms = fresh_bind_syms
@@ -17640,15 +17667,15 @@ impl Codegen:
         let drop_fn = wl_add_function(self.llmod, fn_name, fn_ty)
         wl_set_linkage(drop_fn, wl_internal_linkage())
 
-        let saved_fn = self.current_function
-        let saved_fn_name_sym = self.current_function_name_sym
-        let saved_fn_node = self.current_function_node
-        let saved_ret_ty = self.current_ret_type
+        let saved_fn: i64 = self.current_function
+        let saved_fn_name_sym: i32 = self.current_function_name_sym
+        let saved_fn_node: i32 = self.current_function_node
+        let saved_ret_ty: i64 = self.current_ret_type
         let saved_bb = wl_get_insert_block(self.builder)
-        let saved_needs_guard = self.current_drop_needs_guard
-        let saved_member_depth = self.member_drop_depth
-        let saved_origin_ptr = self.current_drop_origin_ptr
-        let saved_origin_len = self.current_drop_origin_len
+        let saved_needs_guard: bool = self.current_drop_needs_guard
+        let saved_member_depth: i32 = self.member_drop_depth
+        let saved_origin_ptr: i64 = self.current_drop_origin_ptr
+        let saved_origin_len: i64 = self.current_drop_origin_len
         self.current_function = drop_fn
         self.current_function_name_sym = 0
         self.current_function_node = 0
@@ -17802,10 +17829,10 @@ impl Codegen:
         let closure_byval_types = self.fn_abi_byval_types(closure_abi_index)
         self.apply_c_abi_byval_attrs(closure_fn, closure_byval_types, param_count, closure_param_offset)
         // Save current state
-        let saved_fn = self.current_function
-        let saved_ret = self.current_ret_type
-        let saved_fn_name_sym = self.current_function_name_sym
-        let saved_async_rbuf = self.async_block_rbuf
+        let saved_fn: i64 = self.current_function
+        let saved_ret: i64 = self.current_ret_type
+        let saved_fn_name_sym: i32 = self.current_function_name_sym
+        let saved_async_rbuf: i64 = self.async_block_rbuf
         self.async_block_rbuf = 0
         let saved_bb = wl_get_insert_block(self.builder)
         let saved_allocas = move self.local_allocas
@@ -17993,14 +18020,7 @@ impl Codegen:
                     let cl_pm_ty: i64 = cl_pm_ty_opt.unwrap()
                     self.mir_local_types.insert(cl_pm_local_id, cl_pm_ty)
 
-        // Pre-populate globals
-        for cl_gli in 0..closure_body.local_names.len() as i32:
-            let cl_gl_name = closure_body.local_names[cl_gli]
-            if cl_gl_name != 0 and closure_body.local_is_global[cl_gli] != 0:
-                let cl_gl_mc = self.module_constants.get(cl_gl_name)
-                if cl_gl_mc.is_some():
-                    let cl_global_value: i64 = cl_gl_mc.unwrap()
-                    self.mir_local_ptrs.insert(cl_gli, cl_global_value)
+        self.mir_bind_global_locals(closure_body)
 
         // Create LLVM basic blocks for MIR blocks
         for cl_bb in 0..closure_body.block_count():
@@ -18015,7 +18035,7 @@ impl Codegen:
             let _ = wl_build_ret(self.builder, wl_const_int(ret_ty, 0, 0))
 
         // Emit MIR statements and terminators
-        let closure_scope = self.di_current_scope
+        let closure_scope: i64 = self.di_current_scope
         for cl_bb in 0..closure_body.block_count():
             if cl_bb < 0 or cl_bb >= self.mir_bb_values.len() as i32:
                 continue
@@ -18042,11 +18062,7 @@ impl Codegen:
                         let _ = wl_build_ret(self.builder, wl_const_int(ret_ty, 0, 0))
         self.di_current_scope = closure_scope
 
-        if self.mir_default_unreachable_bbs.len() as i32 > 0:
-            let ubb = self.mir_default_unreachable_bbs.get(0)
-            if wl_get_bb_terminator(ubb) == 0:
-                wl_position_at_end(self.builder, ubb)
-                wl_build_unreachable(self.builder)
+        self.mir_terminate_default_unreachable()
         self.debug_declare_mir_locals(closure_body, closure_fn, capture_count + 1, param_count)
 
         // Restore outer MIR state
@@ -19053,7 +19069,6 @@ impl Codegen:
         var task_value = wl_get_undef(task_ty)
         task_value = wl_build_insert_value(self.builder, task_value, fiber_id, 0)
         task_value = wl_build_insert_value(self.builder, task_value, result_buf, 1)
-        self.last_async_spawn_ret_ty = ret_ty
         task_value
 
     mut fn emit_async_fn_spawn(fn_sym: i32, callee: i64, call_ft: i64, args: &Vec[i64], dest_place: i32, body: &MirBody, next_bb: i32) -> bool:
@@ -19152,9 +19167,6 @@ impl Codegen:
             wl_build_store(self.builder, result_buf, rbuf_ptr)
             self.mir_local_ptrs.insert(dst_local, task_alloca)
             self.mir_local_types.insert(dst_local, task_ty)
-            // Store result type for FIBER_AWAIT to load correctly
-            self.async_task_result_types.insert(dst_local as i32, ret_ty)
-            self.last_async_spawn_ret_ty = ret_ty
 
         if next_bb >= 0 and next_bb < self.mir_bb_values.len() as i32:
             wl_build_br(self.builder, self.mir_bb_values[next_bb])
@@ -19281,9 +19293,9 @@ impl Codegen:
         let tramp_fn = wl_add_function(self.llmod, tramp_name, tramp_ft)
 
         // 4. Save codegen state
-        let saved_fn = self.current_function
-        let saved_ret = self.current_ret_type
-        let saved_async_rbuf = self.async_block_rbuf
+        let saved_fn: i64 = self.current_function
+        let saved_ret: i64 = self.current_ret_type
+        let saved_async_rbuf: i64 = self.async_block_rbuf
         let saved_bb = wl_get_insert_block(self.builder)
         let saved_allocas = move self.local_allocas
         let saved_types = move self.local_types

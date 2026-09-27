@@ -1026,6 +1026,10 @@ pub type Sema {
     // error (D22 §13.6) and the implicit-move error claim the node here,
     // whichever fires first.
     field_move_diag_nodes: HashMap[i32, i32],
+    // §10.3 (D74, #1710): the optional chains that read their base in place
+    // (a Copy field, a borrowing method, a view). A chain absent here takes
+    // its payload out of a temporary. Sema decides; MirLower reads.
+    optional_chain_observing_nodes: HashMap[i32, i32],
     marking_explicit_move: i32,
     moved_field_path_starts: Vec[i32],
     moved_field_path_counts: Vec[i32],
@@ -1209,6 +1213,14 @@ pub type Sema {
     // consumed by MirLower.lower_call_arg to borrow the place instead of
     // moving the collection.
     slice_coerce_args: HashMap[i32, i32],
+    // #1739: a sequence or map literal with no expected instance whose
+    // declared destination names a collection with undecided type
+    // arguments (a generic struct field `items: Vec[T]`): literal node ->
+    // the collection base the literal builds (§4.3c rule 1 and 2).
+    collection_literal_hints: HashMap[i32, i32],
+    // #1754: the if/match argument now being checked at a `&T` parameter;
+    // its arms meet `T` and its join has no owned anchor.
+    borrow_pointee_join_node: i32,
     // D22 Stage 2 contextual-Copy decisions. The node map indexes the single
     // structured record consumed by later stages; expression type inference
     // never reads this sidecar and therefore remains exact.
@@ -2607,6 +2619,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         moved_field_base_syms: Vec.new(),
         explicitly_partial_syms: sema_new_map_i32_i32(),
         field_move_diag_nodes: sema_new_map_i32_i32(),
+        optional_chain_observing_nodes: sema_new_map_i32_i32(),
         marking_explicit_move: 0,
         moved_field_path_starts: Vec.new(),
         moved_field_path_counts: Vec.new(),
@@ -2723,6 +2736,8 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         autoderef_step_starts: sema_new_map_i32_i32(),
         autoderef_step_counts: sema_new_map_i32_i32(),
         slice_coerce_args: sema_new_map_i32_i32(),
+        collection_literal_hints: sema_new_map_i32_i32(),
+        borrow_pointee_join_node: 0,
         contextual_copy_adjustment_indices: sema_new_map_i64_i32(),
         contextual_copy_adjustments: Vec.new(),
         contextual_join_decision_indices: sema_new_map_i64_i32(),
@@ -3556,7 +3571,51 @@ impl Sema:
             if self.engine_corpus_id(target_path) != 0 or self.module_in_prelude_closure(target_path) != 0:
                 if self.module_visible_no_prelude(target_path) == 0:
                     return 0
+        if target_is_std == 0 and self.unselected_import_path(target_path, sym).len() > 0:
+            return 0
         self.decl_visible_from_current(target_path, is_pub)
+
+    // #1744 (§18.2): a named import introduces the names it selects. When
+    // the current module imports a (non-std) module only by named imports,
+    // a name none of them selects is not visible through them: the import
+    // text of the last such `use` (for the diagnostic), "" when the name is
+    // selected, the module is imported whole, or it is not a direct import.
+    // A std module keeps every public name available through the §18.2
+    // fallback tier. A displaced identity (`name$in$module`, #1350) is
+    // judged by its short name.
+    fn unselected_import_path(target_path: &str, sym: i32) -> str:
+        let cur = self.module_index_by_path.get(with_str_clone_ref(self.current_module_path))
+        let target = self.module_index_by_path.get(target_path)
+        if not cur.is_some() or not target.is_some():
+            return ""
+        let from: i32 = cur.unwrap()
+        let to: i32 = target.unwrap()
+        if from < 0 or from >= self.module_import_starts.len() as i32 or from == to:
+            return ""
+        var name: str = with_str_clone_ref(self.pool_resolve(sym))
+        let infix = name.index_of("$in$")
+        if infix > 0:
+            name = name.slice(0, infix)
+        // A method is reached through a value or its type's name: the
+        // selection governs the names a module spells, and a type name it
+        // spells is judged on its own (`UserService.builder().with_config()`
+        // calls a method of a type the import never names).
+        if name.index_of(".") > 0:
+            return ""
+        var excluded_by = ""
+        let start = self.module_import_starts[from]
+        for ei in 0..self.module_import_counts[from]:
+            let idx = start + ei
+            if self.module_import_targets[idx] != to:
+                continue
+            let text = self.module_import_paths[idx]
+            if text == "std.prelude" or text == "std.prelude_core" or text == "std.prelude_alloc":
+                continue
+            let selected = if idx < self.module_import_selected.len() as i32: self.module_import_selected[idx].clone() else: ""
+            if selected.len() == 0 or sema_selection_names(selected, name):
+                return ""
+            excluded_by = with_str_clone_ref(text)
+        excluded_by
 
     fn module_in_prelude_closure(path: &str) -> i32:
         if self.global_visible_module_paths.contains(path): 1 else: 0
@@ -3720,7 +3779,11 @@ impl Sema:
         let record = self.decl_visibility_node_index.get(node)
         if record.is_some():
             let i: i32 = record.unwrap()
-            return self.decl_visible_from_current(self.decl_visibility_paths[i], self.decl_visibility_pub[i])
+            let path = self.decl_visibility_paths[i]
+            // #1744: a named import that does not select it hides it too.
+            if sema_tier_path_is_std_implementation(path) == 0 and path != self.current_module_path and self.unselected_import_path(path, self.decl_visibility_syms[i]).len() > 0:
+                return 0
+            return self.decl_visible_from_current(path, self.decl_visibility_pub[i])
         1
 
     fn has_extern_var_decl(sym: i32) -> i32:
@@ -3788,6 +3851,18 @@ impl Sema:
 
     mut fn emit_private_symbol_error(sym: i32, node: i32) -> Unit:
         let name: str = with_str_clone_ref(self.pool_resolve(sym))
+        // #1744: a name its module's named imports do not select.
+        var i = if self.decl_visibility_index.contains(sym): self.decl_visibility_index.get(sym).unwrap() else: -1
+        while i >= 0:
+            let decl_path = self.decl_visibility_paths[i]
+            if self.decl_visibility_pub[i] != 0 and sema_tier_path_is_std_implementation(decl_path) == 0:
+                let by = self.unselected_import_path(decl_path, sym)
+                if by.len() > 0:
+                    let infix = name.index_of("$in$")
+                    let short = if infix > 0: name.slice(0, infix) else: name.clone()
+                    self.emit_error("'" ++ short ++ "' is not imported: `use " ++ by ++ "` names only what it selects (§18.2); add `" ++ short ++ "` to that import, or import the whole module", node)
+                    return
+            i = self.decl_visibility_prev[i]
         let gate_note = self.std_gated_import_note(sym)
         if gate_note.len() > 0:
             self.emit_error("'" ++ name ++ "' requires an explicit import (§18.1)" ++ gate_note, node)
@@ -5624,9 +5699,6 @@ impl Sema:
             return 1
         0
 
-    mut fn scope_put(sym: i32, tid: i32, is_mut: i32):
-        self.scope_put_at(sym, tid, is_mut, 0)
-
     fn scope_insert_at(sym: i32, tid: i32, is_mut: i32):
         let idx = self.bind_names.len() as i32
         self.bind_names.push(sym)
@@ -7033,6 +7105,7 @@ impl Sema:
                 let start = self.ast.get_start(err_node)
                 let end = self.ast.get_end(err_node)
                 var diag = Diagnostic.err("view '" ++ view_name ++ "' may outlive its origin '" ++ origin_name ++ "'", Span { file: self.local_file_id, start: start, end: end })
+                diag = self.with_copy_view_fixit(move diag, view_sym, true)
                 diag = self.with_facade_dependency_notes(move diag, view_ty)
                 self.diags.emit(move diag)
                 return

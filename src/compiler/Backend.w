@@ -40,14 +40,16 @@ impl Zcu:
         // OWNS the sema for the emission (take-and-return, the lower_module
         // pattern) and every exit path hands it back — last_sema is blank in
         // between, never aliased.
-        let sema_ast = self.last_sema.ast
-        let sema_pool = self.last_sema.pool
+        let sema_ast: AstPool = self.last_sema.ast
+        let sema_pool: InternPool = self.last_sema.pool
         if sema_ast.decl_count() > 0:
             backend_pool = sema_ast
         if sema_pool.state.symbol_texts.len() as i32 > 1:
             backend_intern = sema_pool
         var cg = Codegen.init_with_opt_and_intern("with_module", opt_level, move backend_intern, move self.last_sema)
         cg.source_file = with_str_clone_ref(self.current_source_path)
+        // Cloned, never moved (here and at the other Codegen seams): the root
+        // file's warnings render after codegen (#1447).
         cg.source_text = with_str_clone_ref(self.current_source_text)
         cg.decl_source_paths = sema_clone_str_vec(&self.decl_source_paths)
         cg.current_decl_source_file = with_str_clone_ref(self.current_source_path)
@@ -189,8 +191,8 @@ impl Zcu:
         var backend_intern = self.pool
         // D17/#697: take-and-return (docs/memory-model.md seam rule) — Copy
         // handles captured first, sema moved in, handed back on every exit.
-        let sema_ast = self.last_sema.ast
-        let sema_pool = self.last_sema.pool
+        let sema_ast: AstPool = self.last_sema.ast
+        let sema_pool: InternPool = self.last_sema.pool
         if sema_ast.decl_count() > 0:
             backend_pool = sema_ast
         if sema_pool.state.symbol_texts.len() as i32 > 1:

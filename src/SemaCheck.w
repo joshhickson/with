@@ -2180,13 +2180,13 @@ impl Sema:
         self.union_last_written = sema_new_map_i32_i32()
         self.union_tracked_syms = Vec.new()
         self.union_in_assign_target = 0
-        let saved_body_file_id = self.local_file_id
+        let saved_body_file_id: i32 = self.local_file_id
         // #747 instance C: capture by move, not view. update_decl_source_context
         // reassigns current_module_path during the body, so a view here names the
         // callee's value at restore time (and its drop froze the old payload).
         // Ownership round-trips exactly like save_label_registry's moves.
         let saved_body_module_path = move self.current_module_path
-        let saved_body_module_has_ci = self.current_module_has_ci
+        let saved_body_module_has_ci: i32 = self.current_module_has_ci
         let fn_di = decl_index
         if fn_di >= 0:
             self.update_decl_source_context(fn_di)
@@ -2198,9 +2198,9 @@ impl Sema:
         if self.fn_decl_has_c_export(node) != 0:
             self.record_global_concurrency_evidence(node, "@[c_export]")
             self.validate_c_export_signature(node, sig_idx, fn_name)
-        let saved_no_alloc_depth = self.current_no_alloc_depth
-        let saved_fn_may_alloc = self.current_fn_may_alloc
-        let saved_current_fn_symbol = self.current_fn_symbol
+        let saved_no_alloc_depth: i32 = self.current_no_alloc_depth
+        let saved_fn_may_alloc: i32 = self.current_fn_may_alloc
+        let saved_current_fn_symbol: i32 = self.current_fn_symbol
         self.current_fn_may_alloc = 0
         self.current_fn_symbol = fn_name
         if self.no_alloc_fns.contains(fn_name):
@@ -2292,7 +2292,8 @@ impl Sema:
                 // the provisional A5/#608 POD-container non-freeing (#691
                 // retires that for both paths at once).
                 let p_is_mut = if fn_param_is_mut_self(self.ast.fn_param_flags(param_start, pi)) != 0: 1 else: 0
-                self.scope_put(p_name, p_tid, p_is_mut)
+                let p_type_node = self.ast.fn_param_type(param_start, pi)
+                self.scope_put_at(p_name, p_tid, p_is_mut, if p_type_node != 0: p_type_node else: node)
                 if fn_param_is_implicit(self.ast.fn_param_flags(param_start, pi)) != 0:
                     self.implicit_binding_types.push(p_tid)
                     self.implicit_binding_syms.push(p_name)
@@ -2318,7 +2319,7 @@ impl Sema:
                             self.emit_error("refutable parameter pattern requires another function clause or an else", ppat)
 
         // Effect tracking: save outer state and populate for this function
-        let saved_eff_sig_idx = self.current_fn_sig_idx
+        let saved_eff_sig_idx: i32 = self.current_fn_sig_idx
         let saved_eff_param_syms = sema_clone_i32_vec(&self.current_fn_param_syms)
         let saved_eff_param_effs = sema_clone_i32_vec(&self.current_fn_param_effs)
         let saved_eff_param_direct_effs = sema_clone_i32_vec(&self.current_fn_param_direct_effs)
@@ -2376,28 +2377,28 @@ impl Sema:
             self.current_return_type = body_ret_type
             self.current_gen_yield_type = 0 as TypeId
             self.has_gen_yield_type = 0
-        let saved_comptime = self.in_comptime_fn
+        let saved_comptime: i32 = self.in_comptime_fn
         if (flags / FnFlags.COMPTIME) % 2 == 1:
             self.in_comptime_fn = self.in_comptime_fn + 1
-        let saved_async = self.in_async_fn
+        let saved_async: i32 = self.in_async_fn
         if (flags / FnFlags.ASYNC) % 2 == 1:
             self.in_async_fn = self.in_async_fn + 1
 
         // Check body — set expected type to return type for tail expression resolution.
         // For async functions, use the unwrapped body return type (T, not Task[T]).
-        let body_expected_ret = self.current_return_type
-        let saved_expected_et = self.expected_expr_type
-        let saved_has_et = self.has_expected_type
-        let saved_body_value_root = self.current_value_expr_root
-        let saved_loop_depth = self.loop_depth
+        let body_expected_ret: i32 = self.current_return_type
+        let saved_expected_et: i32 = self.expected_expr_type
+        let saved_has_et: i32 = self.has_expected_type
+        let saved_body_value_root: i32 = self.current_value_expr_root
+        let saved_loop_depth: i32 = self.loop_depth
         self.loop_depth = 0
         let saved_label_registry = self.save_label_registry()
         self.reset_label_registry()
         self.collect_function_labels(body)
         self.validate_function_gotos()
         self.push_label_boundary()
-        let saved_drop_type_sym = self.current_drop_type_sym
-        let saved_drop_control_flow_depth = self.drop_control_flow_depth
+        let saved_drop_type_sym: i32 = self.current_drop_type_sym
+        let saved_drop_control_flow_depth: i32 = self.drop_control_flow_depth
         self.current_drop_type_sym = self.drop_owner_for_fn_symbol(fn_name)
         self.drop_control_flow_depth = 0
         // move-sites (docs/deep-debugging-tools.md): per-body use sequencing for
@@ -2405,7 +2406,7 @@ impl Sema:
         // are stamped at body end, once every use has been seen. Bodies are
         // separated by an epoch stamped into every entry — one persistent map,
         // one owner, no per-body header swapping.
-        let saved_use_epoch = self.binding_use_epoch
+        let saved_use_epoch: i32 = self.binding_use_epoch
         self.binding_use_epoch = self.binding_epoch_counter + 1
         self.binding_epoch_counter = self.binding_epoch_counter + 1
         let body_site_start = self.consume_call_sites.len() as i32
@@ -2415,12 +2416,12 @@ impl Sema:
             self.current_value_expr_root = body
         // D43: with no annotation (and no trait contract) the function
         // inherits its tail's type. Entry points have a fixed contract.
-        let saved_infer_tail = self.infer_tail_node
-        let saved_infer_closure = self.infer_tail_is_closure
+        let saved_infer_tail: i32 = self.infer_tail_node
+        let saved_infer_closure: i32 = self.infer_tail_is_closure
         self.infer_tail_node = if body_expected_ret == 0 and self.fn_decl_is_entry_point(node) == 0: body else: 0
         self.infer_tail_is_closure = 0
-        let saved_body_tail_block = self.body_tail_block
-        let saved_body_tail_discards = self.body_tail_discards
+        let saved_body_tail_block: i32 = self.body_tail_block
+        let saved_body_tail_discards: bool = self.body_tail_discards
         let source_body = self.fn_body_inner(body)
         self.body_tail_block = source_body
         // §9.1 / D60: under a declared non-Unit return the body's tail
@@ -2753,12 +2754,12 @@ impl Sema:
         if sig_idx < 0:
             return
 
-        let saved_ret = self.current_return_type
-        let saved_fn_symbol = self.current_fn_symbol
-        let saved_expected = self.expected_expr_type
-        let saved_has_expected = self.has_expected_type
-        let saved_value_root = self.current_value_expr_root
-        let saved_stmt_root = self.current_statement_expr_root
+        let saved_ret: i32 = self.current_return_type
+        let saved_fn_symbol: i32 = self.current_fn_symbol
+        let saved_expected: i32 = self.expected_expr_type
+        let saved_has_expected: i32 = self.has_expected_type
+        let saved_value_root: i32 = self.current_value_expr_root
+        let saved_stmt_root: i32 = self.current_statement_expr_root
         let saved_self = if self.named_types.contains(self.syms.self_type): self.named_types.get(self.syms.self_type).unwrap() else: 0
         let saved_assoc = move self.assoc_type_bindings
         let saved_subst_syms = move self.generic_subst_param_syms
@@ -2788,7 +2789,8 @@ impl Sema:
             let p_name = self.ast.fn_param_name(param_start, pi)
             // D12: `mut self` binds mutable — see check_fn_body_with_sig_at.
             let p_is_mut = if fn_param_is_mut_self(self.ast.fn_param_flags(param_start, pi)) != 0: 1 else: 0
-            self.scope_put(p_name, self.sig_param_type(sig_idx, pi), p_is_mut)
+            let p_type_node = self.ast.fn_param_type(param_start, pi)
+            self.scope_put_at(p_name, self.sig_param_type(sig_idx, pi), p_is_mut, if p_type_node != 0: p_type_node else: body)
 
         let ret_tid = self.sig_return_type(sig_idx)
         self.current_return_type = ret_tid as TypeId
@@ -3645,9 +3647,9 @@ impl Sema:
             fn_sym = self.comp_resolved.get(node).unwrap()
         else if self.ast.kind(callee) == NodeKind.NK_IDENT:
             fn_sym = self.ast.get_data0(callee)
-        let saved_file_id = self.local_file_id
+        let saved_file_id: i32 = self.local_file_id
         let saved_module_path = move self.current_module_path
-        let saved_module_has_ci = self.current_module_has_ci
+        let saved_module_has_ci: i32 = self.current_module_has_ci
         self.check_reachable_call_target(fn_sym, node)
         self.local_file_id = saved_file_id
         self.current_module_path = saved_module_path
@@ -3933,16 +3935,16 @@ impl Sema:
         if meta < 0:
             return -1
 
-        let saved_generic_file_id = self.local_file_id
+        let saved_generic_file_id: i32 = self.local_file_id
         let saved_generic_module_path = move self.current_module_path
-        let saved_generic_module_has_ci = self.current_module_has_ci
+        let saved_generic_module_has_ci: i32 = self.current_module_has_ci
         self.update_fn_source_context(fn_name, fn_node)
 
         let tp_count = tp_syms.len() as i32
 
         let saved_generic_subst_param_syms = move self.generic_subst_param_syms
         let saved_generic_subst_type_ids = move self.generic_subst_type_ids
-        let saved_types_frozen = self.types_frozen
+        let saved_types_frozen: i32 = self.types_frozen
         self.types_frozen = 0
         self.generic_subst_param_syms = Vec.new()
         self.generic_subst_type_ids = Vec.new()
@@ -4086,11 +4088,37 @@ impl Sema:
         self.pending_generic_binding_base = HashMap.new()
         self.pending_generic_binding_call = HashMap.new()
         self.pending_generic_binding_decl = HashMap.new()
+        // #1743: the callee's lexical environment is its module's, and the
+        // module-level scope (every module's globals, below scope_starts[1])
+        // is part of it: a generic body reads its module's `let`/`const`
+        // exactly as a non-generic body does. Only the caller's locals stay
+        // out. Visibility is still decided per lookup against the callee's
+        // module (update_fn_source_context above).
+        let module_scope_len = if saved_scope_starts.len() > 1: saved_scope_starts[1] else: saved_bind_names.len() as i32
+        for gi in 0..module_scope_len:
+            let gsym = saved_bind_names[gi]
+            self.bind_names.push(gsym)
+            self.bind_types.push(saved_bind_types[gi])
+            self.bind_muts.push(saved_bind_muts[gi])
+            self.bind_states.push(saved_bind_states[gi])
+            self.bind_is_task.push(saved_bind_is_task[gi])
+            self.bind_task_used.push(saved_bind_task_used[gi])
+            self.bind_is_scoped_task.push(saved_bind_is_scoped_task[gi])
+            self.bind_is_view_bound.push(saved_bind_is_view_bound[gi])
+            self.bind_provenance.push(saved_bind_provenance[gi])
+            let mapped = saved_scope_name_map.get(gsym)
+            if mapped.is_some() and mapped.unwrap() == gi:
+                self.scope_name_map.insert(gsym, gi)
+        // A caller local that shadows a module global hid the global's map
+        // entry; the callee does not see the caller's local.
+        for sgi in 0..self.shadowed_global_syms.len() as i32:
+            if self.shadowed_global_indices[sgi] < module_scope_len:
+                self.scope_name_map.insert(self.shadowed_global_syms[sgi], self.shadowed_global_indices[sgi])
 
         // Type-check body with concrete substitutions installed. Generic bodies
         // may still become invalid after instantiation (for example `T + T`
         // specialized with `str`), so these diagnostics must stay visible.
-        let saved_concrete_generic_body = self.in_concrete_generic_body
+        let saved_concrete_generic_body: i32 = self.in_concrete_generic_body
         self.in_concrete_generic_body = self.in_concrete_generic_body + 1
         self.check_fn_body_with_sig(fn_node, sig_idx)
         self.in_concrete_generic_body = saved_concrete_generic_body
@@ -4634,11 +4662,11 @@ impl Sema:
     // suspend (§14.3) — an `.await`, a call that may suspend, a loop over a
     // generator that may — or 0. The same walk as fn_symbol_may_suspend.
     mut fn generator_suspension_site(gen_fn: i32) -> i32:
-        let saved_depth = self.suspend_site_record_depth
+        let saved_depth: i32 = self.suspend_site_record_depth
         self.suspend_site_record_depth = self.suspend_site_depth + 1
         self.suspend_site_node = 0
         let may = self.fn_symbol_may_suspend(gen_fn)
-        let site = self.suspend_site_node
+        let site: i32 = self.suspend_site_node
         self.suspend_site_record_depth = saved_depth
         self.suspend_site_node = 0
         if may == 0:
@@ -5752,7 +5780,7 @@ impl Sema:
         let cached = self.typed_expr_types.get(node)
         if cached.is_some():
             return cached.unwrap()
-        let saved_unsafe = self.in_unsafe
+        let saved_unsafe: i32 = self.in_unsafe
         self.in_unsafe = 1
         let checked = self.check_expr(node) as i32
         self.in_unsafe = saved_unsafe
@@ -6437,7 +6465,7 @@ impl Sema:
         1
 
     mut fn check_bitwise_literal_with_expected(node: i32, expected: TypeId) -> TypeId:
-        let saved = self.in_bitwise_literal_context
+        let saved: i32 = self.in_bitwise_literal_context
         self.in_bitwise_literal_context = self.in_bitwise_literal_context + 1
         let result = self.check_expr_with_expected(node, expected)
         self.in_bitwise_literal_context = saved
@@ -6674,7 +6702,7 @@ impl Sema:
                 self.typed_expr_types.insert(node, self.ty_i64 as i32)
                 return self.ty_i64
             let value = fast.value
-            let ty = if value < -2147483648 or value > 2147483647: self.ty_i64 else: self.ty_i32
+            let ty: i32 = if value < -2147483648 or value > 2147483647: self.ty_i64 else: self.ty_i32
             self.typed_expr_types.insert(node, ty as i32)
             return ty
 
@@ -6832,7 +6860,7 @@ impl Sema:
                     self.push_scope()
                     pushed_regex_capture_scope = 1
                     self.regex_bind_capture_scope(rhs)
-            let saved_drop_cf = self.drop_control_flow_depth
+            let saved_drop_cf: i32 = self.drop_control_flow_depth
             if self.current_drop_type_sym != 0:
                 self.drop_control_flow_depth = self.drop_control_flow_depth + 1
             // Whole-value Drop moves out of an outer binding are allowed inside the
@@ -6859,7 +6887,7 @@ impl Sema:
             let dw_frame_idx = self.label_syms.len() as i32 - 1
             self.alloc_loop_break_region(dw_frame_idx)
             let dw_entry_states = self.save_scope_states()
-            let saved_drop_cf_dw = self.drop_control_flow_depth
+            let saved_drop_cf_dw: i32 = self.drop_control_flow_depth
             if self.current_drop_type_sym != 0:
                 self.drop_control_flow_depth = self.drop_control_flow_depth + 1
             self.push_move_control_flow_context(1)
@@ -6881,7 +6909,7 @@ impl Sema:
             let loop_frame_idx = self.label_syms.len() as i32 - 1
             self.alloc_loop_break_region(loop_frame_idx)
             let loop_entry_states = self.save_scope_states()
-            let saved_drop_cf_loop = self.drop_control_flow_depth
+            let saved_drop_cf_loop: i32 = self.drop_control_flow_depth
             if self.current_drop_type_sym != 0:
                 self.drop_control_flow_depth = self.drop_control_flow_depth + 1
             self.push_move_control_flow_context(1)
@@ -7048,7 +7076,7 @@ impl Sema:
             let is_prefix = self.ast.get_data1(node) == UNSAFE_KIND_PREFIX
             let is_fn_body = self.ast.get_data2(node) == UNSAFE_ORIGIN_FN_BODY
             let tracks_use = if is_prefix or is_fn_body: 0 else: 1
-            let saved_unsafe = self.in_unsafe
+            let saved_unsafe: i32 = self.in_unsafe
             if is_prefix and saved_unsafe != 0:
                 self.emit_warning("redundant unsafe prefix inside unsafe context", node)
             if tracks_use != 0:
@@ -7113,7 +7141,7 @@ impl Sema:
             return self.ty_never
 
         if kind == NodeKind.NK_DEFER or kind == NodeKind.NK_ERRDEFER:
-            let saved = self.in_defer
+            let saved: i32 = self.in_defer
             self.in_defer = 1
             self.check_expr(self.ast.get_data0(node))
             self.in_defer = saved
@@ -7305,7 +7333,7 @@ impl Sema:
                 if result2 != 0:
                     self.typed_expr_types.insert(node, result2 as i32)
                 return result2 as TypeId
-            let saved_comptime = self.in_comptime_fn
+            let saved_comptime: i32 = self.in_comptime_fn
             self.in_comptime_fn = self.in_comptime_fn + 1
             let result = self.check_expr(inner)
             self.in_comptime_fn = saved_comptime
@@ -7403,7 +7431,7 @@ impl Sema:
             let body = self.ast.get_data1(node)
             let name = self.ast.get_data0(node)
             self.push_scope()
-            self.scope_put(name, self.ty_void, 0)
+            self.scope_put_at(name, self.ty_void, 0, node)
             self.async_scope_names.push(name)
             let as_saved_label_registry = self.save_label_registry()
             self.reset_label_registry()
@@ -7430,7 +7458,7 @@ impl Sema:
             let body = self.ast.get_data1(node)
             let name = self.ast.get_data0(node)
             self.push_scope()
-            self.scope_put(name, self.ty_i64, 0)
+            self.scope_put_at(name, self.ty_i64, 0, node)
             self.sync_scope_names.push(name)
             let scope_saved_label_registry = self.save_label_registry()
             self.reset_label_registry()
@@ -7472,7 +7500,7 @@ impl Sema:
                     self.emit_error("select await arm requires a Task value", task)
                 let arm_result_ty = self.unwrap_task_type(task_ty)
                 self.push_scope()
-                self.scope_put(arm_name, arm_result_ty as i32, 0)
+                self.scope_put_at(arm_name, arm_result_ty as i32, 0, task)
                 self.scope_set_is_task(arm_name, 0)
                 result = self.check_expr(arm_body)
                 self.pop_scope()
@@ -7516,7 +7544,7 @@ impl Sema:
                 if self.ast.comprehension_binding_is_pattern(node, binding):
                     self.check_pattern(binding, elem_ty)
                 else:
-                    self.scope_put(binding, elem_ty, 0)
+                    self.scope_put_at(binding, elem_ty, 0, iterable)
                 if filter != 0:
                     let filter_ty = self.check_expr(filter)
                     if filter_ty != 0 and self.types_compatible(self.ty_bool as i32, filter_ty as i32) == 0:
@@ -7578,7 +7606,7 @@ impl Sema:
                 if self.ast.comprehension_binding_is_pattern(node, binding2):
                     self.check_pattern(binding2, elem_ty2)
                 else:
-                    self.scope_put(binding2, elem_ty2, 0)
+                    self.scope_put_at(binding2, elem_ty2, 0, iterable2)
                 if filter2 != 0:
                     let filter_ty2 = self.check_expr(filter2)
                     if filter_ty2 != 0 and self.types_compatible(self.ty_bool as i32, filter_ty2 as i32) == 0:
@@ -7645,6 +7673,7 @@ impl Sema:
                 self.optional_chain_result_type(base as i32, self.ast.get_data1(node))
             self.typed_expr_types.insert(node, result)
             self.record_transparent_view_origins(node, base_node)
+            self.record_optional_chain_verdict(node, base_node, base as i32, extra_start)
             return result as TypeId
 
         if kind == NodeKind.NK_POISONED_EXPR:
@@ -7922,7 +7951,7 @@ impl Sema:
         while i <= count:
             let sym = self.pool_lookup_symbol("$" ++ i.to_string())
             if sym != 0:
-                self.scope_put(sym, self.ty_str as i32, 0)
+                self.scope_put_at(sym, self.ty_str as i32, 0, regex_node)
             i = i + 1
         let name_count = if self.regex_capture_name_counts.contains(regex_node): self.regex_capture_name_counts.get(regex_node).unwrap() else: 0
         let name_start = if self.regex_capture_name_starts.contains(regex_node): self.regex_capture_name_starts.get(regex_node).unwrap() else: 0
@@ -7930,7 +7959,7 @@ impl Sema:
         while ni < name_count:
             let sym: i32 = self.regex_capture_name_syms[(name_start + ni)]
             if sym != 0:
-                self.scope_put(sym, self.ty_str as i32, 0)
+                self.scope_put_at(sym, self.ty_str as i32, 0, regex_node)
             ni = ni + 1
 
     fn expr_tree_contains_fstring(node: i32) -> i32:
@@ -9302,7 +9331,7 @@ impl Sema:
                 return 0
             self.typed_expr_types.insert(node, self.ty_bool as i32)
             return self.ty_bool as i32
-        let contains_sym = self.syms.contains
+        let contains_sym: i32 = self.syms.contains
         let contains_trait_sym = self.pool_intern("Contains")
         if self.membership_has_contains(rhs_ty, contains_sym) == 0:
             self.emit_error("type '" ++ self.type_name(rhs_ty) ++ "' does not implement Contains[" ++ self.type_name(lhs_ty) ++ "] for `in`", node)
@@ -9698,7 +9727,7 @@ impl Sema:
                 let resolved_neg = self.resolve_alias(expected_neg as TypeId)
                 if self.get_type_kind(resolved_neg) == TypeKind.TY_INT and self.get_type_d1(resolved_neg) != 0:
                     expected_operand = self.expected_expr_type as i32
-        let saved_negated = self.in_negated_literal_context
+        let saved_negated: i32 = self.in_negated_literal_context
         if negated_literal != 0:
             self.in_negated_literal_context = self.in_negated_literal_context + 1
         let operand = if expected_operand != 0: self.check_expr_with_expected(operand_node, expected_operand as TypeId) else: self.check_expr_value_context(operand_node)
@@ -10030,10 +10059,10 @@ impl Sema:
         if block_label != 0:
             self.push_label_frame(block_label, LabelFrameKind.LFK_BLOCK, node)
 
-        let saved_block_extra = self.current_block_extra_start
-        let saved_block_count = self.current_block_stmt_count
+        let saved_block_extra: i32 = self.current_block_extra_start
+        let saved_block_count: i32 = self.current_block_stmt_count
         let saved_block_index = self.current_block_stmt_index
-        let saved_block_tail = self.current_block_tail
+        let saved_block_tail: i32 = self.current_block_tail
         self.current_block_extra_start = extra_start
         self.current_block_stmt_count = stmt_count
         self.current_block_tail = tail
@@ -10054,19 +10083,19 @@ impl Sema:
             if block_diverged != 0 and reported_unreachable == 0:
                 self.emit_error("unreachable code", stmt)
                 reported_unreachable = 1
-            let saved_stmt_pos = self.match_in_stmt_pos
-            let saved_label_stmt_pos = self.stmt_pos_depth
-            let saved_expected = self.expected_expr_type
-            let saved_has_expected = self.has_expected_type
-            let saved_statement_root = self.current_statement_expr_root
-            let saved_value_root = self.current_value_expr_root
+            let saved_stmt_pos: i32 = self.match_in_stmt_pos
+            let saved_label_stmt_pos: i32 = self.stmt_pos_depth
+            let saved_expected: i32 = self.expected_expr_type
+            let saved_has_expected: i32 = self.has_expected_type
+            let saved_statement_root: i32 = self.current_statement_expr_root
+            let saved_value_root: i32 = self.current_value_expr_root
             self.match_in_stmt_pos = 1
             self.stmt_pos_depth = self.stmt_pos_depth + 1
             self.current_statement_expr_root = stmt
             self.current_value_expr_root = 0
             self.expected_expr_type = 0 as TypeId
             self.has_expected_type = 0
-            let saved_discarded_stmt = self.discarded_stmt_node
+            let saved_discarded_stmt: i32 = self.discarded_stmt_node
             self.discarded_stmt_node = stmt
             let stmt_ty = self.check_expr(stmt)
             self.discarded_stmt_node = saved_discarded_stmt
@@ -10092,8 +10121,8 @@ impl Sema:
         if tail != 0:
             // If the tail is a match in a void/unspecified-return context, treat as statement
             // position so partial enum match is allowed (value is not used).
-            let saved_stmt_pos = self.match_in_stmt_pos
-            let saved_tail_value_root = self.current_value_expr_root
+            let saved_stmt_pos: i32 = self.match_in_stmt_pos
+            let saved_tail_value_root: i32 = self.current_value_expr_root
             let ret_is_void = self.current_return_type == self.ty_void or self.current_return_type == 0
             if ret_is_void and self.ast.kind(tail) == NodeKind.NK_MATCH:
                 self.match_in_stmt_pos = 1
@@ -10107,7 +10136,7 @@ impl Sema:
                 self.current_value_expr_root = tail
             // D43: a block in the inferring-tail role hands it to its own tail, so
             // a block body and a single-statement body get the same answer.
-            let saved_infer_tail = self.infer_tail_node
+            let saved_infer_tail: i32 = self.infer_tail_node
             if saved_infer_tail == node:
                 self.infer_tail_node = tail
             let checked_tail_type = if tail_is_value: self.check_expr(tail) else: self.check_expr_statement_context(tail)
@@ -10443,7 +10472,7 @@ impl Sema:
                 self.emit_error("cannot bind an array literal to a slice type; use an array binding `let xs = [...]` or an explicit array type `[T; N]`", node)
 
         // Let binding value is expression position — match inside must be exhaustive.
-        let saved_match_stmt = self.match_in_stmt_pos
+        let saved_match_stmt: i32 = self.match_in_stmt_pos
         self.match_in_stmt_pos = 0
         let val_type = if ann_type != 0: self.check_expr_with_owned_demand(value, ann_type) else: self.check_expr_value_context(value)
         self.match_in_stmt_pos = saved_match_stmt
@@ -10487,7 +10516,9 @@ impl Sema:
                 // is, so a write or a vacate of the field while it is live is
                 // refused. It registered nothing, and `move x.s` / `x.s = …`
                 // under a live `let p = x.s` read the blank.
-                if val_type != 0 and self.is_copy(val_type) == 0:
+                // #1531 (§3.8, D27): uniformly for Copy fields, as for a Copy
+                // element (`let x = v[0]`); `let x: T = s.f` is the copy.
+                if val_type != 0:
                     field_view_let = 1
             else if ann_type != 0 and val_type != 0 and self.can_auto_ref_arg(ann_type as i32, val_type as i32) != 0 and self.place_root_sym(value) != 0:
                 // #1244 / §3.8: `let s: &T = place` auto-references — the
@@ -10584,8 +10615,8 @@ impl Sema:
         let then_body = self.ast.get_data1(node)
         let else_body = self.ast.get_data2(node)
 
-        let saved_expected = self.expected_expr_type
-        let saved_has_expected = self.has_expected_type
+        let saved_expected: i32 = self.expected_expr_type
+        let saved_has_expected: i32 = self.has_expected_type
         self.expected_expr_type = 0 as TypeId
         self.has_expected_type = 0
         self.check_bool_condition(cond, "if")
@@ -10626,7 +10657,7 @@ impl Sema:
                 self.push_scope()
                 pushed_regex_capture_scope = 1
                 self.regex_bind_capture_scope(rhs)
-        let saved_drop_cf_then = self.drop_control_flow_depth
+        let saved_drop_cf_then: i32 = self.drop_control_flow_depth
         if self.current_drop_type_sym != 0:
             self.drop_control_flow_depth = self.drop_control_flow_depth + 1
         self.push_move_control_flow_context(1)
@@ -10659,7 +10690,7 @@ impl Sema:
         var result_type: TypeId = self.ty_void
         var else_is_never = 0
         if else_body != 0:
-            let saved_drop_cf_else = self.drop_control_flow_depth
+            let saved_drop_cf_else: i32 = self.drop_control_flow_depth
             if self.current_drop_type_sym != 0:
                 self.drop_control_flow_depth = self.drop_control_flow_depth + 1
             self.push_move_control_flow_context(1)
@@ -10691,10 +10722,12 @@ impl Sema:
                 let join_roles: Vec[i32] = Vec.new()
                 join_roles.push(D22_JOIN_ROLE_EXPR)
                 join_roles.push(D22_JOIN_ROLE_EXPR)
-                let arm_types = self.join_field_arms_as_views(outer_expected as i32, &join_nodes, move join_types)
-                let saved_infer_join = self.infer_tail_join
+                // #1754: at a `&T` parameter the arms decide the join (no anchor).
+                let if_anchor = if self.borrow_pointee_join_node == node: 0 as TypeId else: outer_expected
+                let arm_types = self.join_field_arms_as_views(if_anchor as i32, &join_nodes, move join_types)
+                let saved_infer_join: i32 = self.infer_tail_join
                 self.infer_tail_join = if is_infer_tail: 1 else: 0
-                result_type = self.resolve_contextual_join(outer_expected as i32, &join_nodes, &origin_nodes, &arm_types, &join_roles, node, "if") as TypeId
+                result_type = self.resolve_contextual_join(if_anchor as i32, &join_nodes, &origin_nodes, &arm_types, &join_roles, node, "if") as TypeId
                 self.infer_tail_join = saved_infer_join
                 self.d32_check_owned_join_arms(result_type as i32, &join_nodes, "if arm")
         else:
@@ -11342,7 +11375,7 @@ impl Sema:
     // such yield of each gen fn is recorded; g.pull() of it is rejected there
     // (check_generator_pulls), and a push consumer is unaffected.
     mut fn note_generator_local_view_yield(yield_node: i32, inner_node: i32):
-        let gen_fn = self.current_fn_symbol
+        let gen_fn: i32 = self.current_fn_symbol
         if gen_fn == 0 or self.generator_local_view_yields.contains(gen_fn):
             return
         let yield_ty = self.resolve_alias(self.current_gen_yield_type)
@@ -12012,9 +12045,7 @@ impl Sema:
             else if lhs_mut_state == PlaceMut.PM_ReadOnly or lhs_via_ro_ref != 0:
                 self.emit_error("cannot assign through a read-only place (e.g., dereferenced &T or *const T) (§15.10)", node)
 
-            let assign_root = self.place_root_sym(base_expr)
-            if assign_root != 0 and self.scope_is_view_bound(assign_root) != 0:
-                self.emit_error("cannot mutate through read-only view yielded by iterator (§15.17)", node)
+            self.reject_mutation_through_view_binding(self.place_root_sym(base_expr), node)
 
             if lhs_kind != PlaceKind.PK_NotPlace and lhs_mut_state != PlaceMut.PM_ReadOnly:
                 self.check_mutation_against_views(base_expr, node)
@@ -12100,9 +12131,7 @@ impl Sema:
                 self.emit_error("cannot assign through a read-only place (e.g., dereferenced &T or *const T) (§15.10)", node)
             // docs/completed/mut.md Rev 8 §15.17 — mutation through a view-bound
             // for-loop variable (e.g., `for u in xs.iter(): u.age += 1`).
-            let assign_root = self.place_root_sym(target)
-            if assign_root != 0 and self.scope_is_view_bound(assign_root) != 0:
-                self.emit_error("cannot mutate through read-only view yielded by iterator (§15.17)", node)
+            self.reject_mutation_through_view_binding(self.place_root_sym(target), node)
 
         let mutation_packed = self.classify_place(target)
         if unpack_place_kind(mutation_packed) != PlaceKind.PK_NotPlace and unpack_place_mut(mutation_packed) != PlaceMut.PM_ReadOnly:
@@ -12289,7 +12318,7 @@ impl Sema:
                 if self.type_is_ephemeral_value(self.scope_lookup(sym)) != 0:
                     self.register_for_binding_borrow(sym, iterable)
         else:
-            self.scope_put(binding, elem_type, 0)
+            self.scope_put_at(binding, elem_type, 0, node)
         if yields_views != 0 and binding != 0:
             self.scope_set_is_view_bound(binding)
         if binding != 0 and not self.ast.for_binding_is_pattern(node) and self.type_is_ephemeral_value(elem_type) != 0:
@@ -12301,12 +12330,12 @@ impl Sema:
             let index_binding = self.ast.for_meta_index_binding(for_meta)
             label = self.ast.for_meta_label(for_meta)
             if index_binding != 0:
-                self.scope_put(index_binding, self.ty_i64 as i32, 0)
+                self.scope_put_at(index_binding, self.ty_i64 as i32, 0, node)
         self.loop_depth = self.loop_depth + 1
         self.push_label_frame(label, LabelFrameKind.LFK_FOR, node)
         let for_frame_idx = self.label_syms.len() as i32 - 1
         self.alloc_loop_break_region(for_frame_idx)
-        let saved_drop_cf_for = self.drop_control_flow_depth
+        let saved_drop_cf_for: i32 = self.drop_control_flow_depth
         if self.current_drop_type_sym != 0:
             self.drop_control_flow_depth = self.drop_control_flow_depth + 1
         let for_body_type = self.check_expr_statement_context(body)
@@ -12871,6 +12900,59 @@ impl Sema:
         if result_err_ty != 0:
             return self.optional_chain_wrap_result_for_error_type(raw_ret, result_err_ty)
         self.optional_chain_wrap_result_type(raw_ret)
+
+    // §10.3 (D74, #1710): a chain on a named place reads it. A chain that
+    // takes nothing out (a Copy field, a borrowing method) is recorded as
+    // observing, and MirLower reads the base's place. INTERIM until D22
+    // stage 4 types a named-base chain as `Option[&U]`: a chain that takes
+    // a non-Copy field out, or hands the payload to a consuming method,
+    // still moves the whole base into a temporary, and that move is now
+    // RECORDED — a whole binding is marked moved, a field path partially
+    // moved — so a later use of the base is "use of moved value" instead
+    // of a silent blank. A temporary base is taken apart freely.
+    mut fn record_optional_chain_verdict(node: i32, base_node: i32, base_ty: i32, extra_start: i32):
+        if base_ty == 0:
+            return
+        var payload = self.optional_chain_payload_type(base_ty)
+        if payload == 0:
+            payload = self.optional_chain_result_ok_type(base_ty)
+        if payload == 0:
+            return
+        self.suppress_errors = self.suppress_errors + 1
+        let packed = self.classify_place(base_node)
+        self.suppress_errors = self.suppress_errors - 1
+        if unpack_place_kind(packed) == PlaceKind.PK_NotPlace:
+            return
+        let member = self.ast.get_data1(node)
+        let payload_resolved = self.resolve_alias(payload as TypeId)
+        var observes = false
+        if self.ast.optional_chain_is_call(extra_start) == 0:
+            let field_ty = self.field_access_type_direct(payload_resolved, member)
+            if field_ty == 0:
+                return
+            observes = self.is_copy(field_ty as TypeId) != 0 or self.type_needs_drop(field_ty) == 0
+        else:
+            let recv_resolved = self.auto_deref_ref_ptr_type(payload as TypeId) as i32
+            let owner_sym = self.method_owner_symbol_for_type(recv_resolved)
+            observes = self.is_copy(payload as TypeId) != 0
+            if not observes:
+                if owner_sym != 0 and self.builtin_intrinsic_method_return_type(recv_resolved, owner_sym, member) != 0:
+                    observes = self.builtin_method_requires_move_receiver(owner_sym, member) == 0
+                else:
+                    let sig_idx = if owner_sym != 0: self.lookup_method_sig(owner_sym, member) else: -1
+                    if sig_idx >= 0 and self.sig_get_param_count(sig_idx) > 0:
+                        let recv_param_ty = self.sig_param_type(sig_idx, 0)
+                        observes = recv_param_ty != 0 and self.can_auto_ref_arg(recv_param_ty, payload) != 0
+        if observes:
+            self.optional_chain_observing_nodes.insert(node, 1)
+            return
+        var place_node = base_node
+        while place_node != 0 and self.ast.kind(place_node) == NodeKind.NK_GROUPED:
+            place_node = self.ast.get_data0(place_node)
+        if self.ast.kind(place_node) == NodeKind.NK_IDENT:
+            self.mark_moved_if_consumed(place_node)
+        else if self.ast.kind(place_node) == NodeKind.NK_FIELD_ACCESS:
+            self.mark_field_moved(place_node)
 
     mut fn struct_field_type(struct_type: i32, field: i32) -> i32:
         if struct_type == 0:
@@ -13818,6 +13900,11 @@ impl Sema:
                 else if target_base == self.syms.hashmap or target_base == self.syms.btreemap:
                     self.emit_error("sequence literal cannot target a map; use [key: value] form", node)
                     return 0
+        // #1739 (§4.3c rule 1): a destination whose collection is named but
+        // whose element type is still undecided (a generic struct's
+        // `items: Vec[T]`) selects the collection; the elements decide T.
+        if target_ty == 0 and expected_elem == 0 and self.collection_literal_hints.contains(node):
+            target_base = self.collection_literal_hints.get(node).unwrap()
         if elem_count == 0:
             if target_ty == 0 and expected_elem != 0:
                 target_ty = self.ensure_exact_type(TypeKind.TY_ARRAY, expected_elem as TypeId, 0, 0) as i32
@@ -13862,6 +13949,10 @@ impl Sema:
         let elem_type = self.resolve_contextual_join(expected_elem, &elem_nodes, &elem_origins, &elem_types, &elem_roles, node, "sequence literal")
         let result: TypeId = if target_ty != 0:
             target_ty as TypeId
+        else if target_base != 0:
+            let hinted_args: Vec[i32] = Vec.new()
+            hinted_args.push(elem_type)
+            self.ensure_generic_inst_type(target_base, hinted_args, 1)
         else:
             // Array types have no side-table payload: reuse the canonical type
             // so frozen MIR lowering sees the same pointee identity as a
@@ -13934,7 +14025,9 @@ impl Sema:
             let args: Vec[i32] = Vec.new()
             args.push(key_ty)
             args.push(val_ty)
-            target_ty = self.ensure_generic_inst_type(self.syms.hashmap, args, 2) as i32
+            // #1739: a generic destination that names the map picks it.
+            let map_base = if self.collection_literal_hints.contains(node): self.collection_literal_hints.get(node).unwrap() else: self.syms.hashmap
+            target_ty = self.ensure_generic_inst_type(map_base, args, 2) as i32
         let target_base2 = if target_ty != 0 and self.get_type_kind(self.resolve_alias(target_ty as TypeId)) == TypeKind.TY_GENERIC_INST:
             self.get_generic_inst_base(self.resolve_alias(target_ty as TypeId) as i32)
         else:
@@ -13996,6 +14089,45 @@ impl Sema:
                     self.emit_error("field default type mismatch for '" ++ self.pool_resolve(f_name) ++ "'; use an explicit `as` cast", f_default)
                 else if self.types_compatible(f_ty as i32, d_ty as i32) == 0 and self.arithmetic_result_type(f_ty, d_ty) == 0 and self.has_contextual_copy_adjustment(f_default) == 0:
                     self.emit_error("field default type mismatch for '" ++ self.pool_resolve(f_name) ++ "'", f_default)
+
+    // #1739: a generic struct literal with no expected instance checks its
+    // fields with no expectation, so `Stack { items: ["p", "q"] }` typed the
+    // element list as the default `[str; 2]` array and `items: Vec[T]` bound
+    // nothing. A sequence or map literal whose declared field type names a
+    // collection builds that collection (§4.3c), and its elements decide T.
+    mut fn hint_generic_struct_literal_collections(td_extra: i32, extra_start: i32, field_count: i32):
+        let declared_count = self.ast.get_extra(td_extra)
+        let positional = if field_count > 0: self.ast.get_extra(extra_start) == 0 else: false
+        for li in 0..field_count:
+            let value = self.ast.get_extra(extra_start + li * 2 + 1)
+            let value_kind = if value > 0: self.ast.kind(value) else: 0
+            if value_kind != NodeKind.NK_ARRAY_LIT and value_kind != NodeKind.NK_MAP_LIT:
+                continue
+            var declared = if positional: li else: -1
+            if not positional:
+                let literal_name = self.ast.get_extra(extra_start + li * 2)
+                for fi in 0..declared_count:
+                    if self.ast.get_extra(td_extra + 1 + fi * 3) == literal_name:
+                        declared = fi
+                        break
+            if declared < 0 or declared >= declared_count:
+                continue
+            self.hint_collection_literal(value, self.ast.get_extra(td_extra + 1 + declared * 3 + 1))
+
+    // A sequence or map literal `value` meeting a declared type `type_node`
+    // that names a collection whose type arguments are still undecided (a
+    // generic struct field, a generic fn parameter) builds that collection.
+    mut fn hint_collection_literal(value: i32, type_node: i32):
+        let value_kind = if value > 0: self.ast.kind(value) else: 0
+        if value_kind != NodeKind.NK_ARRAY_LIT and value_kind != NodeKind.NK_MAP_LIT:
+            return
+        if type_node == 0 or self.ast.kind(type_node) != NodeKind.NK_TYPE_GENERIC:
+            return
+        let base = self.canonical_symbol_by_text(self.ast.get_data0(type_node))
+        let is_sequence = base == self.syms.vec or base == self.syms.hashset or base == self.syms.btreeset
+        let is_map = base == self.syms.hashmap or base == self.syms.btreemap
+        if (value_kind == NodeKind.NK_ARRAY_LIT and is_sequence) or (value_kind == NodeKind.NK_MAP_LIT and is_map):
+            self.collection_literal_hints.insert(value, base)
 
     mut fn infer_struct_literal_generic_type(node: i32, name: i32, td_extra: i32, tp_start: i32, tp_count: i32, extra_start: i32, field_count: i32, val_types: &Vec[i32]) -> i32:
         let declared_count = self.ast.get_extra(td_extra)
@@ -14144,6 +14276,8 @@ impl Sema:
                     let td_node = self.struct_literal_decl_node(name, tid)
                     if td_node != 0 and self.type_decl_tp_count(td_node) == 0:
                         expected_struct_ty = resolved
+                    else if td_node != 0 and type_decl_sub_kind(self.ast.get_data2(td_node)) == TypeDeclKind.Struct:
+                        self.hint_generic_struct_literal_collections(self.ast.get_data1(td_node), extra_start, field_count)
                 // Check field initializers and collect value types
                 let val_types: Vec[i32] = Vec.new()
                 // #626: origins of owned locals coerced into `&T` fields — this
@@ -14360,7 +14494,7 @@ impl Sema:
         // is missing and an undemanded value join otherwise, in every body
         // spelling. Its arms inherit the tail role only in the value case.
         let is_infer_tail = self.infer_tail_node == node
-        let saved_infer_tail = self.infer_tail_node
+        let saved_infer_tail: i32 = self.infer_tail_node
         let match_is_value = if is_infer_tail: self.match_has_missing_arm(subject_type as i32, extra_start, arm_count) == 0 else: self.match_in_stmt_pos == 0
         let match_expected: TypeId = if is_infer_tail: 0 as TypeId else if match_is_value and self.has_expected_type != 0: self.expected_expr_type else: 0 as TypeId
         var stmt_arms_mixed = false
@@ -14368,7 +14502,7 @@ impl Sema:
         let join_origin_nodes: Vec[i32] = Vec.new()
         let join_expr_types: Vec[i32] = Vec.new()
         let join_roles: Vec[i32] = Vec.new()
-        let saved_for_comprehension_carrier = self.current_for_comprehension_carrier
+        let saved_for_comprehension_carrier: i32 = self.current_for_comprehension_carrier
         if comprehension_carrier != 0 and saved_for_comprehension_carrier == 0:
             self.current_for_comprehension_carrier = comprehension_carrier
 
@@ -14404,12 +14538,12 @@ impl Sema:
             if self.ast.kind(pat) == NodeKind.NK_PAT_REGEX:
                 self.regex_bind_capture_scope(pat)
             if guard != 0:
-                let saved_drop_cf_guard = self.drop_control_flow_depth
+                let saved_drop_cf_guard: i32 = self.drop_control_flow_depth
                 if self.current_drop_type_sym != 0:
                     self.drop_control_flow_depth = self.drop_control_flow_depth + 1
                 self.check_expr(guard)
                 self.drop_control_flow_depth = saved_drop_cf_guard
-            let saved_drop_cf_arm = self.drop_control_flow_depth
+            let saved_drop_cf_arm: i32 = self.drop_control_flow_depth
             if self.current_drop_type_sym != 0:
                 self.drop_control_flow_depth = self.drop_control_flow_depth + 1
             let arm_type = if not match_is_value:
@@ -14456,10 +14590,12 @@ impl Sema:
         self.current_for_comprehension_carrier = saved_for_comprehension_carrier
 
         if match_is_value:
-            let arm_types = self.join_field_arms_as_views(match_expected as i32, &join_expr_nodes, move join_expr_types)
-            let saved_infer_join = self.infer_tail_join
+            // #1754: at a `&T` parameter the arms decide the join (no anchor).
+            let match_anchor = if self.borrow_pointee_join_node == node: 0 as TypeId else: match_expected
+            let arm_types = self.join_field_arms_as_views(match_anchor as i32, &join_expr_nodes, move join_expr_types)
+            let saved_infer_join: i32 = self.infer_tail_join
             self.infer_tail_join = if is_infer_tail: 1 else: 0
-            result_type = self.resolve_contextual_join(match_expected as i32, &join_expr_nodes, &join_origin_nodes, &arm_types, &join_roles, node, "match") as TypeId
+            result_type = self.resolve_contextual_join(match_anchor as i32, &join_expr_nodes, &join_origin_nodes, &arm_types, &join_roles, node, "match") as TypeId
             self.infer_tail_join = saved_infer_join
             self.d32_check_owned_join_arms(result_type as i32, &join_expr_nodes, "match arm")
         else if stmt_arms_mixed:
@@ -16166,7 +16302,7 @@ impl Sema:
 
         if kind == NodeKind.NK_PAT_IDENT:
             let sym = self.ast.get_data0(node)
-            self.scope_put(sym, subject_type, self.pattern_bind_mut)
+            self.scope_put_at(sym, subject_type, self.pattern_bind_mut, node)
             return
 
         if kind == NodeKind.NK_PAT_INT or kind == NodeKind.NK_PAT_BOOL or kind == NodeKind.NK_PAT_STRING:
@@ -16200,9 +16336,9 @@ impl Sema:
             var concrete_type = 0
             concrete_type = self.lookup_named_type_visible(type_sym)
             if concrete_type != 0:
-                self.scope_put(bind_sym, concrete_type, self.pattern_bind_mut)
+                self.scope_put_at(bind_sym, concrete_type, self.pattern_bind_mut, node)
             else:
-                self.scope_put(bind_sym, subject_type, self.pattern_bind_mut)
+                self.scope_put_at(bind_sym, subject_type, self.pattern_bind_mut, node)
             return
 
         if kind == NodeKind.NK_PAT_VARIANT or kind == NodeKind.NK_PAT_ENUM_SHORTHAND:
@@ -16359,7 +16495,7 @@ impl Sema:
         if kind == NodeKind.NK_PAT_AT_BINDING:
             let at_name = self.ast.get_data0(node)
             let inner = self.ast.get_data1(node)
-            self.scope_put(at_name, subject_type, self.pattern_bind_mut)
+            self.scope_put_at(at_name, subject_type, self.pattern_bind_mut, node)
             self.check_pattern(inner, subject_type)
             return
 
@@ -16410,7 +16546,7 @@ impl Sema:
                         // Nothing covered binds `()` (§4.8 unit), typed like `()` itself.
                         let rest_ty = if covered.len() == 0: self.ty_void as i32 else: self.ensure_tuple_type(covered, covered.len() as i32) as i32
                         self.typed_expr_types.insert(elem_pat, rest_ty)
-                        self.scope_put(rest_name, rest_ty, self.pattern_bind_mut)
+                        self.scope_put_at(rest_name, rest_ty, self.pattern_bind_mut, elem_pat)
                     continue
                 let si = self.ast.tuple_pattern_subject_index(node, ti, elem_count)
                 let elem_ty: i32 = self.type_extra[(elem_start + si)]
@@ -16443,14 +16579,14 @@ impl Sema:
             for hi in 0..head_count:
                 let h_sym = self.ast.get_extra(s_extra + 1 + hi)
                 if h_sym != 0:
-                    self.scope_put(h_sym, elem_type, self.pattern_bind_mut)
+                    self.scope_put_at(h_sym, elem_type, self.pattern_bind_mut, node)
             if has_rest != 0 and rest_sym != 0:
-                self.scope_put(rest_sym, self.ty_i64, self.pattern_bind_mut)
+                self.scope_put_at(rest_sym, self.ty_i64, self.pattern_bind_mut, node)
             let tail_count = self.ast.get_extra(s_extra + 1 + head_count)
             for ti in 0..tail_count:
                 let t_sym = self.ast.get_extra(s_extra + 2 + head_count + ti)
                 if t_sym != 0:
-                    self.scope_put(t_sym, elem_type, self.pattern_bind_mut)
+                    self.scope_put_at(t_sym, elem_type, self.pattern_bind_mut, node)
             return
 
         if kind == NodeKind.NK_PAT_STRUCT:
@@ -16477,7 +16613,7 @@ impl Sema:
                     if f_pat != 0:
                         self.check_pattern(f_pat, 0)
                     else:
-                        self.scope_put(self.ast.get_extra(sp_extra + 1 + spi * 2), 0, 0)
+                        self.scope_put_at(self.ast.get_extra(sp_extra + 1 + spi * 2), 0, 0, node)
                 return
             let field_count = self.type_reflection_field_count(resolved as i32)
             let first_named = if sp_count > 0: self.ast.get_extra(sp_extra + 1) else: 0
@@ -16519,7 +16655,7 @@ impl Sema:
                 if f_pat != 0:
                     self.check_pattern(f_pat, binding_ty)
                 else:
-                    self.scope_put(f_name, binding_ty, self.pattern_bind_mut)
+                    self.scope_put_at(f_name, binding_ty, self.pattern_bind_mut, node)
             return
 
     mut fn check_enum_variant(node: i32) -> i32:
@@ -16715,7 +16851,7 @@ impl Sema:
                     self.emit_error("placeholder partial application does not support named arguments", node)
                     break
         let outer_count = self.bind_names.len() as i32
-        let saved_capture_sig_idx = self.current_fn_sig_idx
+        let saved_capture_sig_idx: i32 = self.current_fn_sig_idx
         let saved_capture_syms: Vec[i32] = Vec.new()
         let saved_capture_effs: Vec[i32] = Vec.new()
         let saved_capture_direct_effs: Vec[i32] = Vec.new()
@@ -16802,7 +16938,7 @@ impl Sema:
                             if ai < self.sig_get_param_count(partial_sig):
                                 p_ty = self.sig_param_type(partial_sig, ai)
                             break
-            self.scope_put(p_sym, p_ty, 0)
+            self.scope_put_at(p_sym, p_ty, 0, if p_type_node > 0: p_type_node else: node)
             param_tys.push(p_ty)
         let te_start = self.type_extra.len() as i32
         for pti in 0..param_tys.len() as i32:
@@ -16829,12 +16965,12 @@ impl Sema:
         // An inferred closure body is a fresh value context. The expected
         // function type constrains its parameters, not its inferred return.
         // D43: a closure with no expected result inherits its tail's type.
-        let saved_infer_tail = self.infer_tail_node
-        let saved_infer_closure = self.infer_tail_is_closure
+        let saved_infer_tail: i32 = self.infer_tail_node
+        let saved_infer_closure: i32 = self.infer_tail_is_closure
         self.infer_tail_node = if expected_ret_ty == 0: body else: 0
         self.infer_tail_is_closure = 1
-        let saved_body_tail_block = self.body_tail_block
-        let saved_body_tail_discards = self.body_tail_discards
+        let saved_body_tail_block: i32 = self.body_tail_block
+        let saved_body_tail_discards: bool = self.body_tail_discards
         self.body_tail_block = body
         // §9.1 / D60: the expected function type's result is the closure's
         // declared return; a non-Unit one makes a tail assignment its value.
@@ -17163,9 +17299,12 @@ impl Sema:
         let deferred: Vec[i32] = Vec.new()
         arg_types.push(lhs_ty)
         arg_nodes.push(lhs)
+        let pipe_hint_meta = self.ast.find_fn_meta(generic_fn_node)
         for ai in 0..args_count:
             let arg_node = self.ast.get_extra(args_start + ai)
             arg_nodes.push(arg_node)
+            if pipe_hint_meta >= 0 and ai + 1 < self.ast.fn_meta_param_count(pipe_hint_meta):
+                self.hint_collection_literal(arg_node, self.ast.fn_param_type(self.ast.fn_meta_param_start(pipe_hint_meta), ai + 1))
             if self.closure_has_untyped_param(arg_node):
                 deferred.push(ai + 1)
                 arg_types.push(0)
@@ -17180,6 +17319,17 @@ impl Sema:
         self.emit_no_await_guard_may_suspend_call(node, fn_sym)
         self.note_allocating_callee(node, fn_sym)
         let ret = self.check_generic_call(fn_sym, fn_node, arg_types, arg_nodes, args_count + 1, node)
+        // #1741: `g |> stage(a)` is `stage(g, a)`, so its arguments move as
+        // the direct call's do (check_call, #737): a by-value parameter
+        // consumes, a declared `&T` parameter borrows.
+        let pm_meta = self.ast.find_fn_meta(fn_node)
+        for ai in 0..arg_nodes.len() as i32:
+            if pm_meta >= 0 and ai < self.ast.fn_meta_param_count(pm_meta):
+                let pm_ptype = self.ast.fn_param_type(self.ast.fn_meta_param_start(pm_meta), ai)
+                if pm_ptype != 0 and self.ast.kind(pm_ptype) == NodeKind.NK_TYPE_REF:
+                    continue
+            if arg_nodes[ai] > 0:
+                self.mark_moved_if_consumed(arg_nodes[ai])
         if target_sym != 0 and ret != 0:
             let ret_resolved = self.resolve_alias(ret as TypeId)
             let ret_base = if self.get_type_kind(ret_resolved) == TypeKind.TY_GENERIC_INST: self.get_generic_inst_base(ret_resolved as i32) else: self.get_type_name(ret_resolved)
@@ -17195,6 +17345,12 @@ impl Sema:
     mut fn check_pipeline(node: i32) -> i32:
         let lhs = self.ast.get_data0(node)
         let rhs = self.ast.get_data1(node)
+        // #1739: `[1, 2] |> stage()` meets the stage's first parameter.
+        if rhs != 0 and self.ast.kind(rhs) == NodeKind.NK_CALL and self.ast.kind(self.ast.get_data0(rhs)) == NodeKind.NK_IDENT:
+            let stage_fn = self.generic_fn_node_for_symbol(self.ast.get_data0(self.ast.get_data0(rhs)))
+            let stage_meta = if stage_fn != 0: self.ast.find_fn_meta(stage_fn) else: -1
+            if stage_meta >= 0 and self.ast.fn_meta_param_count(stage_meta) > 0:
+                self.hint_collection_literal(lhs, self.ast.fn_param_type(self.ast.fn_meta_param_start(stage_meta), 0))
         let lhs_ty = self.check_expr(lhs)
         if rhs != 0:
             if self.ast.kind(rhs) == NodeKind.NK_CALL:
@@ -17249,7 +17405,7 @@ impl Sema:
         let generic_ret = self.check_generic_pipeline_call(node, lhs, lhs_ty as i32, rhs)
         if generic_ret >= 0:
             return generic_ret
-        let saved = self.in_pipeline_rhs
+        let saved: i32 = self.in_pipeline_rhs
         self.in_pipeline_rhs = 1
         let rhs_ty = self.check_expr(rhs)
         self.in_pipeline_rhs = saved
@@ -17524,7 +17680,7 @@ impl Sema:
             let payload_ty: i32 = self.with_payload_types.get(node).unwrap()
             self.push_scope()
             let had_binding = self.scope_has(name)
-            self.scope_put(name, payload_ty, is_mut)
+            self.scope_put_at(name, payload_ty, is_mut, node)
             self.binding_decl_nodes.insert(name, node)
             self.binding_value_nodes.insert(name, source)
             if had_binding == 0:
@@ -17556,7 +17712,7 @@ impl Sema:
         self.with_form_kinds.insert(node, WithFormKind.Binding)
         self.push_scope()
         let had_binding = self.scope_has(name)
-        self.scope_put(name, source_ty as i32, is_mut)
+        self.scope_put_at(name, source_ty as i32, is_mut, node)
         self.binding_decl_nodes.insert(name, node)
         self.binding_value_nodes.insert(name, source)
         if had_binding == 0:
@@ -17594,7 +17750,7 @@ impl Sema:
             let sym = self.ast.get_extra(extra_start + 2 + i)
             if sym != 0:
                 let elem_ty: i32 = self.type_extra[(te_start + i)]
-                self.scope_put(sym, elem_ty, is_mut)
+                self.scope_put_at(sym, elem_ty, is_mut, node)
                 self.binding_decl_nodes.insert(sym, node)
         // §7.2 Form 2: a `mut` builder body is statements; the block returns the tuple.
         let body_ty = if is_mut != 0: self.check_expr_statement_context(body) else: self.check_expr(body)
@@ -17613,7 +17769,7 @@ impl Sema:
         self.implicit_binding_syms.push(binding_name)
         self.push_scope()
         let had_binding = self.scope_has(binding_name)
-        self.scope_put(binding_name, source_ty as i32, 0)
+        self.scope_put_at(binding_name, source_ty as i32, 0, node)
         if had_binding == 0:
             self.register_pending_generic_binding(binding_name, 0, source, source_ty as i32)
         let body_ty = self.check_expr(body)
@@ -17692,7 +17848,7 @@ impl Sema:
             // restore the matched path's move state after it (#1383).
             let matched_states = self.save_scope_states()
             let matched_mf = self.save_moved_field_state()
-            let saved_drop_cf = self.drop_control_flow_depth
+            let saved_drop_cf: i32 = self.drop_control_flow_depth
             if self.current_drop_type_sym != 0:
                 self.drop_control_flow_depth = self.drop_control_flow_depth + 1
             self.push_move_control_flow_context(1)
@@ -17706,7 +17862,7 @@ impl Sema:
                 self.emit_error("let ... else requires a diverging else branch", else_body)
         self.pattern_subject_node = value
         // §9.7: `var PATTERN = ...` binds every name it introduces mutably (#1354).
-        let saved_bind_mut = self.pattern_bind_mut
+        let saved_bind_mut: i32 = self.pattern_bind_mut
         self.pattern_bind_mut = self.ast.let_pattern_is_mut(node)
         self.check_pattern(pattern, val_type as i32)
         self.pattern_bind_mut = saved_bind_mut
@@ -17858,7 +18014,7 @@ impl Sema:
                 if ni < elem_count:
                     bind_ty = self.type_extra[(elem_start + ni)]
                 if n_sym > 0:
-                    self.scope_put(n_sym, bind_ty, 0)
+                    self.scope_put_at(n_sym, bind_ty, 0, node)
                     if self.type_is_ephemeral_value(bind_ty) != 0:
                         self.record_view_binding_from_expr(n_sym, value)
             // Rest binding: bind to sub-tuple of remaining elements
@@ -17874,11 +18030,11 @@ impl Sema:
                     else:
                         rest_elems.push(0)
                 let rest_ty = self.ensure_tuple_type(rest_elems, rest_elem_count)
-                self.scope_put(rest_sym, rest_ty as i32, 0)
+                self.scope_put_at(rest_sym, rest_ty as i32, 0, node)
                 if self.type_is_ephemeral_value(rest_ty as i32) != 0:
                     self.record_view_binding_from_expr(rest_sym, value)
             else if rest_sym > 0:
-                self.scope_put(rest_sym, self.ty_void as i32, 0)
+                self.scope_put_at(rest_sym, self.ty_void as i32, 0, node)
             // Bind elements after rest
             for ni in 0..after_rest:
                 let n_sym = self.ast.get_extra(extra_start + rest_pos + 1 + ni)
@@ -17887,7 +18043,7 @@ impl Sema:
                 if elem_idx >= 0 and elem_idx < elem_count:
                     bind_ty = self.type_extra[(elem_start + elem_idx)]
                 if n_sym > 0:
-                    self.scope_put(n_sym, bind_ty, 0)
+                    self.scope_put_at(n_sym, bind_ty, 0, node)
                     if self.type_is_ephemeral_value(bind_ty) != 0:
                         self.record_view_binding_from_expr(n_sym, value)
         else:
@@ -17902,7 +18058,7 @@ impl Sema:
                         self.emit_error("tuple destructuring arity mismatch", node)
                         emitted_arity_error = 1
                 if n_sym > 0:
-                    self.scope_put(n_sym, bind_ty, 0)
+                    self.scope_put_at(n_sym, bind_ty, 0, node)
                     if self.type_is_ephemeral_value(bind_ty) != 0:
                         self.record_view_binding_from_expr(n_sym, value)
         // #782 arm 2: destructuring CONSUMES the source — MIR moves every
@@ -18824,6 +18980,8 @@ impl Sema:
         // A generic callee's unannotated closure arguments wait for the other
         // arguments (check_deferred_generic_closure_args).
         let defer_generic_closures = sig_idx < 0 and callable_value_tid == 0 and variant_payload_tys.len() == 0 and self.generic_fn_node_for_symbol(fn_sym) != 0
+        let generic_hint_fn = if sig_idx < 0 and callable_value_tid == 0 and variant_payload_tys.len() == 0: self.generic_fn_node_for_symbol(fn_sym) else: 0
+        let generic_hint_meta = if generic_hint_fn != 0: self.ast.find_fn_meta(generic_hint_fn) else: -1
         let deferred_closure_args: Vec[i32] = Vec.new()
         for ai in 0..resolved_arg_count:
             let arg_node = if has_resolved != 0: self.get_resolved_call_arg(node, ai) else: self.ast.get_extra(resolved_extra_start + ai)
@@ -18869,10 +19027,15 @@ impl Sema:
             if is_closure_arg:
                 self.closure_direct_arg_depth = self.closure_direct_arg_depth + 1
                 self.closure_direct_arg_escape_flags.push(closure_arg_escapes)
-            let saved_display_join_node = self.display_join_node
+            // #1739: a generic callee's `Vec[T]` parameter names the collection
+            // a literal argument builds; its elements decide T.
+            if expected_ty == 0 and sig_idx < 0 and generic_hint_meta >= 0 and ai + param_offset < self.ast.fn_meta_param_count(generic_hint_meta):
+                self.hint_collection_literal(arg_node, self.ast.fn_param_type(self.ast.fn_meta_param_start(generic_hint_meta), ai + param_offset))
+            let saved_display_join_node: i32 = self.display_join_node
             if expected_ty == 0 and sig_idx < 0 and self.generic_param_bounded_by_display(fn_sym, ai + param_offset) != 0:
                 self.display_join_node = arg_node
             let arg_ty = if facade_context.userdata_node != 0 and arg_node == facade_context.userdata_node: facade_context.userdata_type as TypeId
+                else if self.join_meets_ref_param(arg_node, expected_ty): self.check_join_arg_at_ref_param(arg_node, expected_ty)
                 else if expected_ty != 0: self.check_expr_with_expected(arg_node, expected_ty as TypeId)
                 else: self.check_expr_value_context(arg_node)
             self.display_join_node = saved_display_join_node
@@ -19436,8 +19599,8 @@ impl Sema:
         self.if_chain_contains_node(else_body, needle)
 
     mut fn check_expr_with_expected(node: i32, expected: TypeId) -> TypeId:
-        let saved_expected = self.expected_expr_type
-        let saved_has = self.has_expected_type
+        let saved_expected: i32 = self.expected_expr_type
+        let saved_has: i32 = self.has_expected_type
         let saved_statement_root = self.current_statement_expr_root
         let saved_value_root = self.current_value_expr_root
         let saved_match_stmt = self.match_in_stmt_pos
@@ -19512,12 +19675,12 @@ impl Sema:
         1
 
     mut fn check_expr_value_context(node: i32) -> TypeId:
-        let saved_expected = self.expected_expr_type
-        let saved_has = self.has_expected_type
-        let saved_statement_root = self.current_statement_expr_root
-        let saved_value_root = self.current_value_expr_root
-        let saved_match_stmt = self.match_in_stmt_pos
-        let saved_stmt_depth = self.stmt_pos_depth
+        let saved_expected: i32 = self.expected_expr_type
+        let saved_has: i32 = self.has_expected_type
+        let saved_statement_root: i32 = self.current_statement_expr_root
+        let saved_value_root: i32 = self.current_value_expr_root
+        let saved_match_stmt: i32 = self.match_in_stmt_pos
+        let saved_stmt_depth: i32 = self.stmt_pos_depth
         self.expected_expr_type = 0 as TypeId
         self.has_expected_type = 0
         self.current_statement_expr_root = 0
@@ -19534,12 +19697,12 @@ impl Sema:
         out
 
     mut fn check_expr_statement_context(node: i32) -> TypeId:
-        let saved_expected = self.expected_expr_type
-        let saved_has = self.has_expected_type
-        let saved_statement_root = self.current_statement_expr_root
-        let saved_value_root = self.current_value_expr_root
-        let saved_match_stmt = self.match_in_stmt_pos
-        let saved_stmt_depth = self.stmt_pos_depth
+        let saved_expected: i32 = self.expected_expr_type
+        let saved_has: i32 = self.has_expected_type
+        let saved_statement_root: i32 = self.current_statement_expr_root
+        let saved_value_root: i32 = self.current_value_expr_root
+        let saved_match_stmt: i32 = self.match_in_stmt_pos
+        let saved_stmt_depth: i32 = self.stmt_pos_depth
         self.expected_expr_type = 0 as TypeId
         self.has_expected_type = 0
         self.current_statement_expr_root = node
@@ -19994,6 +20157,7 @@ impl Sema:
                 self.check_ephemeral_task_arg_escape(if eg_arg_node > 0: eg_arg_node else: call_node, 0, 0, fn_sym, pi)
 
         // Obligation model: collect and solve trait bounds for each bound type parameter.
+        let bounds_errors_before = self.diags.count_by_severity(DiagSeverity.Error)
         self.check_generic_trait_bounds(tp_start, tp_count, call_node)
         // Also check where clause bounds if present
         let where_idx = self.ast.find_where_meta(fn_node)
@@ -20001,6 +20165,13 @@ impl Sema:
             let where_start: i32 = self.ast.state.where_meta[(where_idx + 1)]
             let where_count: i32 = self.ast.state.where_meta[(where_idx + 2)]
             self.check_generic_trait_bounds(where_start, where_count, call_node)
+        // #1447: a failed bound is the whole story; checking the body under
+        // it reports the bound's consequences in source the caller never
+        // wrote (`print[T: Display]`'s `v.to_str()` inside std).
+        if self.diags.count_by_severity(DiagSeverity.Error) != bounds_errors_before:
+            self.generic_subst_param_syms = saved_generic_call_subst_syms
+            self.generic_subst_type_ids = saved_generic_call_subst_tys
+            return 0
         let ege_before = self.diags.count_by_severity(DiagSeverity.Error)
         self.ensure_generic_substitutions(tp_start, tp_count, param_start, param_count, call_node)
         // #598: an uninferable type param already got its one teaching
@@ -20396,7 +20567,7 @@ impl Sema:
         let owner = self.node_module_path(node)
         if owner.len() == 0 or owner == self.current_module_path:
             return self.resolve_type_expr(node) as i32
-        let saved_file_id = self.local_file_id
+        let saved_file_id: i32 = self.local_file_id
         let saved_module_path = with_str_clone_ref(self.current_module_path)
         let saved_module_has_ci = self.current_module_has_ci
         self.local_file_id = self.ast.file(node as NodeId) as i32
@@ -23212,6 +23383,29 @@ impl Sema:
     // through §3.8's auto-ref at the call, and a `&T` expectation on the
     // argument's own join refuses its owned arms (`m(if c: a ++ b else:
     // c)`, which check_call also refuses — #1754).
+    // #1754 (§3.8, D22 §8.2): an owned `T` meets a `&T` parameter through
+    // auto-ref, so a reference expectation is not an owned anchor for a join
+    // argument (rule 2), and no owned temporary is borrowed to force a
+    // reference result (rule 5). The arms meet `T` (a literal arm is the
+    // owned `str`, a numeric one takes T's width) and decide the join: owned
+    // arms give an owned result the call borrows, view arms a view.
+    fn join_meets_ref_param(arg_node: i32, expected_ty: i32) -> bool:
+        if arg_node <= 0 or expected_ty == 0:
+            return false
+        let k = self.ast.kind(arg_node)
+        if k != NodeKind.NK_IF_EXPR and k != NodeKind.NK_MATCH:
+            return false
+        let r = self.resolve_alias(expected_ty as TypeId)
+        self.get_type_kind(r) == TypeKind.TY_REF and self.get_type_d1(r) == 0 and self.get_type_d0(r) != 0
+
+    mut fn check_join_arg_at_ref_param(arg_node: i32, ref_ty: i32) -> TypeId:
+        let pointee = self.get_type_d0(self.resolve_alias(ref_ty as TypeId))
+        let saved: i32 = self.borrow_pointee_join_node
+        self.borrow_pointee_join_node = arg_node
+        let ty = self.check_expr_with_expected(arg_node, pointee as TypeId)
+        self.borrow_pointee_join_node = saved
+        ty
+
     mut fn method_sig_expected_arg_type(obj_type: i32, is_static_receiver: bool, field: i32, arg_index: i32) -> i32:
         if obj_type == 0:
             return 0
@@ -23232,8 +23426,9 @@ impl Sema:
             param_ty = self.sig_param_type(sig, param_i)
         if param_ty == 0:
             return 0
-        let param_kind = self.get_type_kind(self.resolve_alias(param_ty as TypeId))
-        if param_kind == TypeKind.TY_REF or self.type_is_dyn_object(self.resolve_alias(param_ty as TypeId) as i32) != 0: 0 else: param_ty
+        // A `&T` parameter is published too: a join argument meets it through
+        // check_join_arg_at_ref_param (#1754).
+        if self.type_is_dyn_object(self.resolve_alias(param_ty as TypeId) as i32) != 0: 0 else: param_ty
 
     fn method_arg_stores_value(recv_type: i32, field: i32, arg_index: i32) -> i32:
         if recv_type == 0:
@@ -24204,6 +24399,7 @@ impl Sema:
             if mc_expected == 0:
                 mc_expected = self.method_sig_expected_arg_type(obj_type as i32, static_type_sym != 0 and self.static_receiver_type_is_known(expr) != 0, field, ai)
             let mc_arg_ty = if facade_ud_node != 0 and mc_arg_node == facade_ud_node: facade_ud_ty as TypeId
+                else if self.join_meets_ref_param(mc_arg_node, mc_expected): self.check_join_arg_at_ref_param(mc_arg_node, mc_expected)
                 else if mc_expected != 0: self.check_expr_with_expected(mc_arg_node, mc_expected as TypeId)
                 else: self.check_expr_value_context(mc_arg_node)
             arg_types.push(mc_arg_ty as i32)
@@ -24440,9 +24636,7 @@ impl Sema:
                         return 0
                 // docs/completed/mut.md Rev 8 §15.17 — mutating method on a view-bound
                 // for-loop variable (e.g., `for u in xs.iter(): u.push(1)`).
-                let mc_root = self.place_root_sym(expr)
-                if mc_root != 0 and self.scope_is_view_bound(mc_root) != 0:
-                    self.emit_error("cannot mutate through read-only view yielded by iterator (§15.17)", node)
+                self.reject_mutation_through_view_binding(self.place_root_sym(expr), node)
                 self.check_mutation_against_views(expr, node)
             // docs/completed/mut.md Rev 8 §5.1 — user-defined methods declared with
             // `mut self: Self` require a mutable place receiver. Warnings during
@@ -24475,9 +24669,7 @@ impl Sema:
                     // §15.6 — only check view-liveness when the receiver actually
                     // is a mutable place we'd be mutating.
                     self.check_mutation_against_views(expr, node)
-                let ms_root = self.place_root_sym(expr)
-                if ms_root != 0 and self.scope_is_view_bound(ms_root) != 0:
-                    self.emit_error("cannot mutate through read-only view yielded by iterator (§15.17)", node)
+                self.reject_mutation_through_view_binding(self.place_root_sym(expr), node)
             else if self.method_has_move_self_flag(type_name_sym, field) != 0 or (self.builtin_method_requires_move_receiver(type_name_sym, field) != 0 and borrowed_payload_eliminator == 0):
                 // docs/completed/mutability.md — move self receiver: the call consumes the
                 // receiver binding. Copy receivers satisfy the same contract by
@@ -26502,17 +26694,50 @@ impl Sema:
                 diag.add_note("the generator `" ++ ref_name ++ "` is still running while the loop body runs (§13.4); collect the changes and apply them after the loop")
             else if is_loop_view != 0:
                 diag.add_note("the loop reads `" ++ place_name ++ "` again on its next iteration; collect the changes and apply them after the loop")
-            let ref_ty = self.resolve_alias(self.scope_lookup(ref_sym) as TypeId)
-            if self.get_type_kind(ref_ty) == TypeKind.TY_REF:
-                let pointee = self.get_type_d0(ref_ty)
-                if pointee != 0 and self.is_copy(pointee as TypeId) != 0:
-                    let owned_name = self.type_name(pointee)
-                    diag.add_note("take an independent Copy value with `let " ++ ref_name ++ ": " ++ owned_name ++ " = ...`")
-                    diag.add_help("change the binding to `let " ++ ref_name ++ ": " ++ owned_name ++ " = ...`")
+            let fixed = self.with_copy_view_fixit(move diag, ref_sym, false)
             // §8, §57: a facade resource that depends on the place says why.
-            let noted = self.with_facade_dependency_notes(move diag, self.scope_lookup(ref_sym))
+            let noted = self.with_facade_dependency_notes(move fixed, self.scope_lookup(ref_sym))
             self.diags.emit(move noted)
             return
+
+    // #1531: a binding that views a Copy value (`let x = s.n`, `let x =
+    // v[0]`) named by a view diagnostic: the diagnostic offers the copy
+    // spelling (the ruling's `let x: T = ...`), and points at the binding
+    // when it does not already.
+    mut fn with_copy_view_fixit(diag: Diagnostic, view_sym: i32, label_binding: bool) -> Diagnostic:
+        var d = diag
+        // A field view binds at the field's own type (`let x = s.p` with
+        // `p: &T` is `&T`); an element view binds `&T` for an element `T`.
+        var value = if self.binding_value_nodes.contains(view_sym): self.binding_value_nodes.get(view_sym).unwrap() else: 0
+        while value != 0 and self.ast.kind(value) == NodeKind.NK_GROUPED:
+            value = self.ast.get_data0(value)
+        let field_view = value != 0 and self.ast.kind(value) == NodeKind.NK_FIELD_ACCESS
+        var owned = self.resolve_alias(self.scope_lookup(view_sym) as TypeId) as i32
+        let is_ref = self.get_type_kind(owned as TypeId) == TypeKind.TY_REF
+        if is_ref and not field_view:
+            owned = self.get_type_d0(owned as TypeId)
+        if owned == 0 or self.is_copy(owned as TypeId) == 0 or ((field_view or not is_ref) and self.scope_is_view_bound(view_sym) == 0):
+            return d
+        let name: str = with_str_clone_ref(self.pool_resolve(view_sym))
+        let decl = self.binding_decl_node(view_sym)
+        if label_binding and decl != 0:
+            d.add_label(Span { file: self.local_file_id, start: self.ast.get_start(decl), end: self.ast.get_end(decl) }, "`" ++ name ++ "` binds a view here")
+        let owned_name = self.type_name(owned)
+        d.add_note("take an independent Copy value with `let " ++ name ++ ": " ++ owned_name ++ " = ...`")
+        d.add_help("change the binding to `let " ++ name ++ ": " ++ owned_name ++ " = ...`")
+        d
+
+    // §15.17: a view-bound binding (a for-loop view, a field or element
+    // view) is read-only. A raw-pointer binding is exempt: writing through
+    // the pointer writes its pointee, not the place the binding views.
+    mut fn reject_mutation_through_view_binding(root: i32, node: i32):
+        if root == 0 or self.scope_is_view_bound(root) == 0 or self.suppress_errors != 0:
+            return
+        if self.get_type_kind(self.resolve_alias(self.scope_lookup(root) as TypeId)) == TypeKind.TY_PTR:
+            return
+        let diag = Diagnostic.err("cannot mutate through read-only view yielded by iterator (§15.17)", Span { file: self.local_file_id, start: self.ast.get_start(node), end: self.ast.get_end(node) })
+        let fixed = self.with_copy_view_fixit(move diag, root, true)
+        self.diags.emit(move fixed)
 
     // Register a borrow with pre-computed place/kind/field/path.
     // Used by closure capture registration.
@@ -27423,7 +27648,7 @@ impl Sema:
         // the inner. Block form (NK_UNSAFE_BLOCK over NK_BLOCK) won't classify as
         // a place because NK_BLOCK isn't in any of the place arms.
         if kind == NodeKind.NK_UNSAFE_BLOCK:
-            let saved_unsafe = self.in_unsafe
+            let saved_unsafe: i32 = self.in_unsafe
             self.in_unsafe = 1
             let packed = self.classify_place(self.ast.get_data0(node))
             self.in_unsafe = saved_unsafe
@@ -28081,7 +28306,7 @@ impl Sema:
         let fty = if fty_opt.is_some(): fty_opt.unwrap() else: 0
         if fty == 0 or self.is_copy(fty as TypeId) != 0 or self.type_needs_drop(fty) == 0:
             return
-        let saved_unsafe = self.in_unsafe
+        let saved_unsafe: i32 = self.in_unsafe
         if crossed_unsafe != 0:
             self.in_unsafe = 1
         self.reject_owned_demand_from_view_projection(leaf, 0, context)
@@ -28145,7 +28370,9 @@ impl Sema:
             return 0
         let fty_opt = self.typed_expr_types.get(leaf)
         let fty = if fty_opt.is_some(): fty_opt.unwrap() else: 0
-        if fty == 0 or self.is_copy(fty as TypeId) != 0 or self.type_needs_drop(fty) == 0:
+        // #1531 (§3.8, D27): a Copy field joins as a view too, as a Copy
+        // element does (`if c: v[0] else: v[1]` is `&i32`).
+        if fty == 0:
             return 0
         if unpack_place_kind(self.classify_place(leaf)) == PlaceKind.PK_NotPlace:
             return 0

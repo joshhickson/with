@@ -124,6 +124,10 @@ pub type Codegen {
     current_function: i64,
     current_function_name_sym: i32,
     current_function_node: i32,
+    // The declaration whose module decides by-name type lookups in the body
+    // being emitted: the function's own, or a specialization's template
+    // (#1745). Closures and drop glue emitted inside keep it.
+    current_function_tier_node: i32,
     current_method_owner_sym: i32,
     current_drop_origin_ptr: i64,
     current_drop_origin_len: i64,
@@ -436,8 +440,6 @@ pub type Codegen {
     // Async
     async_fn_symbols: HashMap[i32, i32],
     async_fn_ret_types: HashMap[i32, i64],
-    async_task_result_types: HashMap[i32, i64],
-    last_async_spawn_ret_ty: i64,
     async_fn_args_struct_types: HashMap[i32, i64],
     task_locals: HashMap[i32, i32],
     uses_async: bool,
@@ -589,7 +591,7 @@ extend Codegen:
 
 fn Codegen.init_with_opt_and_intern(module_name: &str, opt_level: i32, intern: InternPool, sema: Sema) -> Codegen:
     var cg = Codegen.init_with_opt(module_name, opt_level)
-    let overflow_mode = sema.overflow_mode
+    let overflow_mode: i32 = sema.overflow_mode
     cg.intern = intern
     cg.sema = sema
     cg.overflow_mode = overflow_mode
@@ -944,6 +946,7 @@ fn Codegen.init_with_opt(module_name: &str, opt_level: i32) -> Codegen:
         current_function: 0,
         current_function_name_sym: 0,
         current_function_node: 0,
+        current_function_tier_node: 0,
         current_method_owner_sym: 0,
         current_drop_origin_ptr: 0,
         current_drop_origin_len: 0,
@@ -1104,8 +1107,6 @@ fn Codegen.init_with_opt(module_name: &str, opt_level: i32) -> Codegen:
         current_fn_saw_explicit_return: false,
         async_fn_symbols: HashMap.new(),
         async_fn_ret_types: HashMap.new(),
-        async_task_result_types: HashMap.new(),
-        last_async_spawn_ret_ty: 0,
         async_fn_args_struct_types: HashMap.new(),
         task_locals: HashMap.new(),
         uses_async: false,
@@ -1987,7 +1988,7 @@ impl Codegen:
         self.loop_depth = st.depth
 
     mut fn push_loop_context(break_bb: i64, continue_bb: i64, result_alloca: i64, label_sym: i32):
-        let idx = self.loop_depth
+        let idx: i32 = self.loop_depth
         var labels: Vec[i32] = move self.loop_labels
         with_codegen_loop_set_break(idx, break_bb)
         with_codegen_loop_set_continue(idx, continue_bb)
@@ -2230,7 +2231,7 @@ impl Codegen:
             if ptr != 0:
                 out = ptr
 
-        let had_error_before = self.had_error
+        let had_error_before: i32 = self.had_error
         let coerced = self.enforce_coerced_type(out, param_ty, "wrong argument type")
         if self.had_error != had_error_before:
             self.debug_call_coerce_failure(call_context, call_node, arg_index, arg_node, out, param_ty)
@@ -3224,7 +3225,7 @@ impl Codegen:
         self.type_bodies_pending = self.type_bodies_pending - 1
         let saved_file = with_str_clone_ref(self.current_decl_source_file)
         let saved_module = with_str_clone_ref(self.sema.current_module_path)
-        let saved_len = self.type_bindings_len
+        let saved_len: i32 = self.type_bindings_len
         let saved_syms = move self.type_binding_syms
         let saved_types = move self.type_binding_types
         self.type_binding_syms = Vec.new()
@@ -3706,10 +3707,8 @@ impl Codegen:
             var cg_sym = self.sema_sym_to_codegen_sym(sym)
             if cg_sym == 0:
                 cg_sym = sym
-            // D29 (#750): a shadowed name's tid carries its tier; route the
-            // std-tier tid to the aliased LLVM slot.
-            if self.sema.type_sym_is_shadowed(sym) != 0 and self.sema.type_tid_std_tier(resolved_tid) != 0:
-                cg_sym = self.shadow_alias_for(cg_sym)
+            // D29 (#750): a shadowed name's std-tier tid routes to its aliased
+            // LLVM slot inside nominal_cg_sym_for_tid.
             return self.resolve_defined_named_type(self.nominal_cg_sym_for_tid(resolved_tid as i32, cg_sym))
         if tk == TypeKind.TY_TUPLE:
             let elem_start = self.sema.get_type_d0(resolved_tid)
@@ -3995,10 +3994,18 @@ impl Codegen:
         self.nominal_cg_sym_for_tid(self.type_decl_sema_tid(decl), name_sym)
 
     // The codegen symbol of the resolved struct/enum TypeId whose plain
-    // symbol is `cg_sym`.
+    // symbol is `cg_sym`: the `$std` slot of a std-tier declaration whose
+    // name a user type shadows (D29, #750), or a later same-named
+    // declaration's `name$tid` (#1446). Every TypeId-to-LLVM path reads it;
+    // the MIR paths applied only the #1446 half, so a std generic body's
+    // private `MutexState` lowered to the user's same-named struct (#1745).
     fn nominal_cg_sym_for_tid(resolved_tid: i32, cg_sym: i32) -> i32:
         let alias = self.nominal_alias_by_tid.get(resolved_tid)
-        if alias.is_some(): alias.unwrap() else: cg_sym
+        if alias.is_some():
+            return alias.unwrap()
+        if resolved_tid > 0 and self.sema.type_tid_std_tier(resolved_tid) != 0 and self.type_sym_shadowed_cg(cg_sym) != 0:
+            return self.shadow_alias_for(cg_sym)
+        cg_sym
 
     // The codegen symbol of a MIR type's nominal, through references — the
     // aliased symbol for a later declaration of a split name, where
@@ -4040,6 +4047,16 @@ impl Codegen:
         self.sema_type_to_llvm(split_tid)
 
     fn current_fn_is_std_tier() -> i32:
+        // #1745: a specialization (`gen_pull__sema__…`,
+        // `Mutex.new__receiver__…`) has no declaration under its own name;
+        // its tier is its template's, which the emitter recorded as the
+        // current tier node. By name alone it read as user code, and
+        // `sizeof[MutexState]` inside std.sync sized the user's MutexState.
+        let node = self.current_function_tier_node
+        if node > 0 and self.pool.kind(node) == NodeKind.NK_FN_DECL:
+            let template_sym = self.codegen_sema_sym_for(self.pool.get_data0(node))
+            if template_sym != 0 and self.sema.fn_decl_source_paths.contains(template_sym):
+                return sema_tier_path_is_std_implementation(self.sema.fn_decl_source_paths.get(template_sym).unwrap())
         if self.current_function_name_sym == 0:
             return 0
         let sema_sym = self.codegen_sema_sym_for(self.current_function_name_sym)
@@ -4864,7 +4881,7 @@ impl Codegen:
         let ctx_sym = self.sema.fn_decl_semantic_symbol_at(fn_node, self.pool.get_data0(fn_node), decl_index)
         if ctx_sym == 0:
             return
-        let saved_decl_fn_sym = self.current_function_name_sym
+        let saved_decl_fn_sym: i32 = self.current_function_name_sym
         self.current_function_name_sym = ctx_sym
         self.declare_function_at_inner(fn_node, decl_index)
         self.current_function_name_sym = saved_decl_fn_sym
@@ -4932,7 +4949,7 @@ impl Codegen:
         let param_types: Vec[i64] = Vec.new()
 
         // Set method owner before resolving return type so Self can resolve
-        let saved_owner = self.current_method_owner_sym
+        let saved_owner: i32 = self.current_method_owner_sym
         if method_owner_sym != 0:
             self.current_method_owner_sym = method_owner_sym
 
@@ -4978,9 +4995,9 @@ impl Codegen:
         let abi_index = self.compute_fn_abi(ret_ty, param_types, places, if uses_c_abi: FN_ABI_C else: FN_ABI_WITH, is_variadic)
         let abi = self.fn_abis[abi_index]
         let has_sret = if abi.ret.pass == PM_INDIRECT: 1 else: 0
-        let sret_ty = abi.ret.source_ty
+        let sret_ty: i64 = abi.ret.source_ty
         let byval_types = self.fn_abi_byval_types(abi_index)
-        let fn_type = abi.llvm_ty
+        let fn_type: i64 = abi.llvm_ty
 
         // Use "main" for @[entry] functions
         var effective_name = if sema_name_str.len() > 0: sema_name_str else: self.function_symbol_name(name_sym)
@@ -5219,7 +5236,7 @@ impl Codegen:
         wl_set_linkage(function, wl_internal_linkage())
         let thunk_byval = self.fn_abi_byval_types(thunk_index)
         self.apply_c_abi_byval_attrs(function, thunk_byval, target.arg_count, 1)
-        let saved_fn = self.current_function
+        let saved_fn: i64 = self.current_function
         let saved_bb = wl_get_insert_block(self.builder)
         self.current_function = function
         wl_position_at_end(self.builder, wl_append_bb(self.context, function, "entry"))
@@ -5339,8 +5356,8 @@ impl Codegen:
         let abi_index = self.compute_fn_abi(ret_ty, param_types, places, FN_ABI_WITH, self.sema.sig_is_variadic(sig_idx))
         let abi = self.fn_abis[abi_index]
         let has_sret = if abi.ret.pass == PM_INDIRECT: 1 else: 0
-        let sret_ty = abi.ret.source_ty
-        let fn_type = abi.llvm_ty
+        let sret_ty: i64 = abi.ret.source_ty
+        let fn_type: i64 = abi.llvm_ty
         // #839: reuse only a same-typed entry. A mismatched occupant (e.g. a
         // link_name extern claiming this bare name) keeps the C symbol; the
         // With fn takes an LLVM-uniquified name — resolution is value-keyed.
@@ -6493,7 +6510,7 @@ impl Codegen:
 
         let saved_bind_syms = move self.type_binding_syms
         let saved_bind_tys = move self.type_binding_types
-        let saved_bind_len = self.type_bindings_len
+        let saved_bind_len: i32 = self.type_bindings_len
         let fresh_bind_syms: Vec[i32] = Vec.new()
         let fresh_bind_tys: Vec[i64] = Vec.new()
         self.type_binding_syms = fresh_bind_syms
@@ -6596,7 +6613,7 @@ impl Codegen:
         let abi_index = self.compute_fn_abi(ret_ty, sources, places, if is_async: FN_ABI_ASYNC else: FN_ABI_WITH, 0)
         let abi = self.fn_abis[abi_index]
         let has_sret = if abi.ret.pass == PM_INDIRECT: 1 else: 0
-        let fn_type = abi.llvm_ty
+        let fn_type: i64 = abi.llvm_ty
         let name = self.intern.resolve(mono_sym)
         let function = wl_add_function(self.llmod, name, fn_type)
         // A module object keeps every specialization it instantiates — a

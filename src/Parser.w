@@ -97,8 +97,13 @@ pub type Parser {
     pending_post_decls: Vec[i32],
     implicit_main_mode: i32,
     implicit_main_has_main_hint: i32,
+    implicit_main_has_exec_stmt: i32,
     top_level_stmts: Vec[i32],
     explicit_main_decl: i32,
+    // §18.5b (D74): the imported module this parse is of, "" for an entry
+    // source. A module file holds declarations; a statement at its top
+    // level is refused by name.
+    module_label: str,
     // D39: `.wi` interface flavor — functions omit bodies and storage globals
     // omit initializers (typed NK_INTERFACE_* nodes fill the slots). Off for
     // every `.w`, so ordinary source never admits a bodyless declaration.
@@ -204,8 +209,10 @@ fn Parser.init_with_pool(tokens: TokenList, source: &str, file_id: i32, intern: 
         pending_post_decls: Vec.new(),
         implicit_main_mode: 0,
         implicit_main_has_main_hint: 0,
+        implicit_main_has_exec_stmt: 0,
         top_level_stmts: Vec.new(),
         explicit_main_decl: 0,
+        module_label: "",
         interface_mode: 0,
         block_indent: 0,
     }
@@ -214,8 +221,66 @@ impl Parser:
     mut fn enable_implicit_main_mode():
         self.implicit_main_mode = 1
         self.implicit_main_has_main_hint = self.has_top_level_main_decl()
+        self.implicit_main_has_exec_stmt = self.has_top_level_exec_stmt()
+
+    // §18.5b (D74): a file is an entry source when its top level holds an
+    // executable statement other than a `let`/`var`. A `let`/`var` alone is
+    // a module-level declaration (a comptime fn or an importer reads it);
+    // only in an entry source do the top-level `let`/`var`s become `main`'s
+    // locals. Without this, `var G = 0` beside a `comptime fn` became a
+    // local of a synthesized main and the fn saw "undefined variable".
+    fn has_top_level_exec_stmt() -> i32:
+        var brace_depth = 0
+        var p = 0
+        while p < self.tokens.len():
+            let tag = self.tokens.get_tag(p)
+            if tag == TokenKind.TK_L_BRACE:
+                brace_depth = brace_depth + 1
+                p = p + 1
+                continue
+            if tag == TokenKind.TK_R_BRACE:
+                if brace_depth > 0:
+                    brace_depth = brace_depth - 1
+                p = p + 1
+                continue
+            if brace_depth != 0 or tag == TokenKind.TK_NEWLINE or tag == TokenKind.TK_SEMICOLON:
+                p = p + 1
+                continue
+            if column_of(self.source, self.tokens.get_start(p)) != 0:
+                p = p + 1
+                continue
+            if tag == TokenKind.TK_IDENT:
+                if not (self.token_text_is(p, "c") and (self.token_text_is(p + 1, "facade") or self.token_text_is(p + 1, "convention"))):
+                    return 1
+            else if tag == TokenKind.TK_INT_LIT or tag == TokenKind.TK_STRING_LIT or tag == TokenKind.TK_FLOAT_LIT or tag == TokenKind.TK_KW_IF or tag == TokenKind.TK_KW_MATCH or tag == TokenKind.TK_KW_FOR or tag == TokenKind.TK_KW_WHILE or tag == TokenKind.TK_KW_LOOP or tag == TokenKind.TK_KW_RETURN or tag == TokenKind.TK_KW_WITH or tag == TokenKind.TK_KW_DEFER or tag == TokenKind.TK_L_PAREN or tag == TokenKind.TK_L_BRACKET or tag == TokenKind.TK_MINUS or tag == TokenKind.TK_KW_NOT or tag == TokenKind.TK_BANG:
+                return 1
+            p = p + 1
+        0
 
     mut fn enable_interface_mode(): self.interface_mode = 1
+
+    mut fn enable_module_mode(label: &str): self.module_label = label.clone()
+
+    // §18.5b (D74): a token that opens an executable statement, never a
+    // declaration, at a module's top level. `let`/`var` are declarations
+    // there; attributes, `impl`, `trait` and `c facade` were taken above.
+    fn top_level_starts_stmt() -> i32:
+        let t = self.peek()
+        if t == TokenKind.TK_IDENT:
+            return if self.top_level_starts_decl() != 0: 0 else: 1
+        if t == TokenKind.TK_INT_LIT or t == TokenKind.TK_STRING_LIT or t == TokenKind.TK_FLOAT_LIT:
+            return 1
+        if t == TokenKind.TK_KW_IF or t == TokenKind.TK_KW_MATCH or t == TokenKind.TK_KW_FOR or t == TokenKind.TK_KW_WHILE or t == TokenKind.TK_KW_LOOP or t == TokenKind.TK_KW_RETURN or t == TokenKind.TK_KW_WITH or t == TokenKind.TK_KW_DEFER:
+            return 1
+        if t == TokenKind.TK_L_PAREN or t == TokenKind.TK_L_BRACKET or t == TokenKind.TK_MINUS or t == TokenKind.TK_KW_NOT or t == TokenKind.TK_BANG:
+            return 1
+        0
+
+    mut fn emit_module_top_level_stmt(stmt: NodeId):
+        let span = Span { file: self.file_id, start: self.pool.get_start(stmt), end: self.pool.get_end(stmt) }
+        var diag = Diagnostic.err("module '" ++ self.module_label ++ "' holds an executable statement at its top level; a module file holds declarations, and only an entry source runs statements (§18.5b, D74)", span)
+        diag.add_help("move the statement into a function the entry source calls, or make this file the entry source")
+        self.diags.emit(move diag)
 
     // D39 interface mode: the body slot of a declaration. A body in a `.wi`
     // is an error (the object holds the code); the recovery still parses it
@@ -293,7 +358,7 @@ impl Parser:
                     return 1
             return 0
         if t == TokenKind.TK_KW_LET or t == TokenKind.TK_KW_VAR:
-            if self.implicit_main_mode != 0 and self.implicit_main_has_main_hint == 0:
+            if self.implicit_main_mode != 0 and self.implicit_main_has_main_hint == 0 and self.implicit_main_has_exec_stmt != 0:
                 return 0
             return 1
         0
@@ -941,7 +1006,7 @@ impl Parser:
                 break
 
             if self.peek() == TokenKind.TK_KW_PUB:
-                let saved_pos = self.pos
+                let saved_pos: i32 = self.pos
                 self.advance()
                 if self.peek() == TokenKind.TK_KW_IMPL or self.peek() == TokenKind.TK_KW_EXTEND:
                     self.parse_impl_block(Visibility.Public)
@@ -970,6 +1035,15 @@ impl Parser:
                 let stmt = self.parse_expr()
                 if stmt != 0:
                     self.record_top_level_stmt(stmt)
+                else:
+                    self.recover_to_top_level()
+            else if self.module_label.len() > 0 and self.top_level_starts_stmt() != 0:
+                // §18.5b (D74): an imported module may not hold executable
+                // statements. The statement is parsed so the error covers it
+                // and the rest of the module is still diagnosed.
+                let stmt = self.parse_expr()
+                if stmt != 0:
+                    self.emit_module_top_level_stmt(stmt)
                 else:
                     self.recover_to_top_level()
             else:
@@ -1234,7 +1308,7 @@ impl Parser:
                 break
 
             if self.peek() == TokenKind.TK_KW_PUB:
-                let saved_pos = self.pos
+                let saved_pos: i32 = self.pos
                 self.advance()
                 if self.peek() == TokenKind.TK_KW_IMPL or self.peek() == TokenKind.TK_KW_EXTEND:
                     let decl_start = self.pool.decl_count()
@@ -1280,7 +1354,7 @@ impl Parser:
     mut fn parse_fn_decl(is_pub: i32, start: i32, is_async: i32, is_gen: i32, is_comptime: i32) -> NodeId:
         // Capture the @[target("arch")] guard up front — parsing the body may run
         // skip_attributes for nested constructs and clear pending_target.
-        let fn_target_guard = self.pending_target
+        let fn_target_guard: i32 = self.pending_target
         self.pending_target = 0
         if self.expect(TokenKind.TK_KW_FN) == 0:
             return self.poisoned_expr()
@@ -1834,7 +1908,7 @@ impl Parser:
             // Check for per-field @[align(N)] attribute
             var field_align = 0
             if self.peek() == TokenKind.TK_AT:
-                let saved = self.pos
+                let saved: i32 = self.pos
                 self.advance()
                 if self.peek() == TokenKind.TK_L_BRACKET:
                     self.advance()
@@ -1906,7 +1980,7 @@ impl Parser:
 
             var field_align = 0
             if self.peek() == TokenKind.TK_AT:
-                let saved = self.pos
+                let saved: i32 = self.pos
                 self.advance()
                 if self.peek() == TokenKind.TK_L_BRACKET:
                     self.advance()
@@ -1964,7 +2038,7 @@ impl Parser:
         extra_start
 
     mut fn is_enum_def() -> bool:
-        let saved = self.pos
+        let saved: i32 = self.pos
         self.advance()  // skip identifier
         self.skip_newlines()
         if self.peek() == TokenKind.TK_PIPE:
@@ -2028,7 +2102,7 @@ impl Parser:
                         self.advance()
                         self.skip_newlines()
 
-                    let before_payload = self.pos
+                    let before_payload: i32 = self.pos
                     let pty = self.parse_type_expr()
                     payloads.push(pty as i32)
                     if self.peek() == TokenKind.TK_COMMA:
@@ -2115,7 +2189,7 @@ impl Parser:
                         self.advance()
                         self.advance()
                         self.skip_newlines()
-                    let before_payload = self.pos
+                    let before_payload: i32 = self.pos
                     let pty = self.parse_type_expr()
                     payloads_flat.push(pty as i32)
                     pcount = pcount + 1
@@ -2178,7 +2252,7 @@ impl Parser:
                         self.advance()
                         self.advance()
                         self.skip_newlines()
-                    let before_payload = self.pos
+                    let before_payload: i32 = self.pos
                     let pty = self.parse_type_expr()
                     payloads_flat.push(pty as i32)
                     pcount = pcount + 1
@@ -2558,7 +2632,7 @@ impl Parser:
                     self.advance()
                     self.skip_newlines()
                     if self.peek() == TokenKind.TK_COMMA:
-                        let cp = self.pos
+                        let cp: i32 = self.pos
                         self.advance()
                         self.skip_newlines()
                         if self.peek() == TokenKind.TK_STRING_LIT:
@@ -2986,7 +3060,7 @@ impl Parser:
     // A trait/impl method's colon body: the members are the declaration's
     // indented list, so the body sits deeper than the member's line (#1391).
     mut fn parse_member_body(member_start: i32) -> NodeId:
-        let saved_block_indent = self.block_indent
+        let saved_block_indent: i32 = self.block_indent
         self.block_indent = line_indent_of(self.source, member_start)
         let body = self.parse_block_or_expr()
         self.block_indent = saved_block_indent
@@ -2994,6 +3068,21 @@ impl Parser:
 
     mut fn skip_member_separators(form: DeclBody):
         if form == DeclBody.Braced: self.skip_separators() else: self.skip_newlines()
+
+    // #1738: a member loop ends at the first token it does not accept. In an
+    // indented body a token still deeper than the declaration's line is a
+    // member line the loop did not recognize; ending there silently parsed
+    // the rest of the body as top-level declarations. Report it and skip the
+    // rest of the body.
+    mut fn reject_unrecognized_member_line(construct: &str, form: DeclBody, start: i32):
+        if form != DeclBody.Indented or self.peek() == TokenKind.TK_EOF:
+            return
+        let decl_indent = line_indent_of(self.source, start)
+        if column_of(self.source, self.current_start()) <= decl_indent:
+            return
+        self.emit_error("expected a member of this `" ++ construct ++ "` (a method or an associated `type`); this line is inside its indented body")
+        while self.peek() != TokenKind.TK_EOF and column_of(self.source, self.current_start()) > decl_indent:
+            self.advance()
 
     mut fn parse_trait_decl(vis: i32):
         let start = self.current_start()
@@ -3133,6 +3222,7 @@ impl Parser:
             method_flags.push(mflags)
             self.skip_member_separators(form)
 
+        self.reject_unrecognized_member_line("trait", form, start)
         if trait_braced:
             self.expect(TokenKind.TK_R_BRACE)
         let extra_start = self.pool.extra_len()
@@ -3430,6 +3520,7 @@ impl Parser:
             method_count = method_count + 1
             self.skip_member_separators(form)
 
+        self.reject_unrecognized_member_line(construct, form, start)
         if impl_braced:
             self.expect(TokenKind.TK_R_BRACE)
         // Emit impl_decl node. Store assoc types + method_count in extra.
@@ -3802,7 +3893,7 @@ impl Parser:
                         return node
             // move (params) => expr
             if self.peek() == TokenKind.TK_L_PAREN:
-                let save = self.pos
+                let save: i32 = self.pos
                 self.advance()
                 self.skip_newlines()
                 var is_closure = 0
@@ -5446,7 +5537,7 @@ impl Parser:
         // Already consumed `(`. Parse `value , pattern )` and desugar to
         //   match value: pattern => () ; _ => assert_matches_failed()
         let start = self.pool.get_start(callee)
-        let saved_sb = self.suppress_brace
+        let saved_sb: i32 = self.suppress_brace
         self.suppress_brace = 0
         self.skip_newlines()
         let value = self.parse_expr()
@@ -5479,7 +5570,7 @@ impl Parser:
         // be read as partial application). Desugar it at parse time into a match.
         if self.pool.kind(callee) == NodeKind.NK_IDENT and self.intern.resolve(self.pool.get_data0(callee)) == "assert_matches":
             return self.parse_assert_matches(callee)
-        let saved_suppress_brace = self.suppress_brace
+        let saved_suppress_brace: i32 = self.suppress_brace
         self.suppress_brace = 0
         self.skip_newlines()
         var args: Vec[i32] = Vec.new()
@@ -5491,7 +5582,7 @@ impl Parser:
                 // Named argument: name: value
                 var arg_name_sym = 0
                 if self.peek() == TokenKind.TK_IDENT:
-                    let save = self.pos
+                    let save: i32 = self.pos
                     let name_sym = self.intern_current()
                     self.advance()
                     if self.peek() == TokenKind.TK_COLON:
@@ -5505,8 +5596,8 @@ impl Parser:
                 if arg_name_sym == 0 and seen_named == 1:
                     self.emit_error("positional argument cannot follow named argument")
                 arg_names.push(arg_name_sym)
-                let outer_it = self.saw_implicit_it
-                let outer_depth = self.implicit_it_depth
+                let outer_it: i32 = self.saw_implicit_it
+                let outer_depth: i32 = self.implicit_it_depth
                 self.saw_implicit_it = 0
                 var arg = self.parse_expr()
                 if self.saw_implicit_it == 1:
@@ -5688,7 +5779,7 @@ impl Parser:
                 fields.push(ident_node as i32)
             field_count = field_count + 1
             if self.peek() == TokenKind.TK_NEWLINE:
-                let save = self.pos
+                let save: i32 = self.pos
                 self.skip_newlines()
                 if self.peek() == TokenKind.TK_EOF:
                     break
@@ -5760,7 +5851,7 @@ impl Parser:
 
         // Comma-separated: check if multi-index or two-arg subscript
         if self.peek() == TokenKind.TK_COMMA:
-            let save = self.pos
+            let save: i32 = self.pos
             self.advance()
             self.skip_newlines()
             // If next is ':' or '...', definitely multi-index
@@ -5948,7 +6039,7 @@ impl Parser:
                 // Keep shorthand construction aligned with normal call parsing:
                 // `.Fatal(code: 99)` should behave like `Fatal(code: 99)`.
                 if self.peek() == TokenKind.TK_IDENT:
-                    let save = self.pos
+                    let save: i32 = self.pos
                     self.advance()
                     if self.peek() == TokenKind.TK_COLON:
                         self.advance()
@@ -5971,7 +6062,7 @@ impl Parser:
 
     mut fn parse_grouped_or_tuple() -> NodeId:
         let start = self.current_start()
-        let open_paren_pos = self.pos
+        let open_paren_pos: i32 = self.pos
         self.advance()  // consume (
         self.skip_newlines()
 
@@ -6133,7 +6224,7 @@ impl Parser:
         if self.peek() == TokenKind.TK_KW_LET:
             return self.parse_if_let(start, chain_col, chain_is_stmt)
 
-        let saved_sb = self.suppress_brace
+        let saved_sb: i32 = self.suppress_brace
         self.suppress_brace = 1
         let cond = self.parse_expr()
         self.suppress_brace = saved_sb
@@ -6142,7 +6233,7 @@ impl Parser:
         let is_stmt_if = chain_is_stmt != 0
         let then_body = self.parse_body()
         var else_body: NodeId = 0 as NodeId
-        let save = self.pos
+        let save: i32 = self.pos
         self.skip_newlines()
         let crossed_newline = self.pos != save
         if self.peek() == TokenKind.TK_KW_ELSE:
@@ -6162,7 +6253,7 @@ impl Parser:
         let pat = self.parse_pattern()
         if self.expect(TokenKind.TK_EQ) == 0:
             return self.poisoned_expr()
-        let saved_sb = self.suppress_brace
+        let saved_sb: i32 = self.suppress_brace
         self.suppress_brace = 1
         let subject = self.parse_expr()
         self.suppress_brace = saved_sb
@@ -6184,7 +6275,7 @@ impl Parser:
                 let p = self.parse_pattern()
                 if self.expect(TokenKind.TK_EQ) == 0:
                     return self.poisoned_expr()
-                let saved_chain_sb = self.suppress_brace
+                let saved_chain_sb: i32 = self.suppress_brace
                 self.suppress_brace = 1
                 let s = self.parse_expr()
                 self.suppress_brace = saved_chain_sb
@@ -6192,7 +6283,7 @@ impl Parser:
                 clauses.push(p as i32)
                 clauses.push(s as i32)
             else:
-                let saved_chain_sb = self.suppress_brace
+                let saved_chain_sb: i32 = self.suppress_brace
                 self.suppress_brace = 1
                 let cond = self.parse_expr()
                 self.suppress_brace = saved_chain_sb
@@ -6205,7 +6296,7 @@ impl Parser:
         let then_body = self.parse_body()
 
         var else_body: NodeId = 0 as NodeId
-        let save = self.pos
+        let save: i32 = self.pos
         self.skip_newlines()
         let crossed_newline = self.pos != save
         if self.peek() == TokenKind.TK_KW_ELSE:
@@ -6618,7 +6709,7 @@ impl Parser:
                 if self.peek() == TokenKind.TK_R_BRACE:
                     break
             else:
-                let save = self.pos
+                let save: i32 = self.pos
                 self.skip_newlines()
                 if self.peek() == TokenKind.TK_IDENT and self.pos + 1 < self.tokens.len() and self.tokens.get_tag(self.pos + 1) == TokenKind.TK_EQ:
                     let next_col = column_of(self.source, self.current_start())
@@ -6644,7 +6735,7 @@ impl Parser:
         if self.peek() == TokenKind.TK_KW_LET:
             return self.parse_while_let(start)
 
-        let saved_sb = self.suppress_brace
+        let saved_sb: i32 = self.suppress_brace
         self.suppress_brace = 1
         let cond = self.parse_expr()
         self.suppress_brace = saved_sb
@@ -6657,7 +6748,7 @@ impl Parser:
         self.advance()
         let body = self.parse_body()
 
-        let save = self.pos
+        let save: i32 = self.pos
         self.skip_newlines()
         if self.peek() == TokenKind.TK_KW_WHILE:
             let while_col = column_of(self.source, self.current_start())
@@ -6675,7 +6766,7 @@ impl Parser:
         let pat = self.parse_pattern()
         if self.expect(TokenKind.TK_EQ) == 0:
             return self.poisoned_expr()
-        let saved_sb = self.suppress_brace
+        let saved_sb: i32 = self.suppress_brace
         self.suppress_brace = 1
         let subject = self.parse_expr()
         self.suppress_brace = saved_sb
@@ -6718,7 +6809,7 @@ impl Parser:
             if first >= 65 and first <= 90:
                 return true
 
-        let saved_pos = self.pos
+        let saved_pos: i32 = self.pos
         self.advance()
         let next = self.peek()
         self.pos = saved_pos
@@ -6746,7 +6837,7 @@ impl Parser:
         if self.expect(TokenKind.TK_KW_IN) == 0:
             return self.poisoned_expr()
         self.skip_newlines()
-        let saved_sb = self.suppress_brace
+        let saved_sb: i32 = self.suppress_brace
         self.suppress_brace = 1
         let iterable = self.parse_expr()
         self.suppress_brace = saved_sb
@@ -6766,7 +6857,7 @@ impl Parser:
         // Only match else: at the same column as the for keyword.
         // Desugar to: { var __for_ran = false; for x in iter: { __for_ran = true; body }; if not __for_ran: else_body }
         let for_col = column_of(self.source, start)
-        let save_pos = self.pos
+        let save_pos: i32 = self.pos
         self.skip_newlines()
         let else_col = column_of(self.source, self.current_start())
         if self.peek() == TokenKind.TK_KW_ELSE and else_col == for_col:
@@ -6821,7 +6912,7 @@ impl Parser:
             if self.peek() == TokenKind.TK_KW_IF:
                 self.advance()
                 self.skip_newlines()
-                let saved_guard_sb = self.suppress_brace
+                let saved_guard_sb: i32 = self.suppress_brace
                 self.suppress_brace = 1
                 let guard_expr = self.parse_expr()
                 self.suppress_brace = saved_guard_sb
@@ -6834,7 +6925,7 @@ impl Parser:
             if self.expect(TokenKind.TK_KW_IN) == 0:
                 return self.poisoned_expr()
             self.skip_newlines()
-            let saved_sb = self.suppress_brace
+            let saved_sb: i32 = self.suppress_brace
             self.suppress_brace = 1
             let bexpr = self.parse_expr()
             self.suppress_brace = saved_sb
@@ -7033,7 +7124,7 @@ impl Parser:
         let start = self.current_start()
         self.advance()
         self.skip_newlines()
-        let saved_suppress_brace = self.suppress_brace
+        let saved_suppress_brace: i32 = self.suppress_brace
         self.suppress_brace = 1
         let subject = self.parse_expr()
         self.suppress_brace = saved_suppress_brace
@@ -7055,7 +7146,7 @@ impl Parser:
     mut fn parse_match_arms() -> i32:
         var arms: Vec[i32] = Vec.new()
         var arm_col = -1
-        let saved_block_indent = self.block_indent
+        let saved_block_indent: i32 = self.block_indent
 
         while self.peek() != TokenKind.TK_EOF:
             let t = self.peek()
@@ -7104,7 +7195,7 @@ impl Parser:
                 guard = in_guard_expr
             else if self.peek() == TokenKind.TK_KW_IF:
                 self.advance()
-                let saved_sfa = self.suppress_fat_arrow_closure
+                let saved_sfa: i32 = self.suppress_fat_arrow_closure
                 self.suppress_fat_arrow_closure = 1
                 guard = self.parse_expr()
                 self.suppress_fat_arrow_closure = saved_sfa
@@ -7126,7 +7217,7 @@ impl Parser:
             let arm = self.pool.add_node(NodeKind.NK_MATCH_ARM, arm_start, self.prev_end(), pattern, body, guard)
             arms.push(arm as i32)
 
-            let save = self.pos
+            let save: i32 = self.pos
             self.skip_newlines()
             if self.peek() == TokenKind.TK_EOF:
                 break
@@ -7175,7 +7266,7 @@ impl Parser:
                 guard = in_guard_expr
             else if self.peek() == TokenKind.TK_KW_IF:
                 self.advance()
-                let saved_sfa2 = self.suppress_fat_arrow_closure
+                let saved_sfa2: i32 = self.suppress_fat_arrow_closure
                 self.suppress_fat_arrow_closure = 1
                 guard = self.parse_expr()
                 self.suppress_fat_arrow_closure = saved_sfa2
@@ -7696,7 +7787,7 @@ impl Parser:
         self.skip_newlines()
         // New syntax: with name(expr): body → NK_WITH_IMPLICIT
         if self.peek() == TokenKind.TK_IDENT:
-            let save = self.pos
+            let save: i32 = self.pos
             let binding_name = self.intern_current()
             self.advance()
             if self.peek() == TokenKind.TK_L_PAREN:
@@ -7896,7 +7987,7 @@ impl Parser:
                             if self.expect(TokenKind.TK_KW_IN) == 0:
                                 return self.poisoned_expr()
                             self.skip_newlines()
-                            let saved_sb = self.suppress_brace
+                            let saved_sb: i32 = self.suppress_brace
                             self.suppress_brace = 1
                             let iterable = self.parse_expr()
                             self.suppress_brace = saved_sb
@@ -7978,7 +8069,7 @@ impl Parser:
                     if self.expect(TokenKind.TK_KW_IN) == 0:
                         return self.poisoned_expr()
                     self.skip_newlines()
-                    let saved_sb = self.suppress_brace
+                    let saved_sb: i32 = self.suppress_brace
                     self.suppress_brace = 1
                     let iterable = self.parse_expr()
                     self.suppress_brace = saved_sb
@@ -8202,7 +8293,7 @@ impl Parser:
             return true
         let intro_start = self.prev_start()
         let intro_end = self.prev_end()
-        let save = self.pos
+        let save: i32 = self.pos
         self.skip_newlines()
         if self.peek() != TokenKind.TK_EOF and column_of(self.source, self.current_start()) > self.block_indent:
             return true
@@ -8220,7 +8311,7 @@ impl Parser:
             return self.poisoned_expr()
 
         let block_col = column_of(self.source, self.current_start())
-        let saved_block_indent = self.block_indent
+        let saved_block_indent: i32 = self.block_indent
         self.block_indent = block_col
         let body = self.parse_indented_block(block_col)
         self.block_indent = saved_block_indent
@@ -8244,7 +8335,7 @@ impl Parser:
                     continue
                 break
 
-            let save = self.pos
+            let save: i32 = self.pos
             self.skip_separators()
             if self.peek() == TokenKind.TK_EOF:
                 break
@@ -8278,7 +8369,7 @@ impl Parser:
         // Indentation inside braces is insignificant (§29.13 Form 3), so a
         // statement's own line is the level a colon body inside it must
         // exceed (#1391).
-        let saved_block_indent = self.block_indent
+        let saved_block_indent: i32 = self.block_indent
         var stmts: Vec[i32] = Vec.new()
         self.block_indent = line_indent_of(self.source, self.current_start())
         var last_expr = self.parse_expr()
@@ -8632,7 +8723,7 @@ impl Parser:
             if first >= 65 and first <= 90:
                 return true
 
-        let saved_pos = self.pos
+        let saved_pos: i32 = self.pos
         self.advance()
         let next = self.peek()
         self.pos = saved_pos
@@ -8658,7 +8749,7 @@ impl Parser:
     // method form (`mut fn m -> R:`), where parse_param_list is never called.
     mut fn flush_receiver_only_param() -> i32:
         let pattern_start = self.pool.fn_param_patterns_len()
-        let rmode = self.pending_receiver_mode
+        let rmode: i32 = self.pending_receiver_mode
         self.pending_receiver_mode = 0
         let rflags = self.build_synth_receiver(rmode)
         self.pool.add_extra(self.intern.intern("self"))
@@ -8696,7 +8787,7 @@ impl Parser:
             if has_explicit_self:
                 self.pending_receiver_mode = 0
             else:
-                let rmode = self.pending_receiver_mode
+                let rmode: i32 = self.pending_receiver_mode
                 self.pending_receiver_mode = 0
                 let rflags = self.build_synth_receiver(rmode)
                 params.push(self.intern.intern("self"))

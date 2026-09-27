@@ -640,7 +640,7 @@ impl Compilation:
     mut fn set_prelude_mode(mode: i32):
         var cfg = move self.config
         cfg.prelude_mode = compilation_normalize_prelude_mode(mode)
-        let cfg_prelude_mode = cfg.prelude_mode
+        let cfg_prelude_mode: i32 = cfg.prelude_mode
         self.config = cfg
         var zcu = move self.zcu
         zcu.set_prelude_mode(cfg_prelude_mode)
@@ -1896,6 +1896,9 @@ impl Compilation:
             sema.emit_config_warnings = 0
         else:
             sema = self.zcu.configure_tracked_input_sema(Sema.init(self.zcu.pool, move self.zcu.diagnostics, active_pool))
+            // A clone, not a move: the Zcu renders the root file's warnings
+            // after lowering and codegen, and against a moved-out text every
+            // one read 1:1 of an empty line (#1447).
             sema.source_text = with_str_clone_ref(self.zcu.current_source_text)
             // Clone like Frontend's seam: a bare assignment moves the table out of
             // the Zcu (single-owner Vec), and the backend's module-object pruning

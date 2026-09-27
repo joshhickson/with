@@ -84,7 +84,7 @@ type JsonParser {
 unsafe fn jsmn_alloc_token(parser: *mut JsonParser, tokens: *mut JsonToken, num_tokens: i32) -> i32:
     if parser.toknext >= num_tokens:
         return -1
-    let idx = parser.toknext
+    let idx: i32 = parser.toknext
     parser.toknext = parser.toknext + 1
     let tok = tokens + idx as u64
     tok.start = -1
@@ -102,7 +102,7 @@ unsafe fn jsmn_fill_token(tokens: *mut JsonToken, idx: i32, tok_type: i32, start
     tok.size = 0
 
 unsafe fn jsmn_parse_primitive(parser: *mut JsonParser, js: &str, len: i32, tokens: *mut JsonToken, num_tokens: i32) -> i32:
-    let start = parser.pos
+    let start: i32 = parser.pos
     while parser.pos < len:
         let c = js[parser.pos] as i32
         if c == 0:
@@ -123,7 +123,7 @@ unsafe fn jsmn_parse_primitive(parser: *mut JsonParser, js: &str, len: i32, toke
     0
 
 unsafe fn jsmn_parse_string(parser: *mut JsonParser, js: &str, len: i32, tokens: *mut JsonToken, num_tokens: i32) -> i32:
-    let start = parser.pos
+    let start: i32 = parser.pos
     parser.pos = parser.pos + 1
     while parser.pos < len:
         let c = js[parser.pos] as i32
@@ -472,6 +472,7 @@ impl LspDocument:
         var intern = InternPool.init()
         var diags = DiagnosticList.init()
         var parser = Parser.init(move tokens, self.text, 0, intern, move diags)
+        parser.enable_implicit_main_mode()  // §18.5b (D74): an open root is an entry source
         self.fast_pool = parser.parse_module()
         self.fast_intern = parser.intern
         self.fast_text_len = self.text.len() as i32
@@ -483,7 +484,7 @@ impl LspDocument:
             return
         var comp = Compilation.init()
         comp.set_prelude_mode(2)
-        let pool = comp.compile_source_text(self.path, self.text)
+        let pool = comp.compile_entry_source_text(self.path, self.text)
         self.cached_pool = pool
         self.cached_intern = comp.zcu.pool
         self.cached_diags = move comp.zcu.diagnostics
@@ -688,7 +689,7 @@ impl LspState:
         let use_cache = idx >= 0 and (&self.documents[idx]).cache_valid
         if not use_cache:
             comp.set_prelude_mode(2)
-            let pool = comp.compile_source_text(uri_to_path(uri), text)
+            let pool = comp.compile_entry_source_text(uri_to_path(uri), text)
         let dl = if use_cache: &self.documents[idx].cached_diags else: &comp.zcu.diagnostics
 
         var diags = jarr_start()
@@ -845,7 +846,7 @@ impl LspState:
         let use_cache = idx >= 0 and (&self.documents[idx]).cache_valid
         if not use_cache:
             comp.set_prelude_mode(2)
-            fresh_pool = comp.compile_source_text(uri_to_path(uri), text)
+            fresh_pool = comp.compile_entry_source_text(uri_to_path(uri), text)
         let pool = if use_cache: &self.documents[idx].cached_pool else: &fresh_pool
         let intern = if use_cache: &self.documents[idx].cached_intern else: &comp.zcu.pool
 
@@ -1186,7 +1187,7 @@ impl LspState:
         let use_cache = cidx >= 0 and (&self.documents[cidx]).cache_valid
         if not use_cache:
             comp.set_prelude_mode(2)
-            fresh_pool = comp.compile_source_text(uri_to_path(uri), text)
+            fresh_pool = comp.compile_entry_source_text(uri_to_path(uri), text)
         let pool = if use_cache: &self.documents[cidx].cached_pool else: &fresh_pool
         let intern = if use_cache: &self.documents[cidx].cached_intern else: &comp.zcu.pool
 
@@ -1288,6 +1289,7 @@ fn lsp_parse_file(text: &str) -> LspParseResult:
     var intern = InternPool.init()
     var diags = DiagnosticList.init()
     var parser = Parser.init(move tokens, text, 0, intern, move diags)
+    parser.enable_implicit_main_mode()  // §18.5b (D74): an open root is an entry source
     let pool = parser.parse_module()
     LspParseResult { pool, intern: parser.intern }
 
@@ -1721,7 +1723,7 @@ impl LspState:
         let use_cache = idx >= 0 and (&self.documents[idx]).cache_valid
         if not use_cache:
             comp.set_prelude_mode(2)
-            fresh_pool = comp.compile_source_text(uri_to_path(uri), text)
+            fresh_pool = comp.compile_entry_source_text(uri_to_path(uri), text)
         let pool = if use_cache: &self.documents[idx].cached_pool else: &fresh_pool
         let intern = if use_cache: &self.documents[idx].cached_intern else: &comp.zcu.pool
 

@@ -13760,7 +13760,7 @@ impl MirBuilder:
         let wanted_bb = self.new_block()
         let other_bb = self.new_block()
         let join_bb = self.new_block()
-        let wanted_variant = if method_name == "ok": self.sema.syms.ok else: self.sema.syms.err
+        let wanted_variant: i32 = if method_name == "ok": self.sema.syms.ok else: self.sema.syms.err
         let disc = self.lower_enum_discriminant(value_place)
         let vals: Vec[i64] = Vec.new()
         vals.push(self.enum_variant_discriminant_for_type(value_ty, wanted_variant))
@@ -15050,7 +15050,11 @@ impl MirBuilder:
 
         let intrinsic = self.classify_intrinsic(payload_ty, method_name)
         if intrinsic != MirIntrinsic.NONE:
-            let payload_op_kind = if self.sema.is_copy_frozen(payload_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE
+            // #1710: a reader intrinsic observes the payload in place.
+            let observes = self.optional_chain_intrinsic_observes(payload_ty, member_sym)
+            if observes and self.place_type_is_str(payload_place) != 0:
+                self.mark_string_place_copied(payload_place)
+            let payload_op_kind = if observes: OperandKind.OK_COPY else: OperandKind.OK_MOVE
             let payload_op = self.body.new_operand(payload_op_kind, payload_place)
             raw_op = self.lower_intrinsic_call_with_receiver_operand(intrinsic, payload_op, payload_ty, member_sym, arg_start, arg_count, raw_ret_ty, node)
         else:
@@ -15274,15 +15278,39 @@ impl MirBuilder:
         self.register_stmt_temp(tmp, ty)
         self.body.new_operand(OperandKind.OK_MOVE, place)
 
+    // Whether an optional chain reads its base in place (#1710): the base is
+    // a place, and the chain takes nothing out of it — a Copy field, a Copy
+    // payload handed to an intrinsic, or a payload lent to a method whose
+    // receiver borrows. A non-Copy field still moves the base into a
+    // temporary (the §10.3 `map` desugar consumes it).
+    // An intrinsic reads a chained payload in place unless its builtin
+    // method consumes the receiver (the ordinary call path's rule,
+    // lower_intrinsic_call).
+    fn optional_chain_intrinsic_observes(payload_ty: i32, member_sym: i32) -> bool:
+        if self.sema.is_copy_frozen(payload_ty) != 0:
+            return true
+        let owner = self.sema.method_owner_symbol_for_type(payload_ty)
+        owner != 0 and self.sema.builtin_method_requires_move_receiver(owner, member_sym) == 0
+
     mut fn lower_optional_chain(node: i32) -> i32:
         let base_expr = self.ast.get_data0(node)
         let member_sym = self.ast.get_data1(node)
         let extra_start = self.ast.get_data2(node)
         let is_call = self.ast.optional_chain_is_call(extra_start)
 
-        let base_op = self.lower_expr(base_expr)
         let base_ty = self.expr_type(base_expr)
-        let base_place = self.materialize_operand(base_op, base_ty, self.ast.get_start(base_expr))
+        // #1710 (§10.3, D74): Sema decided whether this chain reads its base
+        // in place (a Copy field, a borrowing method, a view) and recorded
+        // it; such a chain reads through the base's place. Moving the base
+        // into a temporary reset it, and the next chain on the same Option
+        // read `Some(<blank>)`. A chain that is not observing has a
+        // temporary base (a named base that gives a field up is refused).
+        var base_place = 0
+        if self.sema.optional_chain_observing_nodes.contains(node):
+            base_place = self.lower_expr_place(base_expr)
+        else:
+            let base_op = self.lower_expr(base_expr)
+            base_place = self.materialize_operand(base_op, base_ty, self.ast.get_start(base_expr))
         let option_payload_ty = self.generic_inst_arg_type(base_ty, self.sema.syms.option, 0)
         let result_ok_ty = self.generic_inst_arg_type(base_ty, self.sema.syms.result, 0)
         let result_err_ty = self.generic_inst_arg_type(base_ty, self.sema.syms.result, 1)
@@ -17280,9 +17308,9 @@ fn lower_concrete_specialization(sema: Sema, ast_pool: AstPool, pool: InternPool
         sema.named_types.insert(sym, tid)
         sema.put_generic_subst(sym, tid, fn_node)
 
-    let saved_file_id = sema.local_file_id
+    let saved_file_id: i32 = sema.local_file_id
     let saved_module_path = sema_owned_text(sema.current_module_path)
-    let saved_module_has_ci = sema.current_module_has_ci
+    let saved_module_has_ci: i32 = sema.current_module_has_ci
     let decl_index = sema.find_decl_index(fn_node)
     if decl_index >= 0:
         sema.update_decl_source_context(decl_index)

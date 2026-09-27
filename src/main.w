@@ -165,6 +165,9 @@ type TestDirectives {
     // passed while `unknown type 'T'` led its stderr).
     expect_check_fail_not: Vec[str],
     expect_build_fail: str,
+    // #1447: a build that must succeed and print these on its stderr (the
+    // warnings a build renders after codegen).
+    expect_build_stderr: Vec[str],
     has_expect_exit: bool,
     expect_exit: i32,
     check_only: bool,
@@ -206,6 +209,7 @@ fn empty_test_directives -> TestDirectives:
         expect_check_fail: "",
         expect_check_fail_not: Vec.new(),
         expect_build_fail: "",
+        expect_build_stderr: Vec.new(),
         has_expect_exit: false,
         expect_exit: 0,
         check_only: false,
@@ -847,7 +851,7 @@ fn run_cli(argc: i32) -> i32:
         comp.configure(opt_level, no_std, alloc_mode, runtime_available)
         comp.set_prelude_mode(prelude_mode)
         comp.set_overflow_mode(driver_internal_overflow_mode())
-        let pool = comp.compile_file(source)
+        let pool = comp.compile_entry_file(source)
         if pool.decl_count() == 0 or comp.has_errors():
             comp.print_warnings()
             with_eprint("error: emit-c-header: compilation failed")
@@ -873,7 +877,7 @@ fn run_cli(argc: i32) -> i32:
         // `--link-bundle` reads the same flags every compiling command does.
         comp.set_link_bundles(&driver_link_bundle_args(argc))
         comp.set_bundle_fingerprint(driver_bundle_corpus_arg(argc), "")
-        let pool = comp.compile_file(source)
+        let pool = comp.compile_entry_file(source)
         if pool.decl_count() == 0:
             with_eprint("error: IR generation failed during compilation")
             return 1
@@ -972,7 +976,7 @@ fn run_cli(argc: i32) -> i32:
             with_eprint("error: --bundle-fingerprint requires --bundle-corpus <rel>")
             return 1
         comp.set_bundle_fingerprint(bundle_corpus, bundle_fingerprint_path)
-        let pool = if source.ends_with(".wi"): comp.compile_bundle_interface_root(source) else: comp.compile_file(source)
+        let pool = if source.ends_with(".wi"): comp.compile_bundle_interface_root(source) else: comp.compile_entry_file(source)
         if pool.decl_count() == 0:
             with_eprint("error: check failed during compilation")
             return 1
@@ -3645,6 +3649,7 @@ fn parse_test_directives_for_target(target: &str) -> TestDirectives:
     let expect_check_fail_not_prefix = "//! expect-check-fail-not: "
     let expect_error_prefix = "//! expect-error: "
     let expect_build_fail_prefix = "//! expect-build-fail: "
+    let expect_build_stderr_prefix = "//! expect-build-stderr: "
     let args_prefix = "//! args: "
     let env_prefix = "//! env: "
     let skip_prefix = "//! skip: "
@@ -3680,6 +3685,8 @@ fn parse_test_directives_for_target(target: &str) -> TestDirectives:
                 result.expect_check_fail = line.slice(expect_error_prefix.len(), line.len())
             else if line.starts_with(expect_build_fail_prefix):
                 result.expect_build_fail = line.slice(expect_build_fail_prefix.len(), line.len())
+            else if line.starts_with(expect_build_stderr_prefix):
+                result.expect_build_stderr.push(line.slice(expect_build_stderr_prefix.len(), line.len()))
             else if line.starts_with(args_prefix):
                 result.extra_args = line.slice(args_prefix.len(), line.len())
             else if line.starts_with(env_prefix):
@@ -3737,10 +3744,46 @@ fn parse_test_directives_for_target(target: &str) -> TestDirectives:
             else if line.starts_with("//!"):
                 let _ = 0
             else:
+                // #1529: the first line that is not `//!` ends the header. A
+                // directive below it was never read, and its fixture passed
+                // on expectations nobody checked; name it instead.
+                result.directive_error = test_orphan_directive_error(text, i + 1, nr_of_offset(text, i) + 1)
                 return result
             start = i + 1
         i = i + 1
     result
+
+fn nr_of_offset(text: &str, offset: i32) -> i32:
+    var n = 1
+    for k in 0..offset:
+        if text[k] == 10: n = n + 1
+    n
+
+fn test_directive_line_is_known(line: &str) -> bool:
+    let prefixes = ["//! expect-stdout: ", "//! expect-stderr: ", "//! expect-exit: ", "//! expect-check-stdout: ", "//! expect-check-stdout-not: ", "//! expect-check-fail: ", "//! expect-check-fail-not: ", "//! expect-error: ", "//! expect-build-fail: ", "//! expect-build-stderr: ", "//! args: ", "//! env: ", "//! skip: ", "//! skip-on: ", "//! only-on: ", "//! known-issue: "]
+    for p in prefixes:
+        if line.starts_with(p): return true
+    line == "//! skip" or line == "//! check-only"
+
+// The first directive the header parser would honor that sits after the
+// header ends (`from`, on line `line_no`), as a directive error; "" if none.
+fn test_orphan_directive_error(text: &str, from: i32, line_no: i32) -> str:
+    var start = from
+    var n = line_no
+    let text_len = text.len() as i32
+    var i = from
+    while i <= text_len:
+        if i == text_len or text[i] == 10:
+            if start < i:
+                var line = text.slice(start as i64, i as i64)
+                if line.len() > 0 and line[line.len() as i64 - 1] == 13:
+                    line = line.slice(0, line.len() - 1)
+                if test_directive_line_is_known(line):
+                    return f"directive on line {n} is below the directive header, which ends at the first line that is not `//!`; move it up: {line}"
+            start = i + 1
+            n = n + 1
+        i = i + 1
+    ""
 
 fn test_directives_have_run_expectations(directives: &TestDirectives) -> bool:
     directives.has_expect_exit or directives.expect_stdout.len() > 0 or directives.expect_stderr.len() > 0
@@ -3852,6 +3895,19 @@ fn run_test_directive_command(target: &str, directives: &TestDirectives, quiet: 
         if not test_output_contains_expected(result.stderr, directives.expect_build_fail):
             emit_test_stage_error("missing expected build error: " ++ directives.expect_build_fail, target, "build", "")
             return 1
+        return 0
+    if directives.expect_build_stderr.len() > 0:
+        let result = run_test_compiler_command(target, "build", directives)
+        if result.rc != 0:
+            emit_test_stage_error(f"build failed with exit code {result.rc}", target, "build", "")
+            emit_test_child_stderr(result.stderr)
+            return 1
+        for i in 0..directives.expect_build_stderr.len() as i32:
+            let expected = directives.expect_build_stderr[i]
+            if not test_output_contains_expected(result.stderr, expected):
+                emit_test_stage_error("missing expected build stderr: " ++ expected, target, "build", "")
+                emit_test_child_stderr(result.stderr)
+                return 1
         return 0
     if directives.expect_check_stdout.len() > 0 or directives.expect_check_stdout_not.len() > 0:
         let result = run_test_compiler_command(target, "check", directives)
