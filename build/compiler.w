@@ -16,7 +16,7 @@ const COMPILER_FALLBACK_LLVM_PREFIX: str = "/usr/local/llvm"
 const COMPILER_VERSION_SENTINEL: str = "WITHVERSIONSTAMPv1"
 const COMPILER_VERSION_SLOT_WIDTH: i32 = 48
 const COMPILER_VERSION_SOURCE_SLOT: str = "WITHVERSIONSTAMPv1XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-// D38 / docs/wo_bundles.md: the compiler bakes in the sha256 of
+// D38 / docs/spec/toolchain/wo_bundles.md: the compiler bakes in the sha256 of
 // docs/with-abi.sha256 (the recorded hashes of the ABI-defining sources) the
 // same way it bakes in its version — a post-link byte patch of a sentinel
 // slot. `with version --abi-sha` prints it; .wo bundle keys and link-time
@@ -815,6 +815,9 @@ fn comp_spec_subsection(text: &str, heading: &str) -> str:
     var i = start + 1
     while i < text.len() as i32:
         if text[i] == 10:
+            if i + 3 < text.len() as i32 and text.slice((i + 1) as i64, (i + 3) as i64) == "# ":
+                end = i
+                break
             if i + 4 < text.len() as i32 and text.slice((i + 1) as i64, (i + 4) as i64) == "## ":
                 end = i
                 break
@@ -945,7 +948,7 @@ fn comp_spec_cli_commands(spec: &str) -> Vec[str]:
     var commands: Vec[str] = Vec.new()
     commands.push("version")
     commands.push("help")
-    let block = comp_first_fenced_block(comp_spec_subsection(spec, "### 18.5 Toolchain"))
+    let block = comp_first_fenced_block(comp_spec_subsection(spec, "# 18.5 Toolchain"))
     let lines = comp_split_lines(block)
     for i in 0..lines.len() as i32:
         let stripped = comp_trim(lines[i])
@@ -965,7 +968,7 @@ fn comp_spec_cli_commands(spec: &str) -> Vec[str]:
                         commands.push(token)
                 part_start = pi + 1
             pi = pi + 1
-    let package_sec = comp_spec_subsection(spec, "### 18.8 Package Management")
+    let package_sec = comp_spec_subsection(spec, "# 18.8 Package Management")
     var tick = 0
     while tick < package_sec.len() as i32:
         let open = comp_find_from(package_sec, "`", tick)
@@ -1064,7 +1067,7 @@ fn comp_internal_command(item: &str) -> bool:
 
 fn comp_internal_flag(item: &str) -> bool:
     // --link-object / --link-bundle / --emit-bundle-manifest are .wo bundle
-    // plumbing driven by build.w (docs/wo_bundles.md), never hand-written:
+    // plumbing driven by build.w (docs/spec/toolchain/wo_bundles.md), never hand-written:
     // internal like --no-prelude.
     item == "--keep-binary" or item == "--test" or item == "--alloc" or item == "--check" or item == "--c-export-functions" or item == "--contains" or item == "--convert-goto-to-structured" or item == "--debug-alloc-filter" or item == "--deterministic" or item == "--diff" or item == "--dry-run" or item == "--dump-abi" or item == "--emit-bundle-manifest" or item == "--emit-bundle-interface" or item == "--bundle-fingerprint" or item == "--bundle-corpus" or item == "--link-object" or item == "--link-bundle" or item == "--dump-ast" or item == "--dump-async-mir" or item == "--dump-drop-flags" or item == "--dump-drop-plan" or item == "--dump-drop-state" or item == "--dump-mir" or item == "--dump-place-map" or item == "--dump-project-info" or item == "--dump-resolved" or item == "--dump-tokens" or item == "--dump-typed" or item == "--exclude" or item == "--exit-code" or item == "--explain" or item == "--explain-mir-origin" or item == "--filter" or item == "--force" or item == "--force-reinstall" or item == "--from-source" or item == "--freestanding" or item == "--graph" or item == "--help" or item == "--ir-roundtrip" or item == "--lib" or item == "--migrate-one" or item == "--name" or item == "--no-c-export" or item == "--no-deps" or item == "--no-prelude" or item == "--no-runtime" or item == "--out" or item == "--output" or item == "--prefer-brace" or item == "--prefer-colon" or item == "--prefer-curly" or item == "--prelude" or item == "--quiet" or item == "--shared-defs" or item == "--shared-fragment" or item == "--stats" or item == "--survey" or item == "--trace-cleanup-edge" or item == "--trace-ownership" or item == "--trace-place" or item == "--validate-all" or item == "--validate-ownership" or item == "--verbose" or item == "--width-slice" or item == "--version" or item == "-f" or item == "-D" or item == "-g0" or item == "-h" or item == "-I" or item == "-include" or item == "-l" or item == "-o" or item == "-q" or item == "-v" or item == "-w"
 
@@ -1448,10 +1451,16 @@ pub fn run_check_spec_inventory_action(ctx: ActionCtx) -> i32:
     if os() == "Windows":
         print("spec-inventory-check: skipped on Windows (#811)")
         return comp_write_ok_output(ctx)
-    let spec_path = "docs/with-specification.md"
-    if not fs.exists(spec_path):
-        return comp_fail(ctx, "missing " ++ spec_path)
-    let spec = fs.read_text(spec_path)
+    // The specification is one file per chapter under docs/spec/, with the
+    // sections that are not language semantics in its reference subfolders;
+    // the inventory reads every chapter file as one text.
+    let spec_dir = "docs/spec"
+    if not fs.exists(spec_dir ++ "/README.md"):
+        return comp_fail(ctx, "missing " ++ spec_dir ++ "/README.md")
+    var chapters = fs.glob(spec_dir ++ "/*.md")
+    for path in fs.glob(spec_dir ++ "/*/*.md"): chapters.push(compiler_owned_text(path))
+    var spec = ""
+    for path in chapters: spec = spec ++ fs.read_text(path) ++ "\n"
     var errors: Vec[str] = Vec.new()
 
     errors = comp_inventory_add_errors(move errors, "keywords", comp_spec_keywords(spec), comp_impl_keywords(fs), "", "")
@@ -1535,7 +1544,7 @@ pub fn run_stack_budget_check_action(ctx: ActionCtx) -> i32:
         sizes = comp_stack_collect_after_marker(result.stdout, "DW_CFA_def_cfa_offset:", move sizes)
 
     let report = comp_stack_summarize(binary_path, format, sizes)
-    let max_frame = report.max_frame
+    let max_frame: i32 = report.max_frame
     let report_text = comp_stack_report_text(report, max_frame_budget)
     let report_path = comp_join(output_dir, "report.txt")
     if fs.write_text(report_path, report_text) != 0:
@@ -2025,7 +2034,7 @@ pub fn run_patch_version_action(ctx: ActionCtx) -> i32:
     comp_patch_version_binary(ctx, unstamped, output_path, version)
 
 // Whether an LLVM SDK's lib dir carries the WebAssembly backend the wasm32
-// target needs (docs/wasm-target.md). tools/build-static-llvm.sh builds it
+// target needs (docs/proposals/wasm-target.md). tools/build-static-llvm.sh builds it
 // by default now; SDKs published before that were AArch64+X86 only.
 pub fn comp_sdk_has_wasm_backend(fs: &ToolFs, llvm_lib_dir: &str) -> bool:
     fs.host_exists(llvm_lib_dir ++ "/libLLVMWebAssemblyCodeGen.a") or fs.host_exists(llvm_lib_dir ++ "/LLVMWebAssemblyCodeGen.lib")
@@ -2280,7 +2289,7 @@ pub fn run_with_compiler_build_action(ctx: ActionCtx) -> i32:
         return comp_fail(ctx, "did not produce output: " ++ tmp_output)
     let _remove_old_dsym = comp_remove_tree_if_exists(fs, output_path ++ ".dSYM")
     if comp_output_is_stamped_compiler(ctx, output_path):
-        // D38 (docs/wo_bundles.md, batch C3): a stage binary carries the
+        // D38 (docs/spec/toolchain/wo_bundles.md, batch C3): a stage binary carries the
         // version and ABI stamps exactly as the release binary does, so the
         // stage whose stamp equals a bundle key's abi-sha can build that
         // bundle and its manifest.

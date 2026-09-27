@@ -1,0 +1,204 @@
+# The With ABI (version 4)
+
+Status: DRAFT v4 (2026-09-12), the convention as the compiler implements
+it today, written down so `.wo` bundles (decisions.md D38,
+`docs/spec/toolchain/wo_bundles.md`) can depend on it. Nothing here is a new rule. The
+sources named in §7 define the ABI; this document describes them, and at
+Level 0 of `docs/spec/abi/abi_roadmap.md` their sha256 — not a version number — is
+what keys a bundle. `WITH_ABI_VERSION` labels the version history below;
+it becomes a frozen, normative major version at Level 1.
+
+This is With's own calling convention. It is not a C ABI and exposes none
+(`@[c_export]` is for foreign callers and does not appear in the compiler).
+Where the platform ABI appears below it is as LLVM's substrate for lowering
+a With value type, not as a contract With makes with another language.
+
+## 1. Scalars and pointers
+
+- `i8/i16/i32/i64`, `u8..u64`, `f32/f64`, `bool` (1 byte), `Unit` (zero
+  size) lower to the LLVM integer/float types of that width. A `Unit`
+  *result* is LLVM `void` in every signature, whether spelled `-> Unit` or
+  left off; as a value (local, parameter, generic argument) `Unit` is
+  carried as `i32`.
+- Raw pointers (`*const T`, `*mut T`), references (`&T`), and
+  `extern fn` values are one pointer word — 8 bytes on every native target,
+  4 on `wasm32` (`target_spec_ptr_bytes`).
+- Ordinary With function values use `{ function pointer, environment pointer }`.
+  Named functions acquire an adapter thunk when converted to this representation.
+- A reference is a **value of pointer type**: it is passed as that pointer,
+  never as the pointee (D5/D6: "an explicit `&T` is a reference value with
+  the ABI of that reference type").
+
+## 2. Aggregates
+
+- **Structs:** fields in declaration order, each at the next offset aligned
+  to the field's alignment; size rounded up to the struct's alignment
+  (`TypeLayout.type_layout_struct_field_offset`). No reordering, no
+  packing, no niche use. A `Drop` struct whose all-zero storage can be a
+  live value — no field whose zero is the reset sentinel: a str, a
+  container, a raw pointer, a callable, another `Drop` value — carries one
+  hidden liveness byte after its last field, inside the size rounding
+  (`Sema.struct_needs_liveness_byte`, spec §2.5.1, D72); a construction
+  sets it, the reset blank clears it. `union` types size to the largest
+  member at offset 0. Distinct (newtype) declarations have the layout of
+  their underlying type.
+- **Enums:** a tag followed by the payload area. The tag is the declared
+  `repr` type, else 4 bytes; the payload area is the largest variant's
+  fields laid out as a struct; the enum is aligned to the larger of the
+  tag's and the payloads' alignment
+  (`TypeLayout`, the `TY_ENUM` size/align rules). Payload-less enums with
+  a `repr` lower to that integer.
+- **Tuples** lay out as structs of their elements.
+- **Generic instantiations** lay out as the instantiated struct/enum.
+
+## 3. The built-in value types (the runtime's headers)
+
+These are With value types with fixed layouts shared between the compiler's
+generated code and `rt/rt_core.w`:
+
+| Type | Layout | Size |
+|---|---|---|
+| `str` | `{ ptr: *const u8, len: i64 }` | 16 |
+| `Vec[T]` | `{ ptr: *mut u8, len: i64, cap: i64, elem_size: i64 }` | 32 |
+| `HashMap[K, V]` / `HashSet[T]` | handle: one pointer to a 64-byte runtime header (`keys, vals, occupied, cap, len, key_size, val_size, is_str_key`) | 8 |
+| `SlotMap[T]` | handle: one pointer to a 56-byte runtime header (`values, next, generations, len, cap, elem_size, free_head: u32, free_tail: u32`) | 8 |
+| `Handle[T]` | `{ index: u32, generation: u32 }` | 8 |
+| `StringBuilder` / `FmtBuffer` | `{ buf: *mut u8, len: i64, cap: i64 }` | 24 |
+| slices `[]T`, `[]mut T` | fat: `{ ptr, len: i64 }` | 16 |
+
+`Option[&T]` and `Option[*T]` lower to a **nullable pointer**: null is
+`None`, a live address is `Some` (the D22 lookup representation shared by
+`HashMap.get` and `SlotMap.get`). Every other `Option[T]` and every
+`Result[T, E]` is an ordinary tagged enum under §2.
+
+## 4. Function calls
+
+The substrate is LLVM's C calling convention for the target. On top of it
+With decides, per parameter, ONE pass mode from the signature — computed
+once and read by both the callee prologue (`declare_function_from_sig`)
+and every call site (D6; `docs/spec/abi/fn_abi_descriptor_design.md`):
+
+| Signature | Pass mode | Physical form |
+|---|---|---|
+| plain `T`, `T: Copy` | COPY | the LLVM value of `T` (§1–3 layout) |
+| plain `T`, not Copy | OWNED | the LLVM value of `T`; the callee owns it |
+| `&T` / `&mut T` (explicit reference) | reference value | pointer word |
+| receiver `mut self` (in-place), compiler-modeled borrowed places | IndirectPlace (`SHARE-PLACE` in `--dump-abi`) | pointer to the caller's place |
+| `[]T` slices | Fat | `{ ptr, len }` by value |
+
+Return values are returned by LLVM value of the return type. One target
+exception, applied by the compiler on both sides: on windows-x86_64 a
+struct/array larger than 8 bytes is returned through a hidden `sret`
+pointer and passed indirectly (`internal_abi_needs_sret`,
+`internal_abi_needs_indirect_param`). Other targets return `str`, `Vec`,
+and structs by value and let LLVM lower them per the platform.
+
+**Ownership is part of the ABI.** A plain `T` parameter transfers
+ownership: the callee drops it (or moves it on). A reference parameter
+transfers nothing. A returned value is owned by the caller. Receiver modes
+(`fn` read, `mut fn` in-place, `move fn` consume) are encoded the same way
+(D5; D21 for in-place receivers). A `.wo` boundary function with an owned
+parameter therefore drops it inside the bundle, with the drop glue the
+bundle was compiled with.
+
+Effects (`read`/`write`/`consume`/`escape`) are Sema facts carried by the
+source interface, not encoded in the object.
+
+## 5. Symbols
+
+A function's link name is its semantic symbol text — `main`, `peek`,
+`Vec.push`, and for specializations the mono name Sema assigns
+(`Vec.iter__receiver__158_16` style) — qualified by module when objects
+are built per module: `__with_mod_<hash>__<base>`, where `<hash>` is
+`with_str_hash` (FNV) of the canonical module path
+(`module_link_name_for_path`). Runtime ABI symbols (`with_*`) keep their
+bare names. Symbols are not otherwise mangled; the source interface, not
+the symbol, carries types. A function whose short name another module's
+declaration takes in the flat merge carries the semantic symbol
+`<name>$in$<module>` (#1350); its module-qualified link name drops the
+`$in$` suffix, so it is `__with_mod_<hash>__<name>` — the name its module
+exports whichever unit compiles it.
+
+For `.wo`: the bundle's objects are built in module-object mode, so every
+exported function is `__with_mod_<hash(canonical path)>__<base>`; the
+canonical path is the bundle-relative module path, which makes the name
+stable across checkouts.
+
+## 6. Drops
+
+The destructor body's descriptor records aggregate receivers as owned
+indirect storage, without byval copying. The body and subsequent field
+cleanup use that same storage so a field moved out by the body is not
+dropped again. This physical mode does not turn `move self` into a borrow.
+
+Drop glue is generated per type by codegen (`mir_emit_drop_*`): a `str`
+frees its buffer through the runtime allocator; a `Vec[T]` drops each
+element then its buffer; enums drop the live variant's payload; structs
+drop fields in declaration order. The runtime allocator's header is 16
+bytes with the aligned payload size in the first word; `.wo` objects
+allocate and free through the same runtime, which is linked once per
+executable.
+
+## 7. ABI-defining sources (what `WITH_ABI_VERSION` stamps)
+
+- `src/TypeLayout.w` — §2 layouts.
+- the cached descriptor and function declaration in `src/Codegen.w`
+  (`compute_fn_abi`, `abi_param_source_type`, `declare_function_from_sig`,
+  `push_call_arg`) and
+  Sema's `sig_param_uses_value_ref_abi` — §4.
+- symbol naming in `src/Codegen.w` (`module_link_name_for_path`,
+  `function_symbol_name`, `codegen_canonical_module_path`) and
+  `with_str_hash` — §5.
+- the header layouts in `rt/rt_core.w` (`str`, Vec, HashMap, SlotMap,
+  FmtBuffer sections) and the allocator header — §3, §6.
+- drop glue in `src/CodegenDispatch.w` (`mir_emit_drop_*`) — §6.
+- the LLVM version and target triple the object is built for (part of
+  the `.wo` key, not of the version number).
+
+**Enforcement** (implemented): the §4–5 rules live in `src/FnAbi.w`
+(`WITH_ABI_VERSION`, the `PM_*` modes, `fn_abi_pass_mode`,
+`fn_abi_argument_pass`, `fn_abi_return_pass`, `fn_abi_owned_place`,
+`fn_abi_platform_aggregate_indirect`, the symbol-naming rules), with
+one-line adapters left on `Codegen`; §2 lives in `src/TypeLayout.w`.
+`docs/with-abi.sha256` records both files' sha256 (`shasum -a 256`
+format), and the `abi-hash-check` action in `build.w` (`build/abi.w`,
+part of `:test`) fails when a recorded hash no longer matches. To change
+the convention: edit the rule, bump `WITH_ABI_VERSION`, add a
+version-history entry, re-record the hashes. A comment-only or refactor
+edit re-records without a bump. Non-ABI edits to `Codegen.w` never trip
+it.
+
+Not yet under the hash: the runtime header layouts (§3) and drop glue
+(§6) still sit inside `rt/rt_core.w` and `CodegenDispatch.w`, which
+change for non-ABI reasons too often to hash whole. They move under an
+ABI-owned file when D30's in-unit runtime retirement lands; until then a
+layout change there is caught by the `wo-drift` lane, not by this check.
+
+## Version history
+
+- **v6** (2026-09-27): a `Drop` struct whose all-zero storage can be a live
+  value gains a hidden liveness byte after its fields (§2; spec §2.5.1,
+  D72). Every other layout is unchanged; a bundle built under v5 that
+  exposes such a type sizes it one byte (plus rounding) smaller.
+- **v5** (2026-09-19): a `Unit` result lowers to LLVM `void` in every
+  signature. An explicit `-> Unit` had lowered to an `i32` result while an
+  absent return type lowered to `void`, so a definition and a declaration of
+  the same symbol could disagree — harmless on the native ABIs (an unused
+  return register), a signature-mismatch trap on WebAssembly. Pointer-sized
+  types (pointers, references, `extern fn`, trait objects, the two words of
+  a function value) take their width from the target: 4 bytes on `wasm32`.
+- **v4** (2026-09-12): SlotMap replaces its occupied-byte array with a `u32`
+  free-list link array and adds FIFO head/tail indices to its runtime header.
+  Insertion reuses free slots without scanning capacity. Slots whose generation
+  is exhausted are retired permanently instead of overflowing or reviving stale
+  handles. The public SlotMap and Handle value layouts stay unchanged.
+- **v3** (2026-09-12): declarations use finalized signature types for every
+  parameter, including consuming receivers and parameters of the owner's type.
+  Removes the AST shortcut that passed those owned values as borrowed pointers.
+  Named calls, callable types, closures, and thunks share cached `FnAbi`
+  descriptors; indirect C calls use the same C aggregate classification as
+  named C declarations.
+- **v2** (2026-09-09): adds target-sized, eight-byte-aligned `c_va_list`;
+  SysV x86_64 parameters use the caller's place, while other targets retain
+  value semantics. The AAPCS64 C call uses the existing aggregate-copy ABI.
+- **v1** (2026-09-02): the convention as implemented at `23293bf0`.
