@@ -776,9 +776,9 @@ pub fn rt_getenv(name: *const u8) -> *const u8:
     let _ = win_utf16_to_utf8_buf(&wvalue as *const [16384]u16 as *const u16, buf, n as i64 + 1)
     buf as *const u8
 
-pub fn gethostname(name: *mut u8, len: u64) -> i32:
+pub fn rt_gethostname(name: *mut u8, len: u64) -> i32:
     var wname: [256]u16 = [0 as u16; 256]
-    var n: u32 = 256 as u32
+    var n: u32 = 256
     if GetComputerNameW(&raw mut wname as *mut [256]u16 as *mut u16, &raw mut n) == 0:
         return -1
     let _ = win_utf16_to_utf8_buf(&wname as *const [256]u16 as *const u16, name, len as i64)
