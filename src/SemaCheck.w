@@ -8218,7 +8218,7 @@ impl Sema:
 
     // D61 (§15.4.7): a value `:?` formats in place, with no formatter of its
     // own — numbers, bool, str (quoted and escaped by the runtime), Unit,
-    // and a raw pointer (its address).
+    // and a raw pointer (its address in hexadecimal, #1564).
     fn debug_fmt_is_inline(kind: i32) -> bool:
         kind == TypeKind.TY_INT or kind == TypeKind.TY_FLOAT or kind == TypeKind.TY_BOOL or
             kind == TypeKind.TY_STR or kind == TypeKind.TY_VOID or kind == TypeKind.TY_PTR or
@@ -8256,7 +8256,7 @@ impl Sema:
         var ok = true
         if base != 0 and (base == self.syms.hashmap or base == self.syms.btreemap):
             ok = self.debug_fmt_has_form(self.get_generic_inst_arg(resolved, 0)) and self.debug_fmt_has_form(self.get_generic_inst_arg(resolved, 1))
-        else if kind == TypeKind.TY_GENERIC_INST and base != self.syms.vec and base != self.syms.box and
+        else if kind == TypeKind.TY_GENERIC_INST and base != self.syms.vec and not self.debug_fmt_transparent_owner(resolved) and
             self.debug_fmt_enum_base(resolved) == 0 and not self.debug_fmt_generic_struct(resolved):
             ok = false
         else:
@@ -8351,11 +8351,20 @@ impl Sema:
             return entry
         if base != 0 and (base == self.syms.hashmap or base == self.syms.btreemap):
             // The collection's own `:?` form lives in std.collections as a
-            // With method; its body's `{k:?}`/`{v:?}` register K and V.
+            // With method; its body's `{k:?}`/`{v:?}` register K and V. A K
+            // or V with no Debug form is an error under the program's `:?`
+            // (§15.4.7, #1564), here: reached through the std body, it named
+            // a line of std/collections.w the program never wrote.
+            let key_ty = self.get_generic_inst_arg(resolved, 0)
+            let value_ty = self.get_generic_inst_arg(resolved, 1)
+            let key_has_form = self.debug_fmt_has_form(key_ty)
+            if not key_has_form or not self.debug_fmt_has_form(value_ty):
+                let _ = self.ensure_debug_formatter(if key_has_form: value_ty else: key_ty, node)
+                return -1
             let entry = self.debug_fmt_push(resolved, DebugFmtKind.HELPER, 0)
             let _ = self.debug_fmt_bind_method(entry, resolved, "debug_form", node)
             return entry
-        if kind == TypeKind.TY_GENERIC_INST and base != self.syms.vec and base != self.syms.box and
+        if kind == TypeKind.TY_GENERIC_INST and base != self.syms.vec and not self.debug_fmt_transparent_owner(resolved) and
             self.debug_fmt_enum_base(resolved) == 0 and not self.debug_fmt_generic_struct(resolved):
             self.emit_error("cannot format a value of type '" ++ self.type_name(resolved) ++ "' with :? — §15.4.7 gives it no Debug form", node)
             return -1
@@ -8374,19 +8383,45 @@ impl Sema:
         self.debug_fmt_sigs[entry] = sig
         self.debug_fmt_monos[entry] = fn_sym
         self.debug_fmt_synth_syms.insert(fn_sym, entry)
-        if base == self.syms.box:
-            // A Box formats what it owns, read through Box.as_ref: the
-            // backends represent the box differently, its accessor is one.
-            let accessor = self.debug_fmt_method_fn(resolved, "as_ref")
-            let accessor_sig = self.debug_fmt_method_sig(resolved, accessor, "as_ref", node)
-            if accessor_sig >= 0:
-                self.debug_fmt_aux_fns[entry] = accessor
-                self.debug_fmt_aux_sigs[entry] = accessor_sig
-                self.debug_fmt_aux_monos[entry] = self.sig_names[accessor_sig]
+        if self.debug_fmt_transparent_owner(resolved):
+            // A Box, Rc or Arc formats the value it holds (§15.4.7), read
+            // through its as_ref (`&T`): the backends represent a box
+            // differently, its accessor is one.
+            self.debug_fmt_bind_aux(entry, resolved, "as_ref", node)
+        else if base == self.syms.hashset:
+            // `{elem, elem}` ordered by the elements' Debug text (§15.4.7,
+            // #1564). The set has no traversal of its own: the formatter
+            // walks its table (MirLower.lower_debug_set) into a Vec of the
+            // elements' texts, which the library's debug_form_of orders.
+            let _ = self.ensure_exact_type(TypeKind.TY_REF, self.get_generic_inst_arg(resolved, 0), 0, 0)
+            let texts_args: Vec[i32] = Vec.new()
+            texts_args.push(self.ty_str as i32)
+            let texts_ty = self.ensure_generic_inst_type(self.syms.vec, texts_args, 1) as i32
+            let _ = self.ensure_exact_type(TypeKind.TY_REF, texts_ty, 0, 0)
+            self.debug_fmt_bind_aux(entry, resolved, "debug_form_of", node)
         let components = self.debug_fmt_components(resolved)
         for ci in 0..components.len() as i32:
             let _ = self.ensure_debug_formatter(components[ci], node)
         entry
+
+    // The library method a synthesized formatter calls besides the element
+    // formatters (a box's as_ref, a set's debug_form_of), specialized for
+    // the concrete owner.
+    mut fn debug_fmt_bind_aux(entry: i32, resolved: i32, method: &str, node: i32):
+        let method_fn = self.debug_fmt_method_fn(resolved, method)
+        let sig = self.debug_fmt_method_sig(resolved, method_fn, method, node)
+        if sig >= 0:
+            self.debug_fmt_aux_fns[entry] = method_fn
+            self.debug_fmt_aux_sigs[entry] = sig
+            self.debug_fmt_aux_monos[entry] = self.sig_names[sig]
+
+    // §15.4.7 (#1564): `Box[T]`, `Rc[T]` and `Arc[T]` format the value they
+    // hold, never their handle (a raw address).
+    fn debug_fmt_transparent_owner(resolved: i32) -> bool:
+        if self.get_type_kind(resolved as TypeId) != TypeKind.TY_GENERIC_INST:
+            return false
+        let base = self.get_generic_inst_base(resolved)
+        base == self.syms.box or self.type_symbol_is_std_rc_owner(base) != 0
 
     // The declared template of a generic inst, by registration truth — a
     // formatter is registered in whatever module formats the value (a std
@@ -8423,7 +8458,7 @@ impl Sema:
             out.push(self.get_type_d0(resolved as TypeId))
             return out
         let base = if kind == TypeKind.TY_GENERIC_INST: self.get_generic_inst_base(resolved) else: 0
-        if base != 0 and (base == self.syms.vec or base == self.syms.box):
+        if base != 0 and (base == self.syms.vec or base == self.syms.hashset or self.debug_fmt_transparent_owner(resolved)):
             out.push(self.get_generic_inst_arg(resolved, 0))
             return out
         let enum_base = self.debug_fmt_enum_base(resolved)
@@ -16748,6 +16783,17 @@ impl Sema:
         var expected_ret_ty = 0
         if expected_fn_tid != 0:
             expected_ret_ty = self.get_type_d2(expected_fn_tid)
+        // §12 (#1508): a closure's `-> T` is checked like a declared return
+        // type — the body must produce T — and T is the closure's result.
+        // A context that expects a closure returning another type is a
+        // mismatch: types_compatible takes any fn type for any other, so
+        // the closure would reach it returning the wrong representation.
+        let declared_ret_node = self.ast.closure_ret_type(node)
+        let declared_ret_ty = if declared_ret_node > 0: self.resolve_type_expr(declared_ret_node) as i32 else: 0
+        if declared_ret_ty != 0:
+            if expected_ret_ty != 0 and not self.types_identical(expected_ret_ty, declared_ret_ty):
+                self.emit_error(f"closure declares `-> {self.type_name(declared_ret_ty)}` where a closure returning `{self.type_name(expected_ret_ty)}` is expected (§12)", declared_ret_node)
+            expected_ret_ty = declared_ret_ty
         // An inferred closure body is a fresh value context. The expected
         // function type constrains its parameters, not its inferred return.
         // D43: a closure with no expected result inherits its tail's type.
@@ -16969,7 +17015,9 @@ impl Sema:
 
         // Use callee return type for partial application closures
         var closure_ret_ty = if body_ty != 0: body_ty as i32 else: self.ty_i32 as i32
-        if partial_sig >= 0:
+        if declared_ret_ty != 0:
+            closure_ret_ty = declared_ret_ty
+        else if partial_sig >= 0:
             closure_ret_ty = self.sig_return_type(partial_sig)
         else if expected_ret_ty != 0:
             closure_ret_ty = expected_ret_ty
@@ -19484,6 +19532,23 @@ impl Sema:
             let payload_count = self.type_extra[(pos + 1)]
             if v_name == variant_sym or v_name == bare_variant_sym:
                 return 1
+            pos = pos + 2 + payload_count
+        0
+
+    // The first variant of enum `enum_tid` that carries a payload, or 0 when
+    // every variant is a unit variant (§4.4a from_int, #1497).
+    fn enum_first_payload_variant(enum_tid: i32) -> i32:
+        let resolved = self.resolve_alias(enum_tid)
+        if self.get_type_kind(resolved) == TypeKind.TY_GENERIC_INST:
+            let base_tid = self.lookup_named_type_visible(self.get_generic_inst_base(resolved))
+            return if base_tid != 0: self.enum_first_payload_variant(base_tid) else: 0
+        if self.get_type_kind(resolved) != TypeKind.TY_ENUM:
+            return 0
+        var pos = self.get_type_d1(resolved)
+        for _ in 0..self.get_type_d2(resolved):
+            let payload_count = self.type_extra[(pos + 1)]
+            if payload_count > 0:
+                return self.type_extra[pos]
             pos = pos + 2 + payload_count
         0
 
@@ -24380,7 +24445,18 @@ impl Sema:
 
         if self.static_receiver_type_is_known(expr) != 0 and self.pool_resolve(field) == "from_int":
             let enum_resolved = self.resolve_alias(obj_type)
-            if self.disc_repr_types.contains(enum_resolved as i32):
+            // §4.4a (#1497): `from_int` exists only on an enum whose variants
+            // are all unit variants — no value of the enum exists for a
+            // payload variant's discriminant alone. It was the repr's Option
+            // (`Some(7)`) on a discriminant enum and "unknown method" on any
+            // other. A `from_int` the program declares is its own method.
+            let payload_variant = self.enum_first_payload_variant(enum_resolved as i32)
+            if payload_variant != 0:
+                let owner = self.method_owner_symbol_for_type(enum_resolved as i32)
+                if owner == 0 or self.lookup_method_fn(owner, field) == 0:
+                    self.emit_error(f"`{self.type_name(enum_resolved as i32)}.from_int` does not exist: variant `{self.pool_resolve(payload_variant)}` carries a payload, and `from_int` exists only on an enum whose variants are all unit variants (§4.4a)", node)
+                    return 0
+            else if self.disc_repr_types.contains(enum_resolved as i32):
                 if arg_count != 1:
                     self.emit_error("from_int() expects exactly one argument", node)
                     return 0
@@ -24391,14 +24467,9 @@ impl Sema:
                         return 0
                 // §4.4a: `Type.from_int(n)` is an `Option[Type]` —
                 // `Color.from_int(2)` is `Some(Color.Green)` (#1453: it was
-                // typed the repr's Option). An enum with payload variants has
-                // no value to give a payload variant's discriminant; it keeps
-                // the repr (#1497 asks what it should be).
-                let repr_ty = self.enum_repr_type(enum_resolved as i32)
+                // typed the repr's Option).
                 let opt_args: Vec[i32] = Vec.new()
-                let repr_or_i32 = if repr_ty != 0: repr_ty else: self.ty_i32 as i32
-                let opt_inner = if self.disc_has_payload.contains(enum_resolved as i32): repr_or_i32 else: enum_resolved as i32
-                opt_args.push(opt_inner)
+                opt_args.push(enum_resolved as i32)
                 let opt_ty = self.ensure_generic_inst_type(self.syms.option, opt_args, 1) as i32
                 self.typed_expr_types.insert(node, opt_ty)
                 return opt_ty
