@@ -1032,6 +1032,27 @@ impl Sema:
             self.reject_owned_demand_from_view_projection(arg_node, expected, "call argument")
             let _ = self.record_contextual_copy_adjustment(arg_node, expected, actual)
 
+    // #1627 (§3.8, D22): an enum payload is a demand like a parameter. A
+    // place against a `&T` payload (`Some(ctx)` for `Option[&Ctx]`) is
+    // auto-referenced — the constructor observes it and the caller's binding
+    // stays valid; Option is transparent to the view's origin. A temporary
+    // (`Some(Ctx { .. })`) is borrowed as a `&T` call argument is: MIR
+    // materializes it and it drops at the end of the statement. The
+    // userdata constructor of a nullable facade callback (`ctor_node`,
+    // facade_prepare_callback_call) is checked with no expected type — its
+    // `U` comes from this payload — and its parameter is `Option[&U]`, so an
+    // owned payload there is borrowed too (#1618).
+    mut fn payload_arg_auto_refs(expected: i32, actual: i32, arg_node: i32, ctor_node: i32) -> bool:
+        if arg_node <= 0 or self.ast.kind(arg_node) == NodeKind.NK_MOVE_ARG:
+            return false
+        let actual_kind = if actual != 0: self.get_type_kind(self.resolve_alias(actual as TypeId)) else: 0
+        let userdata = ctor_node != 0 and ctor_node == self.facade_userdata_ctor and actual != 0 and actual_kind != TypeKind.TY_REF and actual_kind != TypeKind.TY_PTR
+        if not userdata and self.can_auto_ref_arg(expected, actual) == 0:
+            return false
+        self.check_borrow_create(arg_node, BorrowKind.SHARED, arg_node)
+        self.auto_ref_payload_args.insert(arg_node, 1)
+        true
+
     mut fn check_builtin_method_call_arg(call_name: &str, arg_index: i32, expected: i32, actual: i32, arg_node: i32) -> i32:
         if expected == 0 or actual == 0:
             return 1
@@ -6899,6 +6920,12 @@ impl Sema:
             return self.ty_never
 
         if kind == NodeKind.NK_FIELD_ACCESS:
+            // D70: a namespace access becomes the declaration's ident.
+            let ns = self.rewrite_namespace_access(node, false)
+            if ns < 0:
+                return 0 as TypeId
+            if ns > 0:
+                return self.check_ident(self.ast.get_data0(node), node) as TypeId
             let result = self.check_field_access(node) as TypeId
             if result != 0:
                 self.typed_expr_types.insert(node, result as i32)
@@ -10761,6 +10788,10 @@ impl Sema:
         // materialized result stops carrying the source view.
         if self.has_contextual_copy_adjustment(node) != 0:
             return out
+        // #1627: an auto-referenced payload is `&place`: the place's storage
+        // root is an origin, with every origin reachable through it.
+        if self.auto_ref_payload_args.contains(node):
+            out = self.push_unique_i32(move out, self.ref_storage_root_sym(node))
         let kind = self.ast.kind(node)
         if kind == NodeKind.NK_IDENT:
             let sym = self.ast.get_data0(node)
@@ -15845,10 +15876,17 @@ impl Sema:
             let arg_node = self.ast.get_extra(args_start + ai)
             if arg_node == 0:
                 continue
+            // #1627: the payload demand decides, as for `Some(x)` and
+            // `Option[T].Some(x)`: a `&T` payload borrows a place, any other
+            // consumes it (#764 — `.Some(ctx)` into `Option[Ctx]` left `ctx`
+            // live over its moved-out bytes).
             if ai < payloads.len() as i32 and payloads[ai] != 0:
-                let _ = self.check_expr_with_expected(arg_node, payloads[ai] as TypeId)
+                let arg_ty = self.check_expr_with_expected(arg_node, payloads[ai] as TypeId)
+                if not self.payload_arg_auto_refs(payloads[ai], arg_ty as i32, arg_node, node):
+                    self.mark_moved_if_consumed(arg_node)
             else:
                 let _ = self.check_expr_value_context(arg_node)
+                self.mark_moved_if_consumed(arg_node)
 
     fn expected_variant_constructor_type(variant_name: i32) -> i32:
         if self.has_expected_type == 0 or self.expected_expr_type == 0:
@@ -18050,6 +18088,178 @@ impl Sema:
         self.typed_expr_types.insert(node, ret)
         ret
 
+    // D70 (§18.2): every import is also a namespace, so a name a later import
+    // shadows stays reachable. `ns.member` — `ns` an import's namespace (its
+    // `as` name, a module's last path segment, a header's file name without
+    // `.h`) or a module's full dotted path — names the member that import
+    // provides. Sema resolves it here and rewrites the node into that
+    // declaration's ident (Ast.bind_namespace_ident), so MIR, comptime and
+    // codegen read Sema's choice (D65), never a re-resolved short name. A
+    // namespace name is an import's (tier 3): a binding, a type or a fn that
+    // the name already reaches keeps it. Returns 1 when rewritten, 0 when the
+    // node is no namespace access, -1 when an error was reported. A callee
+    // (`is_callee`) the import does not declare stays a qualified extension
+    // call (`slug.tag(t)`, check_qualified_extension_call).
+    mut fn rewrite_namespace_access(node: i32, is_callee: bool) -> i32:
+        if self.current_module_path.len() == 0 or self.ast.kind(node) != NodeKind.NK_FIELD_ACCESS:
+            return 0
+        let base = self.ast.get_data0(node)
+        let member = self.ast.get_data1(node)
+        let text = self.namespace_path_text(base)
+        if text.len() == 0:
+            return 0
+        let root = self.namespace_root_sym(base)
+        if self.scope_lookup(root) >= 0 and (self.scope_binding_is_local(root) or self.symbol_visible_from_current(root) != 0):
+            return 0
+        if self.primitive_type_by_sym(root) != 0 or self.lookup_named_type_visible(root) != 0 or self.get_visible_sig(root) >= 0 or self.generic_fn_node_for_symbol(root) != 0:
+            return 0
+        let cur_opt = self.module_index_by_path.get(with_str_clone_ref(self.current_module_path))
+        if not cur_opt.is_some():
+            return 0
+        let cur: i32 = cur_opt.unwrap()
+        let is_path = self.ast.kind(base) != NodeKind.NK_IDENT
+        var found = -1
+        var clash = -1
+        for ni in 0..self.ns_names.len() as i32:
+            if self.ns_modules[ni] != cur:
+                continue
+            let hit = if is_path: self.ns_fulls[ni] == text else: self.ns_names[ni] == text or self.ns_fulls[ni] == text
+            if not hit:
+                continue
+            if found < 0:
+                found = ni
+            else if self.ns_targets[ni] != self.ns_targets[found] or (self.ns_targets[ni] < 0 and self.ns_offsets[ni] != self.ns_offsets[found]):
+                clash = ni
+        if found < 0:
+            return 0
+        if clash >= 0:
+            let a = self.namespace_import_text(found)
+            let b = self.namespace_import_text(clash)
+            self.emit_error_with_help(f"'{text}' names two imports: {a} and {b}", base, f"give one of them another namespace with `as` — e.g. {self.namespace_as_example(clash, text)}")
+            return -1
+        let sym = self.namespace_member(found, member, node)
+        if sym < 0:
+            return -1
+        if sym == 0 and is_callee:
+            return 0
+        if sym == 0:
+            let member_name: str = with_str_clone_ref(self.pool_resolve(member))
+            self.emit_error(f"{self.namespace_import_text(found)} provides no '{member_name}' (through the namespace '{text}')", node)
+            return -1
+        self.ast.bind_namespace_ident(node as NodeId, sym)
+        1
+
+    // `a` or `a.b.c` when `node` is an identifier or a field-access chain of
+    // identifiers, else "".
+    fn namespace_path_text(node: i32) -> str:
+        let kind = self.ast.kind(node)
+        if kind == NodeKind.NK_IDENT:
+            return with_str_clone_ref(self.pool_resolve(self.ast.get_data0(node)))
+        if kind != NodeKind.NK_FIELD_ACCESS:
+            return ""
+        let head = self.namespace_path_text(self.ast.get_data0(node))
+        if head.len() == 0:
+            return ""
+        head ++ "." ++ self.pool_resolve(self.ast.get_data1(node))
+
+    fn namespace_root_sym(node: i32) -> i32:
+        var n = node
+        while self.ast.kind(n) == NodeKind.NK_FIELD_ACCESS:
+            n = self.ast.get_data0(n)
+        self.ast.get_data0(n)
+
+    // How a diagnostic names import `ni`: `use std.math` or a c_import.
+    fn namespace_import_text(ni: i32) -> str:
+        if self.ns_targets[ni] < 0:
+            return "`use c_import(...)` (namespace '" ++ self.ns_names[ni] ++ "')"
+        "`use " ++ self.ns_fulls[ni] ++ "`"
+
+    fn namespace_as_example(ni: i32, text: &str) -> str:
+        if self.ns_targets[ni] < 0:
+            return "`use c_import(...) as other_" ++ text ++ "`"
+        "`use " ++ self.ns_fulls[ni] ++ " as other_" ++ text ++ "`"
+
+    // The declaration `member` names in the import `ni` provides: its
+    // module's own declaration (flat or displaced, #1703), a type it
+    // declares, or — for a c_import — the value or fn that `use c_import`
+    // produced. 0 when there is none, -1 when an error was reported.
+    mut fn namespace_member(ni: i32, member: i32, node: i32) -> i32:
+        let target = self.ns_targets[ni]
+        let member_name: str = with_str_clone_ref(self.pool_resolve(member))
+        if target < 0:
+            return self.namespace_c_import_member(self.ns_offsets[ni], member)
+        let path: str = with_str_clone_ref(self.module_paths[target])
+        var i = if self.decl_visibility_index.contains(member): self.decl_visibility_index.get(member).unwrap() else: -1
+        while i >= 0:
+            if self.decl_visibility_paths[i] == path:
+                if self.decl_visible_from_current(path, self.decl_visibility_pub[i]) == 0:
+                    self.emit_error(f"'{member_name}' is private to module '{path}'", node)
+                    return -1
+                let decl = self.decl_visibility_nodes[i]
+                // A type keeps its short name (types are not displaced): the
+                // rewritten ident reaches the target's type only when that is
+                // the one the name resolves to here. Otherwise fail loudly
+                // rather than bind another module's type (#1757).
+                if decl != 0 and self.ast.kind(decl) == NodeKind.NK_TYPE_DECL and self.lookup_named_type_visible(member) != self.named_type_candidate_tid_in(member, path):
+                    self.emit_error(f"'{self.ns_names[ni]}.{member_name}' names module '{path}'s type, but '{member_name}' here resolves to another declaration; a namespaced type that another visible declaration shadows is not reachable yet (D70)", node)
+                    return -1
+                return member
+            i = self.decl_visibility_prev[i]
+        i = if self.displaced_fn_index.contains(member): self.displaced_fn_index.get(member).unwrap() else: -1
+        while i >= 0:
+            if self.displaced_fn_paths[i] == path:
+                if self.decl_visible_from_current(path, self.displaced_fn_pub[i]) == 0:
+                    self.emit_error(f"'{member_name}' is private to module '{path}'", node)
+                    return -1
+                return self.displaced_fn_syms[i]
+            i = self.displaced_fn_prev[i]
+        // std.math's transcendental functions are compiler builtins that
+        // std.math documents and does not declare (§17.6a): `math.sqrt(x)`
+        // is the builtin, unless a visible non-extern fn of that name would
+        // make the rewritten short name mean something else (a builtin
+        // outranks an extern of its name, check_call).
+        if self.module_path_is_std_math(path) and math_fn_lookup(member_name) >= 0:
+            if (self.get_visible_sig(member) >= 0 and not self.extern_fn_names.contains(member)) or self.displaced_fn_index.contains(member):
+                self.emit_error(f"'math.{member_name}' is the builtin, but '{member_name}' also names a declaration here; call the builtin as `x.{member_name}()`", node)
+                return -1
+            return member
+        0
+
+    // The type `sym` names in the module at `path`, 0 when it declares none.
+    fn named_type_candidate_tid_in(sym: i32, path: &str) -> i32:
+        var i = self.named_type_candidate_head(sym)
+        while i >= 0:
+            if self.named_type_candidate_paths[i] == path:
+                return self.named_type_candidate_tids[i]
+            i = self.named_type_candidate_next[i]
+        0
+
+    // A c_import's `member`: a declaration that `use c_import` at `offset`
+    // of the current module produced (Zcu records it in decl_is_c_import).
+    fn namespace_c_import_member(offset: i32, member: i32) -> i32:
+        if self.namespace_c_import_decl_at(member, offset):
+            return member
+        var i = if self.displaced_fn_index.contains(member): self.displaced_fn_index.get(member).unwrap() else: -1
+        while i >= 0:
+            let dsym = self.displaced_fn_syms[i]
+            if self.namespace_c_import_decl_at(dsym, offset):
+                return dsym
+            i = self.displaced_fn_prev[i]
+        0
+
+    fn namespace_c_import_decl_at(sym: i32, offset: i32) -> bool:
+        if not self.ci_syms.contains(sym):
+            return false
+        var i = if self.decl_visibility_index.contains(sym): self.decl_visibility_index.get(sym).unwrap() else: -1
+        while i >= 0:
+            let decl = self.decl_visibility_nodes[i]
+            if self.decl_visibility_paths[i] == self.current_module_path and decl != 0:
+                let di = self.find_decl_index(decl)
+                if di >= 0 and di < self.decl_is_c_import.len() as i32 and self.decl_is_c_import[di] == offset + 1:
+                    return true
+            i = self.decl_visibility_prev[i]
+        false
+
     mut fn check_qualified_extension_call(recv_expr: i32, method_sym: i32, extra_start: i32, arg_count: i32, node: i32) -> i32:
         if recv_expr == 0 or self.ast.kind(recv_expr) != NodeKind.NK_IDENT:
             return -1
@@ -18119,6 +18329,11 @@ impl Sema:
         let callee = self.ast.get_data0(node)
         let extra_start = self.ast.get_data1(node)
         let arg_count = self.ast.get_data2(node)
+        // D70: `math.sqrt(x)` / `raylib.DrawText(...)` call the member the
+        // import namespace names — resolved before the callee is read as a
+        // method or a qualified extension call.
+        if self.rewrite_namespace_access(callee, true) < 0:
+            return 0
 
         // sizeof[T]() / alignof[T]() / transmute[T]() / nameof[T]() builtins
         if self.is_sizeof_or_alignof(callee) != 0:
@@ -18639,6 +18854,8 @@ impl Sema:
                     if ucm_ptype != 0 and self.ast.kind(ucm_ptype) == NodeKind.NK_TYPE_REF:
                         continue
                 let arg_node = if has_resolved != 0: self.get_resolved_call_arg(node, ai) else: self.ast.get_extra(resolved_extra_start + ai)
+                if ai < variant_payload_tys.len() as i32 and self.payload_arg_auto_refs(variant_payload_tys[ai], arg_types[ai], arg_node, node):
+                    continue
                 if arg_node > 0:
                     self.mark_moved_if_consumed(arg_node)
 
@@ -23760,7 +23977,7 @@ impl Sema:
             // argument is consumed exactly like a container store below
             // (#714 rule). Without the mark a second use compiled clean and
             // read the move-blanked slot at runtime (Bad() printed empty).
-            if mc_is_static_enum_variant and ai < mc_static_variant_payload_tys.len() as i32:
+            if mc_is_static_enum_variant and ai < mc_static_variant_payload_tys.len() as i32 and not self.payload_arg_auto_refs(mc_static_variant_payload_tys[ai], mc_arg_ty as i32, mc_arg_node, node):
                 let ctor_arg_kind = self.ast.kind(mc_arg_node)
                 if ctor_arg_kind != NodeKind.NK_MOVE_ARG and ctor_arg_kind != NodeKind.NK_COPY_ARG and self.is_copy(mc_arg_ty as TypeId) == 0:
                     let ctor_root = self.place_root_sym(mc_arg_node)

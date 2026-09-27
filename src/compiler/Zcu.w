@@ -60,7 +60,7 @@ pub type Zcu {
     prelude_prefix_non_use: i32,
     decl_source_paths: Vec[str],
     decl_source_file_ids: Vec[i32],
-    decl_is_c_import: Vec[i32],
+    decl_is_c_import: Vec[i32],   // 0, or 1 + the offset of the importing `use c_import` (Sema.decl_is_c_import)
     c_import_omitted_symbols: HashMap[str, str],
     c_import_cache_keys: Vec[str],
     c_import_cache_values: Vec[str],
@@ -489,6 +489,9 @@ impl Zcu:
                 index_in_module: imp.index_in_module,
                 kind: imp.kind,
                 path_text: zcu_owned_text(imp.path_text),
+                selected: zcu_owned_text(imp.selected),
+                namespace: zcu_owned_text(imp.namespace),
+                module_text: zcu_owned_text(imp.module_text),
                 target_module: imp.target_module,
                 span_start: imp.span_start,
                 span_end: imp.span_end,

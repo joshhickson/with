@@ -285,6 +285,13 @@ impl Sema:
         self.module_import_counts = sema_new_vec_i32()
         self.module_import_targets = sema_new_vec_i32()
         self.module_import_paths = sema_new_vec_str()
+        self.module_import_selected = sema_new_vec_str()
+        self.module_import_offsets = sema_new_vec_i32()
+        self.ns_modules = sema_new_vec_i32()
+        self.ns_names = sema_new_vec_str()
+        self.ns_fulls = sema_new_vec_str()
+        self.ns_targets = sema_new_vec_i32()
+        self.ns_offsets = sema_new_vec_i32()
         self.module_index_by_path = HashMap.new()
         self.global_visible_module_paths = HashMap.new()
         self.module_visibility_cache = HashMap.new()
@@ -297,9 +304,17 @@ impl Sema:
             var visible_count = 0
             for ii in 0..mod.import_count:
                 let imp = resolved.imports[(mod.import_start + ii)]
+                if imp.namespace.len() > 0 and (imp.target_module >= 0 or imp.module_text.len() == 0):
+                    self.ns_modules.push(mi)
+                    self.ns_names.push(frontend_owned_text(imp.namespace))
+                    self.ns_fulls.push(frontend_owned_text(imp.module_text))
+                    self.ns_targets.push(imp.target_module)
+                    self.ns_offsets.push(imp.span_start)
                 if imp.target_module >= 0:
                     self.module_import_targets.push(imp.target_module)
                     self.module_import_paths.push(frontend_owned_text(imp.path_text))
+                    self.module_import_selected.push(frontend_owned_text(imp.selected))
+                    self.module_import_offsets.push(imp.span_start)
                     visible_count = visible_count + 1
             self.module_import_counts.push(visible_count)
             self.module_index_by_path.insert(frontend_owned_text(mod.path), mod.module_id)
@@ -516,7 +531,10 @@ impl Zcu:
                     ordered.push(dnode as i32)
                     ordered_paths.push(frontend_owned_text(ci_owner_path))
                     ordered_file_ids.push(ci_owner_file_id)
-                    ordered_ci.push(1)  // c_import origin
+                    // c_import origin, carrying where the importing `use c_import`
+                    // sits in its module: §18.2 orders explicit imports by
+                    // position (Sema.import_position_of, #1221).
+                    ordered_ci.push(out.get_start(decl) + 1)
                 di = di + 1
 
             // A requested symbol that was never produced (omitted, untranslated, or
@@ -1912,6 +1930,7 @@ impl Zcu:
         pool = self.inject_toolchain_facades_frontend(pool)
         pool = self.apply_convention_profiles_frontend(pool)
         pool = self.render_c_facades_frontend(pool)
+        self.displace_colliding_globals(pool)
         if do_profile:
             let cimport_ns = runtime_clock_nanos() - t_cimport
             runtime_eprint(f"[profile] frontend.c_import  {cimport_ns / 1000000}.{(cimport_ns % 1000000) / 1000} ms")
@@ -2261,6 +2280,36 @@ impl Zcu:
                 continue
             if taken.get(name).unwrap() != path and not frontend_fn_decl_is_c_export(pool, self.pool, decl):
                 frontend_displace_fn_decl(pool, self.pool, decl, path)
+
+    // #1703 (§18.2, §18.3): a module's top-level values are its own, as its
+    // fns are (#1350). When another owner's declaration already holds a
+    // value's name — std.re's `pub let PACKAGE` beside a program's `const
+    // PACKAGE`, a header's `PI` beside std.math's — this one is displaced to
+    // its module-qualified identity (frontend_displace_fn_decl) instead of
+    // colliding in the flat global table, and Sema binds each reference by
+    // §18.2 precedence (Sema.resolve_displaced_global_ident). The root
+    // module's own declarations keep their names, then the others in
+    // declaration order. A c_import's values are its importer's import, not
+    // its declarations, so they are an owner of their own. A same-owner
+    // duplicate keeps one name (Sema's "shadowing is not allowed"), and
+    // interface storage keeps its own table (D39).
+    fn displace_colliding_globals(pool: AstPool):
+        let taken: HashMap[i32, str] = HashMap.new()
+        for pass in 0..2:
+            for di in 0..pool.decl_count():
+                let decl = pool.get_decl(di) as i32
+                if pool.kind(decl) != NodeKind.NK_LET_DECL or pool.let_decl_is_interface_provided(decl as NodeId):
+                    continue
+                let from_c_import = di < self.decl_is_c_import.len() as i32 and self.decl_is_c_import[di] != 0
+                let path = self.decl_source_path_frontend(di)
+                if (pass == 0) != (not from_c_import and path == self.current_source_path):
+                    continue
+                let owner = if from_c_import: path ++ "/c_import" else: path.clone()
+                let name = pool.get_data0(decl)
+                if not taken.contains(name):
+                    taken.insert(name, frontend_owned_text(owner))
+                else if taken.get(name).unwrap() != owner:
+                    frontend_displace_fn_decl(pool, self.pool, decl, owner)
 
     mut fn parse_interface_chunk(pool: AstPool, path: &str, chunk: &str) -> AstPool:
         var out = pool
@@ -2747,7 +2796,7 @@ fn frontend_fn_decl_is_c_export(pool: AstPool, intern: InternPool, decl: i32) ->
     // The tp_start slot of a non-generic fn carries its callconv.
     meta >= 0 and pool.fn_meta_tp_count(meta) == 0 and pool.fn_meta_tp_start(meta) != 0 and intern.resolve(pool.fn_meta_tp_start(meta)).starts_with("c_export:")
 
-// A displaced fn's identity: its name qualified by its module's canonical
+// A displaced fn's (or, #1703, module value's) identity: its name qualified by its module's canonical
 // path (checkout-independent, D38), spelled with `$` so no source name can
 // collide with it. Sema recognizes the `$in$` infix, keeps the short name for
 // diagnostics, and resolves each module's references

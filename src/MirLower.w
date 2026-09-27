@@ -11506,6 +11506,23 @@ impl MirBuilder:
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, temp_place, rv, self.ast.get_start(node))
         self.body.new_operand(OperandKind.OK_COPY, temp_place)
 
+    // #1627 (D65): the call-form (`Some(x)`) and static (`Option[&T].Some(x)`)
+    // constructors borrow a payload exactly where Sema decided it borrows
+    // (payload_arg_auto_refs records the node); every other payload lowers
+    // as it did. MIR re-derives no other adjustment here: running the
+    // type-driven call-argument chain on every payload reached
+    // lower_auto_deref_call_arg's frozen trait query for generic
+    // specializations Sema never preregistered (std.result's ContextError:
+    // "type_implements_trait_frozen generic blanket path needs preregistered
+    // answer").
+    mut fn lower_constructor_payload_arg(arg_node: i32, payload_ty: i32) -> i32:
+        if payload_ty != 0 and self.sema.auto_ref_payload_args.contains(arg_node):
+            let by_ref = self.lower_auto_ref_call_arg(arg_node, payload_ty)
+            if by_ref < 0:
+                sema_phase_bug(f"BUG: Sema borrows payload node {arg_node} against ty={payload_ty}, but MIR finds no auto-reference (#1627)")
+            return by_ref
+        self.lower_expr(arg_node)
+
     mut fn lower_auto_ref_call_arg(arg_node: i32, expected_ty: i32) -> i32:
         if arg_node == 0 or expected_ty == 0:
             return -1
@@ -11916,11 +11933,13 @@ impl MirBuilder:
         for i in 0..count:
             let arg_node = if has_resolved != 0: self.sema.get_resolved_call_arg(node, i) else: self.ast.get_extra(arg_start + i)
             let saved_expected = self.expected_type
-            if i < payload_tys.len():
-                let payload_ty = payload_tys[i]
-                if payload_ty != 0:
-                    self.expected_type = payload_ty
-            fields.push(if arg_node == 0: self.unit_operand() else: self.lower_expr(arg_node))
+            let payload_ty = if i < payload_tys.len(): payload_tys[i] else: 0
+            if payload_ty != 0:
+                self.expected_type = payload_ty
+            // #1627: `Option[&Ctx].Some(ctx)` borrows `ctx` as `.Some(ctx)`
+            // and `Some(ctx)` do — the plain lowering moved it into a `&Ctx`
+            // payload slot and blanked it.
+            fields.push(if arg_node == 0: self.unit_operand() else: self.lower_constructor_payload_arg(arg_node, payload_ty))
             self.expected_type = saved_expected
             names.push(0)
         let fid = self.body.new_agg_fields(fields, names)
@@ -15688,7 +15707,7 @@ impl MirBuilder:
                             vc_payload_ty = vc_payload_tys[vci]
                             if vc_payload_ty != 0:
                                 self.expected_type = vc_payload_ty
-                        let vc_arg_op = if vc_arg == 0: self.unit_operand() else: self.lower_expr(vc_arg)
+                        let vc_arg_op = if vc_arg == 0: self.unit_operand() else: self.lower_constructor_payload_arg(vc_arg, vc_payload_ty)
                         vc_fields.push(vc_arg_op)
                         self.expected_type = saved_expected
                         vc_names.push(0)
