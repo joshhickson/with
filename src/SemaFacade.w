@@ -32,6 +32,7 @@ impl Sema:
         self.verify_facade_resources()
         self.report_facade_layout_errors()
         self.verify_facade_assignments()
+        self.verify_facade_handle_ops()
         self.verify_facade_buffer_params()
         self.verify_facade_presentation()
         self.verify_facade_failed_state_items()
@@ -61,12 +62,40 @@ impl Sema:
             // visited (a rendered `<facade …>` file, whose lines it would
             // quote).
             self.update_decl_source_context(self.facade_resources[ri].decl)
+            if self.facade_resources[ri].handle != 0:
+                self.verify_facade_handle(ri)
+                continue
             if self.verify_facade_resource(ri) and self.facade_resources[ri].drop != 0 and not self.diags.has_errors() and self.verify_facade_generated_names(ri):
                 if not self.facade_resource_rendered(ri):
                     let rname: str = self.pool_resolve(self.facade_resources[ri].name)
                     self.emit_error(f"resource '{rname}' passed every facade check but no With type was rendered for it; the renderer cannot express this shape and did not say so — a compiler defect (§16.2b.3)", self.facade_resources[ri].node)
                 else:
                     self.verify_facade_constructors(ri)
+
+    // A callback-scope handle (§16.2b.9, ruling Amendment 1): "A foreign
+    // representation that exists only for a callback's invocation
+    // (`sqlite3_context`, `sqlite3_value`) is declared `handle Name wraps
+    // *mut T`. Nothing produces or destroys it, it has no `Drop`, and it is
+    // borrowed for the callback's scope and cannot outlive it." The
+    // representation is the pointer C passes: a pointer to a C record, never
+    // `void *` (every pointer converts to it) or text. The rendering
+    // (FacadeRender.w facade_render_handle) is an ephemeral struct over it,
+    // so the ordinary ephemeral analysis keeps it inside the callback; its
+    // operations are the lends stated `of` it (verify_facade_handle_ops).
+    mut fn verify_facade_handle(ri: i32):
+        let hname: str = self.pool_resolve(self.facade_resources[ri].name)
+        let node = self.facade_resources[ri].node
+        let repr = self.resolve_alias(self.facade_resources[ri].repr_tid as TypeId)
+        let pointee = if self.get_type_kind(repr) == TypeKind.TY_PTR: self.resolve_alias(self.get_type_d0(repr) as TypeId) else: 0 as TypeId
+        let record = pointee != 0 and not self.facade_type_is_void_ptr(repr as i32) and not self.facade_type_is_c_string_ptr(repr as i32) and (self.get_type_kind(pointee) == TypeKind.TY_STRUCT or self.is_opaque_value_type(pointee) != 0)
+        if not record:
+            let rt: str = self.type_name(self.facade_resources[ri].repr_tid)
+            self.emit_error(f"handle '{hname}' wraps {rt}; a callback-scope handle wraps the pointer to a C record that C passes a callback (`*mut sqlite3_context`) — not `void *`, which every pointer converts to, nor text or a value (§16.2b.9)", node)
+            return
+        if self.diags.has_errors() or not self.verify_facade_generated_names(ri):
+            return
+        if not self.facade_resource_rendered(ri):
+            self.emit_error(f"handle '{hname}' passed every facade check but no With type was rendered for it; the renderer cannot express this shape and did not say so — a compiler defect (§16.2b.9)", node)
 
     mut fn verify_facade_resource(ri: i32) -> bool:
         let rname: str = self.pool_resolve(self.facade_resources[ri].name)
@@ -135,7 +164,7 @@ impl Sema:
             if slot >= 0 and self.facade_op_raw_beyond(p, slot, false):
                 self.emit_error(f"resource '{rname}': producer '{pn}' is still a raw call after the facade covers its out parameter (a variadic, a raw status return, or a raw pointer parameter the facade does not describe); describe it with an fn item (§16.2b.5)", node)
                 return false
-        if self.facade_resources[ri].ok_const != 0 and init_fn == 0 and not self.verify_facade_ok_producers(ri):
+        if self.facade_resources[ri].ok_consts.len() > 0 and init_fn == 0 and not self.verify_facade_ok_producers(ri):
             return false
         if init_fn != 0 and not self.verify_facade_init(ri):
             return false
@@ -152,7 +181,7 @@ impl Sema:
     mut fn verify_facade_ok_producers(ri: i32) -> bool:
         let rname: str = self.pool_resolve(self.facade_resources[ri].name)
         let node = self.facade_resources[ri].node
-        let cn: str = self.pool_resolve(self.facade_resources[ri].ok_const)
+        let cn = self.facade_ok_text(ri)
         var statuses = 0
         var shapes = ""
         var first = 0
@@ -197,7 +226,7 @@ impl Sema:
     // and whether that error can hold a failed-state resource `Failed<R>` (an
     // out-parameter producer: failure may still produce, ruling §18).
     fn facade_projects_status(ri: i32) -> bool:
-        if self.facade_resources[ri].ok_const == 0:
+        if self.facade_resources[ri].ok_consts.len() == 0:
             return false
         let init_fn = self.facade_resources[ri].init
         if init_fn != 0:
@@ -211,7 +240,7 @@ impl Sema:
     fn facade_has_failed_state(ri: i32) -> bool:
         if self.facade_resource_dependent(ri):
             return false
-        if self.facade_resources[ri].ok_const == 0:
+        if self.facade_resources[ri].ok_consts.len() == 0:
             return false
         for pi in 0..self.facade_resources[ri].producers.len() as i32:
             if self.facade_resources[ri].out_params[pi] < 0:
@@ -224,8 +253,8 @@ impl Sema:
 
     // The resource whose failed state a type is (`FailedDatabase` of
     // `Database`), or -1: a failed-state resource admits only the operations
-    // the facade states are valid on the failure state, and there is no
-    // clause for that yet, so it admits none (method lookup names this).
+    // its facade marks `valid on failed` (§16.2b.4, ruling Amendment 1), and
+    // method lookup names the clause when it admits none.
     fn facade_failed_state_resource(type_name: &str) -> i32:
         for ri in 0..self.facade_resources.len() as i32:
             if self.facade_projects_status(ri) and self.facade_has_failed_state(ri):
@@ -246,9 +275,9 @@ impl Sema:
         var names: Vec[str] = Vec.new()
         var roles: Vec[str] = Vec.new()
         names.push(rname.clone())
-        roles.push("the resource type")
+        roles.push(if self.facade_resources[ri].handle != 0: "the handle type" else: "the resource type")
         if self.facade_projects_status(ri):
-            let cn: str = self.pool_resolve(self.facade_resources[ri].ok_const)
+            let cn = self.facade_ok_text(ri)
             names.push(facade_render_error_name(rname))
             roles.push(f"the error type of its 'ok {cn}' projection")
             if self.facade_has_failed_state(ri):
@@ -267,7 +296,8 @@ impl Sema:
             if other.len() > 0:
                 let n = names[ni]
                 let role = roles[ni]
-                self.emit_error(f"resource '{rname}' renders '{n}', {role}, and {other}; the compiler never picks between two types of one name — rename one (§16.2b.4)", self.facade_resources[ri].node)
+                let word = if self.facade_resources[ri].handle != 0: "handle" else: "resource"
+                self.emit_error(f"{word} '{rname}' renders '{n}', {role}, and {other}; the compiler never picks between two types of one name — rename one (§16.2b.4)", self.facade_resources[ri].node)
                 return false
         true
 
@@ -328,6 +358,49 @@ impl Sema:
             if self.source_text_file_ids[si] == file_id and si < self.source_text_names.len() as i32:
                 return with_str_clone_ref(self.source_text_names[si])
         ""
+
+    // The `<facade NAME>` file a struct type was rendered into, or "" when no
+    // facade rendered it.
+    fn facade_rendered_file_of(tid: i32) -> str:
+        if tid <= 0:
+            return ""
+        let resolved = self.resolve_alias(tid as TypeId)
+        if self.get_type_kind(resolved) != TypeKind.TY_STRUCT or not self.type_decl_nodes_by_tid.contains(resolved as i32):
+            return ""
+        let file = self.facade_decl_file_name(self.find_decl_index(self.type_decl_nodes_by_tid.get(resolved as i32).unwrap()))
+        if file.starts_with("<facade "): file else: ""
+
+    // The display name of the file being checked.
+    fn facade_current_file_name() -> str:
+        for si in 0..self.source_text_file_ids.len() as i32:
+            if self.source_text_file_ids[si] == self.local_file_id and si < self.source_text_names.len() as i32:
+                return with_str_clone_ref(self.source_text_names[si])
+        ""
+
+    // A type a facade rendered — a resource, the failed state its error
+    // owns, a borrowed view, a callback-scope handle — holds foreign state
+    // only the rendering puts there: a producer's result, the handle C
+    // passes a callback (§16.2b.9: "Nothing produces or destroys it"), the
+    // resource a failed producer still produced. A literal of one, or a
+    // write to one of its fields, anywhere else would put a pointer the
+    // program chose under the safe surface — the lends, Drop and destroyers
+    // that call C with it — which the raw rules keep behind `unsafe`
+    // (§16.2b.3, §16.2b.5). Reading the representation stays raw access.
+    mut fn reject_facade_type_construction_if_needed(tid: i32, node: i32) -> bool:
+        let file = self.facade_rendered_file_of(tid)
+        if file.len() == 0 or self.facade_current_file_name() == file:
+            return false
+        let tname: str = self.type_name(tid)
+        self.emit_error_with_help(f"'{tname}' is a type the facade renders, and only its rendering makes one: its representation is foreign state a producer or C hands over, never a value the program chooses (§16.2b.3, §16.2b.9)", node, "obtain it from the facade — its constructor, or the callback C invokes; raw access is the representation under the raw C rules (`unsafe`)")
+        true
+
+    mut fn reject_facade_field_write_if_needed(recv_tid: i32, node: i32) -> bool:
+        let file = self.facade_rendered_file_of(recv_tid)
+        if file.len() == 0 or self.facade_current_file_name() == file:
+            return false
+        let tname: str = self.type_name(recv_tid)
+        self.emit_error(f"cannot assign a field of '{tname}', a type the facade renders: its fields are the foreign state its rendering keeps, and a write would put a value the program chose under its safe surface (§16.2b.3, §16.2b.9)", node)
+        true
 
     // `file:line:col` of a declaration, for a diagnostic that names a second
     // declaration beside the one it points at.
@@ -441,12 +514,12 @@ impl Sema:
         if self.facade_same_type(self.sig_param_type(isig, 0), repr as i32):
             self.emit_error(f"resource '{rname}': 'init {iname}' takes the representation by value, so it would initialize a copy; an in-place initializer takes a pointer to the storage (§16.2b.4)", node)
             return false
-        if self.facade_resources[ri].ok_const != 0 and self.get_type_kind(self.resolve_alias(self.sig_return_type(isig) as TypeId)) == TypeKind.TY_VOID:
-            let cn: str = self.pool_resolve(self.facade_resources[ri].ok_const)
+        if self.facade_resources[ri].ok_consts.len() > 0 and self.get_type_kind(self.resolve_alias(self.sig_return_type(isig) as TypeId)) == TypeKind.TY_VOID:
+            let cn = self.facade_ok_text(ri)
             self.emit_error(f"resource '{rname}': 'ok {cn}' names a status but 'init {iname}' returns nothing to compare it with (§16.2b.4)", node)
             return false
-        if self.facade_resources[ri].ok_const != 0 and self.get_type_kind(self.numeric_operand_type(self.sig_return_type(isig))) != TypeKind.TY_INT:
-            let cn: str = self.pool_resolve(self.facade_resources[ri].ok_const)
+        if self.facade_resources[ri].ok_consts.len() > 0 and self.get_type_kind(self.numeric_operand_type(self.sig_return_type(isig))) != TypeKind.TY_INT:
+            let cn = self.facade_ok_text(ri)
             let rt: str = self.type_name(self.sig_return_type(isig))
             self.emit_error(f"resource '{rname}': 'ok {cn}' compares an integer status, but 'init {iname}' returns {rt} (§16.2b.4)", node)
             return false
@@ -697,7 +770,7 @@ impl Sema:
         let repr_tid = self.resolve_type_expr(repr_node) as i32
         if repr_tid == 0:
             return
-        var r = FacadeResource { name, facade, node: item, decl, repr_tid, producers: Vec.new(), out_params: Vec.new(), init: 0, preinit: 0, drop: 0, destroyers: Vec.new(), ok_const: 0, borrows: Vec.new(), borrows_owner: Vec.new(), borrows_nodes: Vec.new(), last_producer: -2, independent: 0, independent_node: 0, movable: 0, thread_caps: 0, abandon: 0, abandon_node: 0 }
+        var r = FacadeResource { name, facade, node: item, decl, repr_tid, producers: Vec.new(), out_params: Vec.new(), init: 0, preinit: 0, drop: 0, destroyers: Vec.new(), ok_consts: Vec.new(), ok_node: 0, borrows: Vec.new(), borrows_owner: Vec.new(), borrows_nodes: Vec.new(), last_producer: -2, independent: 0, independent_node: 0, movable: 0, thread_caps: 0, abandon: 0, abandon_node: 0, handle: 0 }
         for ci in 0..clause_count:
             let clause = self.ast.get_extra(extra_start + 1 + ci)
             r = self.collect_resource_clause(rname, move r, clause)
@@ -781,12 +854,26 @@ impl Sema:
             else: r.destroyers.push(f)
             return r
         if kind == FACADE_CLAUSE_OK:
-            let c = self.ast.get_extra(ops)
-            if not self.facade_status_constant_ok(c):
-                let cn: str = self.pool_resolve(c)
-                self.emit_error(f"resource '{rname}': '{cn}' is not an imported compile-time constant (§16.2b.4, §16.2b.13)", clause)
+            // `ok C` or `ok C1, C2, …` (§16.2b.4, ruling Amendment 1): any
+            // listed constant is success. Every one is stated and verified
+            // (§16.2b.13); one success statement per resource.
+            if r.ok_node != 0:
+                self.emit_error(f"resource '{rname}': 'ok' is stated twice; list every success status in one clause: 'ok C1, C2' (§16.2b.4)", clause)
                 return r
-            r.ok_const = c
+            let listed: Vec[i32] = Vec.new()
+            for k in 0..self.ast.get_data2(clause):
+                let c = self.ast.get_extra(ops + k)
+                let cn: str = self.pool_resolve(c)
+                if not self.facade_status_constant_ok(c):
+                    self.emit_error(f"resource '{rname}': '{cn}' is not an imported compile-time constant (§16.2b.4, §16.2b.13)", clause)
+                    return r
+                for j in 0..listed.len() as i32:
+                    if listed[j] == c:
+                        self.emit_error(f"resource '{rname}': 'ok' lists '{cn}' twice (§16.2b.4)", clause)
+                        return r
+                listed.push(c)
+            r.ok_consts = listed
+            r.ok_node = clause
             return r
         if kind == FACADE_CLAUSE_BORROWS:
             // `borrows` names a parameter of the producer stated before it:
@@ -839,6 +926,11 @@ impl Sema:
                 return r
             r.abandon = f
             r.abandon_node = clause
+            return r
+        if kind == FACADE_CLAUSE_HANDLE:
+            // The parser's marker for `handle Name wraps *mut T` (§16.2b.9):
+            // verified in verify_facade_handle.
+            r.handle = 1
             return r
         if kind == FACADE_CLAUSE_THREAD:
             let cap_count = self.ast.get_data2(clause)
@@ -1399,6 +1491,12 @@ impl Sema:
             // verify_facade_buffers checks once every clause is collected.
             let const_sym = self.ast.get_extra(ops)
             let cn: str = self.pool_resolve(const_sym)
+            // Several success statuses are a producer's (§16.2b.4, ruling
+            // Amendment 1: "A producer's `ok` may list several"); the
+            // status contract of an fn item names one.
+            if self.ast.get_data2(clause) > 1:
+                self.emit_error(f"fn '{fname}': 'ok' lists several success statuses, which a producer's 'ok' on its resource may; an fn item's 'ok' — the status contract of a copied-back length or a variadic setter — names one (§16.2b.4)", clause)
+                return c
             if not self.facade_status_constant_ok(const_sym):
                 self.emit_error(f"fn '{fname}': 'ok {cn}' names no imported integer constant; a status is compared with a compile-time constant the header declares (§16.2b.4)", clause)
                 return c
@@ -1627,6 +1725,15 @@ impl Sema:
                 value = self.ast.get_data1(value)
             return value != 0 and self.ast.kind(value) == NodeKind.NK_INT_LIT
         false
+
+    // A resource's success statuses as its `ok` clause states them, for a
+    // diagnostic: `SQLITE_OK`, or `SQLITE_ROW, SQLITE_DONE`.
+    fn facade_ok_text(ri: i32) -> str:
+        var out = ""
+        for k in 0..self.facade_resources[ri].ok_consts.len() as i32:
+            let cn: str = self.pool_resolve(self.facade_resources[ri].ok_consts[k])
+            out = out ++ (if k > 0: ", " else: "") ++ cn
+        out
 
     // ── discriminated variadic contracts (D66, spec §16.2b.5) ──────────────
 
@@ -1996,6 +2103,8 @@ pub fn facade_clause_name(kind: i32) -> str:
     if kind == FACADE_CLAUSE_FIXED: return "param … fixed"
     if kind == FACADE_CLAUSE_VARIADIC: return "variadic param … selected by param …"
     if kind == FACADE_CLAUSE_VARIADIC_CASE: return "case"
+    if kind == FACADE_CLAUSE_ABANDON: return "abandon"
+    if kind == FACADE_CLAUSE_HANDLE: return "handle"
     "callback consumes"
 
 // ── stage 3: raw classification consults the facts ──────────────────────
@@ -2293,6 +2402,32 @@ impl Sema:
                 continue
             if recv.len() > 1:
                 self.emit_error_with_help(f"fn '{fname}': {shown} receives a representation several resources wrap ({names}); an operation is callable through a resource only after the facade assigns it, so '{fname}' is not presented on any of them (§16.2b.3)", node, f"state {ofs} on this fn item")
+
+    // An operation of a callback-scope handle is a lend of it (§16.2b.9,
+    // ruling Amendment 1: "Operations stated `of` the handle are its
+    // methods"). Nothing produces, destroys or consumes a handle, and it
+    // lives only for the callback's invocation, so it cannot retain anything
+    // past it or register a callback of its own: an item hosted on a handle
+    // that says so is refused, never rendered as something weaker.
+    mut fn verify_facade_handle_ops():
+        for ci in 0..self.foreign_contracts.len() as i32:
+            let fn_sym = self.foreign_contracts[ci].fn_sym
+            if self.get_sig(fn_sym) < 0 or self.facade_fn_is_resource_op(fn_sym):
+                continue
+            let host = self.facade_method_host(fn_sym)
+            if host.len() != 1 or self.facade_resources[host[0]].handle == 0:
+                continue
+            var what = ""
+            if self.foreign_contracts[ci].destroys != 0: what = "'destroys'"
+            else if self.foreign_contracts[ci].consumes.len() > 0: what = "'consumes'"
+            else if self.foreign_contracts[ci].retains.len() > 0: what = "'retains'"
+            else if self.facade_contract_is_callback_item(ci): what = "a callback contract"
+            if what.len() == 0:
+                continue
+            self.update_decl_source_context(self.foreign_contracts[ci].decl)
+            let fname: str = self.pool_resolve(fn_sym)
+            let hname: str = self.pool_resolve(self.facade_resources[host[0]].name)
+            self.emit_error(f"fn '{fname}' is an operation of the callback-scope handle '{hname}' and states {what}; nothing produces, destroys or consumes a handle, and it lives only for the callback's invocation, so its operations are lends of it (§16.2b.9)", self.foreign_contracts[ci].node)
 
     // Whether a resource clause names `fn_sym` (`from`, `init`, `preinit`,
     // `drop`, `destroys`): the clause assigns it.
@@ -2811,6 +2946,32 @@ impl Sema:
             return self.facade_dependent_resource_in(self.get_type_d0(r), depth + 1)
         -1
 
+    // The callback-scope handle a type is or carries (§16.2b.9), or -1.
+    fn facade_handle_in(tid: i32, depth: i32) -> i32:
+        if tid <= 0 or depth > 6 or self.facade_resources.len() == 0:
+            return -1
+        let r = self.resolve_alias(tid as TypeId)
+        let kind = self.get_type_kind(r)
+        let name = self.get_type_name(r)
+        if name != 0 and self.facade_resource_index.contains(name):
+            let ri: i32 = self.facade_resource_index.get(name).unwrap()
+            if self.facade_resources[ri].handle != 0:
+                return ri
+        if kind == TypeKind.TY_GENERIC_INST:
+            for ai in 0..self.get_generic_inst_arg_count(r as i32):
+                let found = self.facade_handle_in(self.get_generic_inst_arg(r as i32, ai), depth + 1)
+                if found >= 0:
+                    return found
+        else if kind == TypeKind.TY_TUPLE:
+            let te_start = self.get_type_d0(r)
+            for ei in 0..self.get_type_d1(r):
+                let found = self.facade_handle_in(self.type_extra[(te_start + ei)], depth + 1)
+                if found >= 0:
+                    return found
+        else if kind == TypeKind.TY_REF or kind == TypeKind.TY_ARRAY:
+            return self.facade_handle_in(self.get_type_d0(r), depth + 1)
+        -1
+
     // A facade `param` reference as written: `param 0`, `param db`,
     // `param type *mut sqlite3`.
     fn facade_param_ref_text(ref_node: i32, f: i32, pi: i32) -> str:
@@ -2928,6 +3089,15 @@ impl Sema:
     // a struct — the fix that compiles: hold each parent by borrow in an
     // ephemeral struct, so the struct lives no longer than the parents.
     mut fn emit_facade_layout_error(msg: &str, node: i32, tid: i32, container: i32):
+        // A callback-scope handle (§16.2b.9): "borrowed for the callback's
+        // scope and cannot outlive it" — the storage would.
+        let hi = self.facade_handle_in(tid, 0)
+        if hi >= 0:
+            let hname: str = self.pool_resolve(self.facade_resources[hi].name)
+            var hdiag = Diagnostic.err(f"{msg}: '{hname}' is a callback-scope handle, borrowed for the callback's invocation, and cannot outlive it (§16.2b.9)", Span { file: self.local_file_id, start: self.ast.get_start(node), end: self.ast.get_end(node) })
+            hdiag.add_help(f"use the '{hname}' inside the callback C passes it to; copy out what must outlive it (the values its operations return)")
+            self.diags.emit(move hdiag)
+            return
         let ri = self.facade_dependent_resource_in(tid, 0)
         if ri < 0:
             // Not a dependent resource after all (a facade that failed its
@@ -3637,9 +3807,12 @@ impl Sema:
     //
     // "A resource owned by an error admits raw access only, unless the
     // facade marks an operation as valid on the failure state." `valid on
-    // failed` is that mark (stage 12b, #1612): the operation is rendered on
-    // `Failed<R>` too (FacadeRender.w facade_render_error_type), under the
-    // name it has on `R`. What it may mark is a lend or a text view of a
+    // failed` is that mark (stage 12b, #1612; ruling Amendment 1: "An
+    // operation the C contract documents as valid on a failed resource is
+    // marked on its fn item with `valid on failed`, and is presented on the
+    // failed-state type as well"): the operation is rendered on `Failed<R>`
+    // too (FacadeRender.w facade_render_error_type), under the name it has
+    // on `R`. What it may mark is a lend, a text view or a record view of a
     // resource that has a failed state — an out-parameter producer under
     // `ok`, of a resource that depends on nothing (a dependent one's failure
     // is destroyed in the constructor). A destroying, consuming, retaining
@@ -3672,7 +3845,7 @@ impl Sema:
             let borrows_resource = borrow_res != 0 and self.pool_resolve(borrow_res) != "CStr"
             let stronger = self.foreign_contracts[ci].destroys != 0 or self.foreign_contracts[ci].consumes.len() > 0 or self.foreign_contracts[ci].retains.len() > 0 or self.foreign_contracts[ci].callback_userdata_cb.len() > 0 or self.foreign_contracts[ci].callback_thread_any != 0 or self.foreign_contracts[ci].callback_consumes.len() > 0
             if stronger or borrows_resource or self.facade_fn_is_resource_op(fn_sym):
-                self.emit_error(f"fn '{fname}': 'valid on failed' marks a lend or a text view of the failed '{rname}'; a failed state is destroyed by its error's Drop and owns nothing else, so a producing, destroying, consuming, retaining or callback operation, or one returning a borrowed resource, cannot be valid on it (§16.2b.4)", node)
+                self.emit_error(f"fn '{fname}': 'valid on failed' marks a lend, a text view or a record view of the failed '{rname}'; a failed state is destroyed by its error's Drop and owns nothing else, so a producing, destroying, consuming, retaining or callback operation, or one returning a borrowed resource, cannot be valid on it (§16.2b.4)", node)
                 continue
             if self.diags.has_errors():
                 continue

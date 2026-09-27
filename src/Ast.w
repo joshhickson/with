@@ -149,6 +149,7 @@ pub enum NodeKind: i32:
     // D51 modeled C, stage 1 (§16.2b): a `c facade name:` block and its items.
     // NK_C_FACADE:          d0=name(sym), d1=extra_start, d2=item_count; extra=[item(node)...]
     // NK_FACADE_RESOURCE:   d0=name(sym), d1=extra_start, d2=clause_count; extra=[wraps_type(node), clause(node)...]
+    //                       (a `handle Name wraps T` item is one whose only clause is FACADE_CLAUSE_HANDLE, §16.2b.9)
     // NK_FACADE_FN:         d0=name(sym), d1=extra_start, d2=clause_count; extra=[clause(node)...]
     // NK_FACADE_DOMAIN:     d0=name(sym), d1=kind(sym: process|thread|resource|static), d2=0
     // NK_FACADE_CONVENTION: d0=extra_start, d1=path_count, d2=match_count; extra=[path_sym..., match(node)...]
@@ -255,7 +256,7 @@ pub const FACADE_CLAUSE_INIT: i32 = 2              // [fn_sym]
 pub const FACADE_CLAUSE_PREINIT: i32 = 3           // [fn_sym]
 pub const FACADE_CLAUSE_DROP: i32 = 4              // [fn_sym]
 pub const FACADE_CLAUSE_DESTROYS: i32 = 5          // [fn_sym|0]   (a resource names one; an fn item is one)
-pub const FACADE_CLAUSE_OK: i32 = 6                // [const_sym]
+pub const FACADE_CLAUSE_OK: i32 = 6                // [const_sym...]  (several: any is success, §16.2b.4)
 pub const FACADE_CLAUSE_BORROWS: i32 = 7           // [param_ref]
 pub const FACADE_CLAUSE_INDEPENDENT: i32 = 8       // []
 pub const FACADE_CLAUSE_LEND: i32 = 9              // []
@@ -279,6 +280,7 @@ pub const FACADE_CLAUSE_VARIADIC: i32 = 26         // [vararg_ref, selector_ref,
 pub const FACADE_CLAUSE_VARIADIC_CASE: i32 = 27    // [selector_sym, type(node), callback_ref|0, userdata_selector_ref|0, retainer_ref|0]
 pub const FACADE_CLAUSE_CALLBACKS_NONE: i32 = 28  // [] trusted no-invocation guarantee (§16.2b.9)
 pub const FACADE_CLAUSE_ABANDON: i32 = 29          // [fn_sym] resource-only: the `callbacks none` operation run before the destroyer on a drop path not proven callback-free (§16.2b.9)
+pub const FACADE_CLAUSE_HANDLE: i32 = 30           // [] the parser's marker on the NK_FACADE_RESOURCE a `handle Name wraps *mut T` item makes: a callback-scope handle (§16.2b.9), never written as a clause
 pub const FACADE_PARAM_REF_NAME: i32 = 0
 pub const FACADE_PARAM_REF_INDEX: i32 = 1
 pub const FACADE_PARAM_REF_TYPE: i32 = 2
@@ -294,6 +296,14 @@ fn facade_clause_operand_count(kind: i32) -> i32:
     if kind == FACADE_CLAUSE_INIT or kind == FACADE_CLAUSE_PREINIT or kind == FACADE_CLAUSE_DROP or kind == FACADE_CLAUSE_DESTROYS: return 1
     if kind == FACADE_CLAUSE_LEND: return 0
     -1
+
+// Whether an NK_FACADE_RESOURCE item is a callback-scope handle (§16.2b.9).
+pub fn facade_item_is_handle(pool: AstPool, item: i32) -> bool:
+    if item <= 0 or pool.kind(item as NodeId) != NodeKind.NK_FACADE_RESOURCE: return false
+    let extra_start = pool.get_data1(item as NodeId)
+    for k in 0..pool.get_data2(item as NodeId):
+        if pool.get_data0(pool.get_extra(extra_start + 1 + k) as NodeId) == FACADE_CLAUSE_HANDLE: return true
+    false
 
 pub fn facade_clause_profile_rule(pool: AstPool, clause: i32) -> i32:
     if clause <= 0 or pool.kind(clause as NodeId) != NodeKind.NK_FACADE_CLAUSE: return 0
@@ -327,9 +337,28 @@ pub fn type_decl_is_packed(packed: i32) -> i32:
 pub fn type_decl_is_bitpacked(packed: i32) -> i32:
     (packed / TDK_FLAG_BITPACKED) % 2
 
-// @[repr(C)] layout. @[repr(packed)] implies repr(C) per §16.4.
+// @[repr(packed(N))] (§16.4): every field's alignment capped at N, a power
+// of two up to 65536, kept as log2(N) + 1 in the five bits above
+// TDK_FLAG_FLAGS (0: no cap).
+pub const TDK_PACK_UNIT: i32 = 1024
+
+pub fn type_decl_pack_bits(n: i32) -> i32:
+    var e = 1
+    var v = n
+    while v > 1:
+        v = v / 2
+        e = e + 1
+    e * TDK_PACK_UNIT
+
+// The N of @[repr(packed(N))], or 0.
+pub fn type_decl_pack_cap(packed: i32) -> i32:
+    let e = (packed / TDK_PACK_UNIT) % 32
+    if e == 0: 0 else: 1 << ((e - 1) as u32)
+
+// @[repr(C)] layout. @[repr(packed)] and @[repr(packed(N))] imply repr(C)
+// per §16.4.
 pub fn type_decl_is_repr_c(packed: i32) -> i32:
-    if (packed / TDK_FLAG_REPR_C) % 2 != 0:
+    if (packed / TDK_FLAG_REPR_C) % 2 != 0 or type_decl_pack_cap(packed) != 0:
         return 1
     type_decl_is_packed(packed)
 

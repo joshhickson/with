@@ -437,7 +437,8 @@ pub type FacadeResource {
     preinit: i32,
     drop: i32,
     destroyers: Vec[i32],
-    ok_const: i32,
+    ok_consts: Vec[i32],       // `ok C1, C2, …` (§16.2b.4): the success statuses as stated, any of them success; empty without `ok`
+    ok_node: i32,              // the `ok` clause (provenance, and a second one is refused), or 0
     borrows: Vec[i32],         // the parameter each `borrows` clause names
     borrows_owner: Vec[i32],   // parallel: the producer it names one of (a `from` index, or FACADE_DEP_INIT)
     borrows_nodes: Vec[i32],   // parallel: the clause (provenance, §16.2b.2)
@@ -448,6 +449,7 @@ pub type FacadeResource {
     thread_caps: i32,     // bit0 creator, bit1 send, bit2 share, bit3 drop_any_thread
     abandon: i32,         // `abandon <fn>` (§16.2b.9): the `callbacks none` operation run before the destroyer on a drop path not proven callback-free, or 0
     abandon_node: i32,
+    handle: i32,          // 1 for a callback-scope `handle Name wraps *mut T` (§16.2b.9): no producer, destroyer or Drop; borrowed for the callback's invocation
 }
 
 pub type ForeignContract {
@@ -800,6 +802,7 @@ pub type Sema {
     disc_has_payload: HashMap[i32, i32],
     bitpacked_types: HashMap[i32, i32],  // type_id → 1 if bitpacked
     packed_types: HashMap[i32, i32],     // type_id → 1 if repr(packed)/@[packed]
+    packed_caps: HashMap[i32, i32],      // type_id → N of @[repr(packed(N))] (§16.4)
     repr_c_types: HashMap[i32, i32],     // type_id → 1 if @[repr(C)] (or repr(packed))
     // §16.11: TY_FN/TY_EXTERN_FN type_id → 1 when the callable is unsafe to
     // call (carries a raw-pointer-validity precondition). Part of type identity.
@@ -2469,6 +2472,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         disc_has_payload,
         bitpacked_types: sema_new_map_i32_i32(),
         packed_types: sema_new_map_i32_i32(),
+        packed_caps: sema_new_map_i32_i32(),
         repr_c_types: sema_new_map_i32_i32(),
         unsafe_fn_type_set: sema_new_map_i32_i32(),
         union_last_written: sema_new_map_i32_i32(),
