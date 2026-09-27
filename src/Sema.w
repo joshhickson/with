@@ -918,6 +918,10 @@ pub type Sema {
     generator_fn_state_syms: HashMap[i32, i32],
     generator_fn_run_syms: HashMap[i32, i32],
     generator_fn_each_syms: HashMap[i32, i32],
+    // Gen fns whose generator value holds a view of the borrowed receiver
+    // (field 0 is &Self): the constructor stores its place, `each` passes
+    // that place to the producer.
+    generator_fn_receiver_views: HashMap[i32, i32],
     generator_mir_only_fns: HashMap[i32, i32],
     generator_state_yield_types: HashMap[i32, i32],
     // D69 (§13.4): `for x in g` over a Gen[T] runs its body as the `body`
@@ -1510,6 +1514,16 @@ pub type Sema {
     // for_view_binding_depths[i] is the loop_depth of that loop's body.
     for_view_binding_syms: Vec[i32],
     for_view_binding_depths: Vec[i32],
+    // D69 (#1734): 1 when the entry is a generator value's view held across
+    // a loop over it — the generator runs while the body runs, so no
+    // mutation of the viewed place in the body is harmless.
+    for_view_binding_gen_loops: Vec[i32],
+    // D69 (#1734): the places a generator call's view arguments name (the
+    // referent of `&x`, a view argument, a borrowed receiver), keyed by the
+    // call node: gen_call_view_place_nodes[start..start+count].
+    gen_call_view_place_starts: HashMap[i32, i32],
+    gen_call_view_place_counts: HashMap[i32, i32],
+    gen_call_view_place_nodes: Vec[i32],
     stmt_pos_depth: i32,
     current_statement_expr_root: i32,
     current_value_expr_root: i32,
@@ -2236,6 +2250,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
     let generator_fn_state_syms = sema_new_map_i32_i32()
     let generator_fn_run_syms = sema_new_map_i32_i32()
     let generator_fn_each_syms = sema_new_map_i32_i32()
+    let generator_fn_receiver_views = sema_new_map_i32_i32()
     let generator_mir_only_fns = sema_new_map_i32_i32()
     let generator_state_yield_types = sema_new_map_i32_i32()
     let gen_for_elem_types = sema_new_map_i32_i32()
@@ -2466,6 +2481,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         generator_fn_state_syms,
         generator_fn_run_syms,
         generator_fn_each_syms,
+        generator_fn_receiver_views,
         generator_mir_only_fns,
         generator_state_yield_types,
         gen_for_elem_types,
@@ -2816,6 +2832,10 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         loop_depth: 0,
         for_view_binding_syms: Vec.new(),
         for_view_binding_depths: Vec.new(),
+        for_view_binding_gen_loops: Vec.new(),
+        gen_call_view_place_starts: sema_new_map_i32_i32(),
+        gen_call_view_place_counts: sema_new_map_i32_i32(),
+        gen_call_view_place_nodes: Vec.new(),
         stmt_pos_depth: 0,
         current_statement_expr_root: 0,
         current_value_expr_root: 0,

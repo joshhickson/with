@@ -2197,6 +2197,7 @@ impl Sema:
         let saved_borrow_creation_nodes = move self.borrow_creation_nodes
         let saved_for_view_binding_syms = move self.for_view_binding_syms
         let saved_for_view_binding_depths = move self.for_view_binding_depths
+        let saved_for_view_binding_gen_loops = move self.for_view_binding_gen_loops
         self.borrow_kinds = Vec.new()
         self.borrow_places = Vec.new()
         self.borrow_fields = Vec.new()
@@ -2207,6 +2208,7 @@ impl Sema:
         self.borrow_creation_nodes = Vec.new()
         self.for_view_binding_syms = Vec.new()
         self.for_view_binding_depths = Vec.new()
+        self.for_view_binding_gen_loops = Vec.new()
 
         // Push function scope
         self.push_scope()
@@ -2320,11 +2322,12 @@ impl Sema:
         let saved_has_gen_yield_type = self.has_gen_yield_type
         let is_gen = (flags / FnFlags.GEN) % 2
         if is_gen == 1:
-            let yield_ty =
-                if self.generator_fn_yield_types.contains(fn_name):
-                    self.generator_fn_yield_types.get(fn_name).unwrap()
-                else:
-                    ret_type
+            // Keyed by the signature's symbol: a generic gen fn's
+            // specializations each have their own element type.
+            let gen_sym = self.sig_names[sig_idx]
+            if not self.generator_fn_yield_types.contains(gen_sym):
+                sema_phase_bug(f"BUG: gen fn body checked under a signature with no generator registered (sig {sig_idx})")
+            let yield_ty: i32 = self.generator_fn_yield_types.get(gen_sym).unwrap()
             self.current_return_type = self.ty_void
             self.current_gen_yield_type = yield_ty as TypeId
             self.has_gen_yield_type = 1
@@ -2618,6 +2621,7 @@ impl Sema:
         self.borrow_creation_nodes = saved_borrow_creation_nodes
         self.for_view_binding_syms = saved_for_view_binding_syms
         self.for_view_binding_depths = saved_for_view_binding_depths
+        self.for_view_binding_gen_loops = saved_for_view_binding_gen_loops
         self.local_file_id = saved_body_file_id
         self.current_module_path = saved_body_module_path
         self.current_module_has_ci = saved_body_module_has_ci
@@ -3943,7 +3947,11 @@ impl Sema:
             self.sig_params.push(p_tid as i32)
 
         let declared_ret_tid = if ret_type_node != 0: self.resolve_type_expr(ret_type_node) else: self.ty_void
-        let ret_tid = self.fn_signature_return_type(self.ast.fn_meta_flags(meta), declared_ret_tid)
+        // D69 (§13.4): each specialization of a generic gen fn has its own
+        // generator value, producer and `each`, keyed by its symbol.
+        let is_gen = (self.ast.fn_meta_flags(meta) / FnFlags.GEN) % 2 == 1
+        let sig_value_ty = if is_gen: self.register_generator(mono_sym, declared_ret_tid as i32, param_start, ps, param_count) as TypeId else: declared_ret_tid
+        let ret_tid = self.fn_signature_return_type(self.ast.fn_meta_flags(meta), sig_value_ty)
 
         var sig_idx = self.get_sig(mono_sym)
         if sig_idx < 0:
@@ -3995,6 +4003,8 @@ impl Sema:
                 with_eprint(f"[vra] mono={self.pool_resolve(mono_sym)} sig={sig_idx} param={abi_pi} vra={cfc_vra} owner={method_owner_sym} self_ty={self_type_id} kind={self.get_type_kind(self.resolve_alias(self_type_id as TypeId))}")
             if cfc_vra != 0:
                 self.set_sig_param_value_ref_abi(sig_idx, abi_pi, 1)
+        if is_gen and self.generator_borrows_receiver(param_start, param_count, ps):
+            self.set_sig_param_value_ref_abi(sig_idx, 0, 1)
 
         // Concrete generic validation must run in the callee's own lexical
         // environment, not inside the caller's active local scopes.
@@ -4557,6 +4567,24 @@ impl Sema:
         self.suspend_visiting.remove(fn_sym)
         result
 
+    // D69 (§13.4): a generator's body runs inside the loop that consumes it
+    // (`for x in g`, or a comprehension clause, keyed by `key_node`), so a
+    // generator whose body may suspend makes that loop so.
+    mut fn gen_loop_may_suspend(key_node: i32) -> bool:
+        if not self.gen_for_each_syms.contains(key_node):
+            return false
+        let each_fn: i32 = self.gen_for_each_syms.get(key_node).unwrap()
+        let producer: i32 = if self.generator_mir_only_fns.contains(each_fn): self.generator_mir_only_fns.get(each_fn).unwrap() else: each_fn
+        // A generic gen fn's specialization has no declaration of its own:
+        // its body is the generic declaration's.
+        if not self.concrete_specialization_by_sym.contains(producer) or self.suspend_visiting.contains(producer):
+            return self.fn_symbol_may_suspend(producer) != 0
+        let spec_idx: i32 = self.concrete_specialization_by_sym.get(producer).unwrap()
+        self.suspend_visiting.insert(producer, 1)
+        let result = self.expr_may_suspend(self.ast.get_data1(self.concrete_specialization_nodes[spec_idx])) != 0
+        self.suspend_visiting.remove(producer)
+        result
+
     mut fn expr_may_suspend(node: i32) -> i32:
         if node == 0:
             return 0
@@ -4662,13 +4690,8 @@ impl Sema:
         if kind == NodeKind.NK_FOR:
             if self.expr_may_suspend(self.ast.get_data1(node)) != 0:
                 return 1
-            // D69 (§13.4): a generator's body runs inside the loop, so a
-            // generator whose body may suspend makes its consuming loop so.
-            if self.gen_for_each_syms.contains(node):
-                let each_fn: i32 = self.gen_for_each_syms.get(node).unwrap()
-                let producer: i32 = if self.generator_mir_only_fns.contains(each_fn): self.generator_mir_only_fns.get(each_fn).unwrap() else: each_fn
-                if self.fn_symbol_may_suspend(producer) != 0:
-                    return 1
+            if self.gen_loop_may_suspend(node):
+                return 1
             return self.expr_may_suspend(self.ast.get_data2(node))
         if kind == NodeKind.NK_LET_BINDING or kind == NodeKind.NK_LET_DECL:
             return self.expr_may_suspend(self.ast.get_data1(node))
@@ -4709,7 +4732,7 @@ impl Sema:
             let clause_count = self.ast.get_data2(node)
             for ci in 0..clause_count:
                 let base = comp_start + ci * 3
-                if self.expr_may_suspend(self.ast.get_extra(base + 1)) != 0:
+                if self.expr_may_suspend(self.ast.get_extra(base + 1)) != 0 or self.gen_loop_may_suspend(self.ast.get_extra(base + 1)):
                     return 1
                 if self.expr_may_suspend(self.ast.get_extra(base + 2)) != 0:
                     return 1
@@ -4719,7 +4742,7 @@ impl Sema:
             let clause_count = self.ast.get_data1(node)
             for ci in 0..clause_count:
                 let base = comp_start + 2 + ci * 3
-                if self.expr_may_suspend(self.ast.get_extra(base + 1)) != 0:
+                if self.expr_may_suspend(self.ast.get_extra(base + 1)) != 0 or self.gen_loop_may_suspend(self.ast.get_extra(base + 1)):
                     return 1
                 if self.expr_may_suspend(self.ast.get_extra(base + 2)) != 0:
                     return 1
@@ -7397,16 +7420,18 @@ impl Sema:
                     self.emit_error("element comprehension requires Vec, HashSet, or BTreeSet expected type", node)
                     return 0
             var pushed_scopes = 0
+            let comp_view_count = self.for_view_binding_syms.len() as i32
+            let gen_outer_counts: Vec[i32] = Vec.new()
             for ci in 0..clause_count:
                 let base = comp_start + ci * 3
                 let binding = self.ast.get_extra(base)
                 let iterable = self.ast.get_extra(base + 1)
                 let filter = self.ast.get_extra(base + 2)
-                let iter_ty = self.check_expr(iterable)
-                self.reject_gen_comprehension_clause(iterable, iter_ty as i32)
-                self.demand_generic_iter_next(iter_ty, iterable, iterable)
-                let elem_ty = self.for_loop_element_type(iterable, iter_ty as i32)
+                let elem_ty = self.check_comprehension_clause_iterable(iterable)
+                gen_outer_counts.push(if self.gen_for_elem_types.contains(iterable): self.bind_names.len() as i32 else: -1)
                 self.push_scope()
+                if self.gen_for_elem_types.contains(iterable):
+                    self.register_gen_loop_view_borrows(iterable)
                 pushed_scopes = pushed_scopes + 1
                 if self.ast.comprehension_binding_is_pattern(node, binding):
                     self.check_pattern(binding, elem_ty)
@@ -7417,8 +7442,10 @@ impl Sema:
                     if filter_ty != 0 and self.types_compatible(self.ty_bool as i32, filter_ty as i32) == 0:
                         self.emit_error("comprehension filter must be bool", filter)
             let result_elem = if result_expected != 0: self.check_expr_with_owned_demand(expr, result_expected as TypeId) else: self.check_expr(expr)
+            self.record_gen_comprehension_captures(node, comp_start, &gen_outer_counts)
             for _ in 0..pushed_scopes:
                 self.pop_scope()
+            self.truncate_for_view_bindings(comp_view_count)
             let result_ty = if target_ty != 0: target_ty else: self.ensure_vec_type_for(result_elem as i32)
             if target_ty != 0:
                 let target_resolved = self.resolve_alias(target_ty as TypeId)
@@ -7455,16 +7482,18 @@ impl Sema:
                 key_expected = self.get_generic_inst_arg(expected2 as i32, 0)
                 val_expected = self.get_generic_inst_arg(expected2 as i32, 1)
             var pushed_scopes2 = 0
+            let comp_view_count2 = self.for_view_binding_syms.len() as i32
+            let gen_outer_counts2: Vec[i32] = Vec.new()
             for ci2 in 0..clause_count2:
                 let base3 = comp_start2 + 2 + ci2 * 3
                 let binding2 = self.ast.get_extra(base3)
                 let iterable2 = self.ast.get_extra(base3 + 1)
                 let filter2 = self.ast.get_extra(base3 + 2)
-                let iter_ty2 = self.check_expr(iterable2)
-                self.reject_gen_comprehension_clause(iterable2, iter_ty2 as i32)
-                self.demand_generic_iter_next(iter_ty2, iterable2, iterable2)
-                let elem_ty2 = self.for_loop_element_type(iterable2, iter_ty2 as i32)
+                let elem_ty2 = self.check_comprehension_clause_iterable(iterable2)
+                gen_outer_counts2.push(if self.gen_for_elem_types.contains(iterable2): self.bind_names.len() as i32 else: -1)
                 self.push_scope()
+                if self.gen_for_elem_types.contains(iterable2):
+                    self.register_gen_loop_view_borrows(iterable2)
                 pushed_scopes2 = pushed_scopes2 + 1
                 if self.ast.comprehension_binding_is_pattern(node, binding2):
                     self.check_pattern(binding2, elem_ty2)
@@ -7496,8 +7525,10 @@ impl Sema:
                     return 0
                 let _ = self.record_contextual_copy_adjustment(val_expr, val_pointee, val_ty as i32)
                 stored_val_ty = val_pointee
+            self.record_gen_comprehension_captures(node, comp_start2 + 2, &gen_outer_counts2)
             for _ in 0..pushed_scopes2:
                 self.pop_scope()
+            self.truncate_for_view_bindings(comp_view_count2)
             if map_target_ty == 0:
                 let map_args: Vec[i32] = Vec.new()
                 map_args.push(stored_key_ty)
@@ -11437,32 +11468,99 @@ impl Sema:
         let tk = self.get_type_kind(self.resolve_alias(ty as TypeId))
         tk != TypeKind.TY_REF and tk != TypeKind.TY_PTR
 
-    fn record_generator_call_ref_origins(call_node: i32, sig_idx: i32, param_offset: i32, extra_start: i32, arg_count: i32, has_resolved: i32):
+    // D69 (§13.4): a generator value holds its arguments, so it views what
+    // each view argument views — a generator method's borrowed receiver
+    // included (`recv_node` when param_offset is 1), which the value holds
+    // as a view of the caller's place.
+    mut fn record_generator_call_ref_origins(call_node: i32, sig_idx: i32, param_offset: i32, recv_node: i32, extra_start: i32, arg_count: i32, has_resolved: i32):
         if call_node == 0 or sig_idx < 0:
             return
         let ret = self.sig_return_type(sig_idx)
         if not self.generator_state_yield_types.contains(ret):
             return
         let param_count = self.sig_get_param_count(sig_idx)
+        let field_start = self.get_type_d1(ret as TypeId)
         var union_mask = 0
         var concrete_deps: Vec[i32] = Vec.new()
+        self.gen_call_view_place_starts.insert(call_node, self.gen_call_view_place_nodes.len() as i32)
+        var place_count = 0
         for pi in 0..param_count:
-            let param_ty = self.sig_param_type(sig_idx, pi)
-            if self.type_is_ephemeral_value(param_ty) == 0:
+            let field_ty = self.type_extra[(field_start + pi * 3 + 1)]
+            if self.type_is_ephemeral_value(field_ty) == 0:
                 continue
             let arg_index = pi - param_offset
-            if arg_index < 0 or arg_index >= arg_count:
+            if arg_index >= arg_count:
                 continue
-            let arg_node = if has_resolved != 0: self.get_resolved_call_arg(call_node, arg_index) else: self.ast.get_extra(extra_start + arg_index)
+            let arg_node = if arg_index < 0: (if pi == 0: recv_node else: 0) else if has_resolved != 0: self.get_resolved_call_arg(call_node, arg_index) else: self.ast.get_extra(extra_start + arg_index)
             if arg_node <= 0:
                 continue
+            self.gen_call_view_place_nodes.push(self.gen_view_arg_place(arg_node))
+            place_count += 1
             union_mask = union_mask | self.compute_expr_view_origin_mask(arg_node)
             let dep_len_before = concrete_deps.len() as i32
             concrete_deps = self.collect_expr_view_deps(arg_node, move concrete_deps)
             if concrete_deps.len() as i32 == dep_len_before:
                 concrete_deps = self.push_unique_i32(move concrete_deps, self.place_root_sym(arg_node))
+        self.gen_call_view_place_counts.insert(call_node, place_count)
         if union_mask != 0 or concrete_deps.len() > 0:
             self.set_expr_view_deps(call_node, union_mask, concrete_deps)
+
+    // The place a generator's view argument names: the operand of `&place`,
+    // else the argument itself (a view binding, or a borrowed receiver).
+    fn gen_view_arg_place(arg_node: i32) -> i32:
+        var node = arg_node
+        while node != 0 and (self.ast.kind(node) == NodeKind.NK_GROUPED or (self.ast.kind(node) == NodeKind.NK_UNARY and self.ast.get_data0(node) == UnaryOp.UOP_REF)):
+            node = if self.ast.kind(node) == NodeKind.NK_GROUPED: self.ast.get_data0(node) else: self.ast.get_data1(node)
+        node
+
+    // D69 (§13.4, #1734): a generator value's views stay live for the whole
+    // loop that consumes it (`for x in g`, or a comprehension clause, keyed
+    // by `key_node`): the producer runs while every run of the body runs, so
+    // a write to or move of a viewed place in the body is refused like any
+    // mutation under a live view. Each view argument of the generator call
+    // is a shared borrow of the place it names, path-precise (#1530), so a
+    // sibling field stays writable; a generator value reached any other way
+    // (a binding, a field) borrows the roots of its view dependencies. The
+    // borrows name the generator (its binding, or the call as written) and
+    // end with the loop's scope. Call inside the loop's scope.
+    mut fn register_gen_loop_view_borrows(iterable: i32):
+        var node = iterable
+        while node != 0 and self.ast.kind(node) == NodeKind.NK_GROUPED:
+            node = self.ast.get_data0(node)
+        var ref_sym = 0
+        if self.ast.kind(node) == NodeKind.NK_IDENT:
+            ref_sym = self.ast.get_data0(node)
+        else:
+            // The call as its callee names it: `each_line(…)`, `c.walk(…)`.
+            let callee = if self.ast.kind(node) == NodeKind.NK_CALL: self.ast.get_data0(node) else: node
+            let text = render_expr(self.ast, self.pool, callee as NodeId, 0)
+            ref_sym = self.pool_intern(if text.len() > 0 and text.len() < 60 and sema_str_contains_char(text, 10) == 0: text ++ "(…)" else: "the generator")
+        if self.gen_call_view_place_starts.contains(node):
+            let start: i32 = self.gen_call_view_place_starts.get(node).unwrap()
+            let count: i32 = self.gen_call_view_place_counts.get(node).unwrap()
+            for pi in start..start + count:
+                let place_node: i32 = self.gen_call_view_place_nodes[pi]
+                let root = self.borrow_root_place(place_node)
+                if root == 0:
+                    continue
+                let path_start = self.borrow_path_data.len() as i32
+                let path_count = self.borrow_collect_path(place_node)
+                self.register_gen_loop_view_borrow(ref_sym, root, self.borrow_field(place_node), path_start, path_count, iterable)
+            return
+        var deps: Vec[i32] = Vec.new()
+        deps = self.collect_expr_view_deps(node, move deps)
+        for di in 0..deps.len() as i32:
+            if deps[di] != 0 and deps[di] != ref_sym:
+                self.register_gen_loop_view_borrow(ref_sym, deps[di], 0, self.borrow_path_data.len() as i32, 0, iterable)
+
+    mut fn register_gen_loop_view_borrow(ref_sym: i32, root: i32, field: i32, path_start: i32, path_count: i32, err_node: i32):
+        let before = self.borrow_refs.len() as i32
+        self.check_borrow_create_direct(root, BorrowKind.SHARED, field, path_start, path_count, err_node)
+        if self.borrow_refs.len() as i32 > before:
+            self.borrow_refs[before] = ref_sym
+            self.for_view_binding_syms.push(ref_sym)
+            self.for_view_binding_depths.push(self.loop_depth + 1)
+            self.for_view_binding_gen_loops.push(1)
 
     mut fn propagate_call_param_effect(param_eff: i32, arg_node: i32):
         if param_eff == 0 or arg_node <= 0:
@@ -11950,6 +12048,8 @@ impl Sema:
         let for_entry_states = self.save_scope_states()
         let for_view_count = self.for_view_binding_syms.len()
         self.push_scope()
+        if gen_elem != 0:
+            self.register_gen_loop_view_borrows(iterable)
         if self.ast.for_binding_is_pattern(node):
             self.check_pattern(binding, elem_type)
             self.record_pattern_view_bindings(binding, iterable)
@@ -11988,20 +12088,26 @@ impl Sema:
         while self.for_view_binding_syms.len() > for_view_count:
             self.for_view_binding_syms.pop()
             self.for_view_binding_depths.pop()
+            self.for_view_binding_gen_loops.pop()
         self.pop_move_control_flow_context()
         if gen_elem != 0:
-            self.record_gen_for_captures(node, body, outer_binding_count)
+            self.record_gen_loop_captures(node, body, 0, -1, outer_binding_count)
         self.ty_void as i32
 
     // D69 (§13.4): the body of `for x in g` over a Gen[T] runs as a closure,
     // so it captures by place every enclosing binding it uses — exactly the
     // places the loop body reads, writes or moves as an ordinary `for` body.
-    mut fn record_gen_for_captures(node: i32, body: i32, outer_count: i32):
+    // A comprehension clause over a Gen[T] (§13.6, #1727) runs the rest of
+    // the comprehension the same way (comp_node != 0; comprehension_rest_uses_symbol).
+    mut fn record_gen_loop_captures(key_node: i32, body: i32, comp_node: i32, clause_index: i32, outer_count: i32):
         let syms: Vec[i32] = Vec.new()
         let effs: Vec[i32] = Vec.new()
         for ci in 0..outer_count:
             let sym: i32 = self.bind_names[ci]
-            if self.binding_index_is_global(ci, sym) or self.expr_uses_symbol(body, sym) == 0:
+            if self.binding_index_is_global(ci, sym):
+                continue
+            let used = if comp_node != 0: self.comprehension_rest_uses_symbol(comp_node, clause_index, sym) else: self.expr_uses_symbol(body, sym) != 0
+            if not used:
                 continue
             var seen = false
             for si in 0..syms.len() as i32:
@@ -12011,7 +12117,33 @@ impl Sema:
                 syms.push(sym)
                 effs.push(EFF_CAPTURE_BY_PLACE)
         self.ensure_capture_ref_types(&syms)
-        self.set_closure_capture_summary(node, syms, effs)
+        self.set_closure_capture_summary(key_node, syms, effs)
+
+    // Whether what runs inside comprehension clause `clause_index` — its
+    // filter, the later clauses and the element (key and value) — names `sym`.
+    fn comprehension_rest_uses_symbol(comp_node: i32, clause_index: i32, sym: i32) -> bool:
+        let is_map = self.ast.kind(comp_node) == NodeKind.NK_MAP_COMPREHENSION
+        let clause_start = if is_map: self.ast.get_data0(comp_node) + 2 else: self.ast.get_data1(comp_node)
+        let clause_count = if is_map: self.ast.get_data1(comp_node) else: self.ast.get_data2(comp_node)
+        if self.expr_uses_symbol(self.ast.get_extra(clause_start + clause_index * 3 + 2), sym) != 0:
+            return true
+        for cj in clause_index + 1..clause_count:
+            if self.expr_uses_symbol(self.ast.get_extra(clause_start + cj * 3 + 1), sym) != 0 or self.expr_uses_symbol(self.ast.get_extra(clause_start + cj * 3 + 2), sym) != 0:
+                return true
+        if is_map:
+            let pair = self.ast.get_data0(comp_node)
+            return self.expr_uses_symbol(self.ast.get_extra(pair), sym) != 0 or self.expr_uses_symbol(self.ast.get_extra(pair + 1), sym) != 0
+        self.expr_uses_symbol(self.ast.get_data0(comp_node), sym) != 0
+
+    // D69 (§13.4, §13.6): each comprehension clause over a Gen[T] records
+    // the captures of the closure the rest of the comprehension runs as.
+    // outer_counts[ci] is how many bindings were in scope before clause ci's
+    // own (-1 when clause ci is not over a generator); every clause binding
+    // is still in scope here.
+    mut fn record_gen_comprehension_captures(comp_node: i32, clause_start: i32, outer_counts: &Vec[i32]):
+        for ci in 0..outer_counts.len() as i32:
+            if outer_counts[ci] >= 0:
+                self.record_gen_loop_captures(self.ast.get_extra(clause_start + ci * 3 + 1), 0, comp_node, ci, outer_counts[ci])
 
     // A capture of a binding that names a place rather than a local of its
     // own is taken through a &T (MirLower's closure_capture_source); make sure
@@ -12022,21 +12154,19 @@ impl Sema:
             if ty > 0:
                 let _ = self.ensure_exact_type(TypeKind.TY_REF, ty, 0, 0)
 
-    // D69: a comprehension clause over a Gen[T] is not lowered yet (#1727).
-    mut fn reject_gen_comprehension_clause(iterable: i32, iter_type: i32):
-        if iter_type == 0:
-            return
-        let resolved = self.resolve_alias(iter_type as TypeId) as i32
-        let owner_sym = self.method_owner_symbol_for_type(resolved)
-        if owner_sym == 0:
-            return
-        let each_sym = self.pool_intern("each")
-        if self.lookup_method_fn(owner_sym, each_sym) == 0 and self.lookup_generic_method_fn(owner_sym, each_sym) == 0:
-            return
-        let next_sym = self.pool_lookup_symbol("next")
-        if next_sym > 0 and (self.lookup_method_fn(owner_sym, next_sym) != 0 or self.lookup_generic_method_fn(owner_sym, next_sym) != 0):
-            return
-        self.emit_error("a comprehension clause over a generator (Gen[T]) is not implemented yet (#1727); use a `for` loop, or `g |> map(f) |> collect[Vec]()`", iterable)
+    // §13.6: a comprehension clause's `for PATTERN in EXPR` is §13.5's
+    // iteration. Over a Gen[T] the rest of the comprehension runs as the
+    // closure `each` calls, keyed by the iterable (D69, #1727), and the
+    // generator value is consumed; anything else steps an Iter[T]. Returns
+    // the element type.
+    mut fn check_comprehension_clause_iterable(iterable: i32) -> i32:
+        let iter_ty = self.check_expr(iterable)
+        let gen_elem = self.resolve_gen_for(iterable, iterable, iter_ty as i32)
+        if gen_elem != 0:
+            self.mark_moved_if_consumed(iterable)
+            return gen_elem
+        self.demand_generic_iter_next(iter_ty, iterable, iterable)
+        self.for_loop_element_type(iterable, iter_ty as i32)
 
     // D69 (§13.4): when `iter_type` implements Gen[T] — a generator value, or
     // a type with `move fn each(body: fn(T) -> bool)` — record the loop's
@@ -12150,9 +12280,28 @@ impl Sema:
             self.borrow_refs[before] = sym
             self.for_view_binding_syms.push(sym)
             self.for_view_binding_depths.push(self.loop_depth + 1)
+            self.for_view_binding_gen_loops.push(0)
 
     // The loop_depth of the body of the `for` that binds `sym` as a view; 0
     // when `sym` is not a loop view binding. The innermost binding wins.
+    // End the loop views registered since `count` (a comprehension's generator
+    // clauses, #1734).
+    fn truncate_for_view_bindings(count: i32):
+        while self.for_view_binding_syms.len() as i32 > count:
+            self.for_view_binding_syms.pop()
+            self.for_view_binding_depths.pop()
+            self.for_view_binding_gen_loops.pop()
+
+    // Whether the innermost loop view named `sym` is a generator value's view
+    // held across a loop over it (#1734).
+    fn for_view_binding_is_gen_loop(sym: i32) -> bool:
+        var i = self.for_view_binding_syms.len() as i32 - 1
+        while i >= 0:
+            if self.for_view_binding_syms[i] == sym:
+                return self.for_view_binding_gen_loops[i] != 0
+            i -= 1
+        false
+
     fn for_view_binding_depth(sym: i32) -> i32:
         var i = self.for_view_binding_syms.len() as i32 - 1
         while i >= 0:
@@ -18565,7 +18714,7 @@ impl Sema:
                 self.check_mut_slice_call_exclusivity(sc_mut_args, sc_all_args)
             self.check_dyn_trait_call_compat(fn_sym, resolved_extra_start, arg_types, resolved_arg_count, param_offset)
             self.record_call_view_origins(node, sig_idx, param_offset, 0, resolved_extra_start, resolved_arg_count, has_resolved)
-            self.record_generator_call_ref_origins(node, sig_idx, param_offset, resolved_extra_start, resolved_arg_count, has_resolved)
+            self.record_generator_call_ref_origins(node, sig_idx, param_offset, 0, resolved_extra_start, resolved_arg_count, has_resolved)
             self.typed_expr_types.insert(node, ret)
             return ret
 
@@ -19450,7 +19599,10 @@ impl Sema:
         // concrete substitutions above. Its concrete signature therefore owns
         // the exact inferred return type; resolving a missing syntax node as
         // Unit here discarded that result and made generic forwarding lie.
-        let resolved_ret = if ret_node == 0 and concrete_sig >= 0:
+        // A gen fn's call returns its generator value, which only the
+        // specialization's signature names (D69).
+        let returns_generator = (self.ast.fn_meta_flags(meta) / FnFlags.GEN) % 2 == 1
+        let resolved_ret = if (ret_node == 0 or returns_generator) and concrete_sig >= 0:
             self.sig_return_type(concrete_sig)
         else:
             let declared_ret = self.resolve_generic_return_type_node(ret_node, tp_start, tp_count)
@@ -21100,6 +21252,7 @@ impl Sema:
             // identical to effect propagation so Option[&T] retains its concrete
             // collection origin at the caller (D22 Rule 10).
             self.record_call_view_origins(node, concrete_sig, recv_param_offset, receiver, extra_start, arg_count, self.has_resolved_call_args(node))
+            self.record_generator_call_ref_origins(node, concrete_sig, recv_param_offset, receiver, extra_start, arg_count, self.has_resolved_call_args(node))
         if ret_ty != 0:
             self.typed_expr_types.insert(node, ret_ty)
         self.generic_subst_param_syms = saved_generic_method_subst_syms
@@ -24000,6 +24153,7 @@ impl Sema:
                     if mc_subst_ret != 0:
                         self.propagate_method_call_param_effects(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
                         self.record_call_view_origins(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
+                        self.record_generator_call_ref_origins(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
                         return mc_subst_ret
                 // A STATIC call has no receiver param: args pair with params from
                 // index 0 and there is no receiver node to absorb param0's
@@ -24011,6 +24165,7 @@ impl Sema:
                 // mirrors mc_plain_poff in the #567 type-check loop above.
                 self.propagate_method_call_param_effects(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
                 self.record_call_view_origins(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
+                self.record_generator_call_ref_origins(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
                 return mc_ret
 
         let concrete_trait_method_ret = self.check_concrete_trait_method_call(recv_type as i32, field, arg_types, extra_start, mc_resolved_arg_count, node, expr, mc_has_resolved_args)
@@ -25727,11 +25882,15 @@ impl Sema:
             // when this mutation ends the loop, since other paths may not.
             let loop_body_depth = self.for_view_binding_depth(ref_sym)
             let is_loop_view = if loop_body_depth != 0: 1 else: 0
+            // A generator's view (#1734) stays live even when the loop ends
+            // right after the mutation: the stopped generator leaves at its
+            // `yield` through its own scopes and defers, which may read it.
+            let is_gen_loop_view = is_loop_view != 0 and self.for_view_binding_is_gen_loop(ref_sym)
             if last_use == 0 and not self.view_used_in(err_node, ref_sym):
                 if is_loop_view == 0:
                     self.remove_borrow_at(i)
                     continue
-                if self.loop_ends_after_current_stmt(loop_body_depth) != 0:
+                if not is_gen_loop_view and self.loop_ends_after_current_stmt(loop_body_depth) != 0:
                     i = i + 1
                     continue
             let mutation_start = self.ast.get_start(err_node)
@@ -25747,7 +25906,9 @@ impl Sema:
                 let lu_start = self.ast.get_start(last_use)
                 let lu_end = self.ast.get_end(last_use)
                 diag.add_label(Span { file: self.local_file_id, start: lu_start, end: lu_end }, "view is used here after the mutation")
-            if is_loop_view != 0:
+            if is_gen_loop_view:
+                diag.add_note("the generator `" ++ ref_name ++ "` is still running while the loop body runs (§13.4); collect the changes and apply them after the loop")
+            else if is_loop_view != 0:
                 diag.add_note("the loop reads `" ++ place_name ++ "` again on its next iteration; collect the changes and apply them after the loop")
             let ref_ty = self.resolve_alias(self.scope_lookup(ref_sym) as TypeId)
             if self.get_type_kind(ref_ty) == TypeKind.TY_REF:

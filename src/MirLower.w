@@ -60,6 +60,12 @@ const GEN_LOOP_ERR_RETURN: i32 = 2
 const GEN_LOOP_CANCEL: i32 = 3
 const GEN_LOOP_LABEL_BASE: i32 = 4
 
+// How a gen-loop closure's exit to a label outside it continues in the
+// owning frame (MirBuilder.gen_loop_exit_kinds).
+const GEN_EXIT_BREAK: i32 = 0
+const GEN_EXIT_CONTINUE: i32 = 1
+const GEN_EXIT_GOTO: i32 = 2
+
 fn gen_loop_code_bit(code: i32) -> i32:
     var bit = 1
     for _ in 0..code:
@@ -189,6 +195,9 @@ pub type MirBuilder = ephemeral {
     goto_label_drop_depths: Vec[i32],
     goto_label_defer_depths: Vec[i32],
     goto_label_defined: Vec[i32],
+    // Whether a goto targets the label; a target this body never defines
+    // is a phase bug (verify_goto_labels).
+    goto_label_jumped: Vec[i32],
 
     next_temp: i32,
     cur_node: i32,
@@ -218,10 +227,11 @@ pub type MirBuilder = ephemeral {
     gen_loop_flag_local: i32,
     gen_loop_ret_local: i32,
     gen_loop_ret_ty: i32,
-    // The outer labels this closure's break/continue leave through the flag:
-    // exit i sets the flag to GEN_LOOP_LABEL_BASE + i.
+    // The outer labels this closure's break, continue and goto leave through
+    // the flag: exit i sets the flag to GEN_LOOP_LABEL_BASE + i, and its kind
+    // (GEN_EXIT_*) says what the owning frame does at the label.
     gen_loop_exit_labels: Vec[i32],
-    gen_loop_exit_continues: Vec[i32],
+    gen_loop_exit_kinds: Vec[i32],
     // Which of GEN_LOOP_RETURN..GEN_LOOP_CANCEL this closure sets (bit per
     // code, gen_loop_code_bit), so the owning frame emits only those arms.
     gen_loop_used_codes: i32,
@@ -311,6 +321,7 @@ fn MirBuilder.init(sema: &Sema, ast: AstPool, pool: InternPool, fn_sym: i32) -> 
         goto_label_drop_depths: Vec.new(),
         goto_label_defer_depths: Vec.new(),
         goto_label_defined: Vec.new(),
+        goto_label_jumped: Vec.new(),
         next_temp: 0,
         cur_node: 0,
         expected_type: 0,
@@ -323,7 +334,7 @@ fn MirBuilder.init(sema: &Sema, ast: AstPool, pool: InternPool, fn_sym: i32) -> 
         gen_loop_ret_local: -1,
         gen_loop_ret_ty: 0,
         gen_loop_exit_labels: Vec.new(),
-        gen_loop_exit_continues: Vec.new(),
+        gen_loop_exit_kinds: Vec.new(),
         gen_loop_used_codes: 0,
         regex_capture_pat_nodes: Vec.new(),
         regex_capture_opt_places: Vec.new(),
@@ -1413,6 +1424,7 @@ impl MirBuilder:
         self.goto_label_drop_depths.push(0)
         self.goto_label_defer_depths.push(0)
         self.goto_label_defined.push(0)
+        self.goto_label_jumped.push(0)
         self.goto_label_syms.len() as i32 - 1
 
     mut fn collect_goto_label_depths(node: i32, scope_depth: i32):
@@ -1450,7 +1462,10 @@ impl MirBuilder:
             return
         if kind == NodeKind.NK_FOR:
             self.collect_goto_label_depths(self.ast.get_data1(node), scope_depth)
-            self.collect_goto_label_depths(self.ast.get_data2(node), scope_depth)
+            // D69: the body of a `for` over a Gen[T] is lowered as a closure
+            // (lower_for_gen), which collects its own labels.
+            if not self.sema.gen_for_elem_types.contains(node):
+                self.collect_goto_label_depths(self.ast.get_data2(node), scope_depth)
             return
         if kind == NodeKind.NK_MATCH:
             self.collect_goto_label_depths(self.ast.get_data0(node), scope_depth)
@@ -1573,6 +1588,7 @@ impl MirBuilder:
 
     mut fn goto_target_info(label: i32) -> LoopInfo:
         let idx = self.ensure_goto_label(label, -1)
+        self.goto_label_jumped[idx] = 1
         let bb = self.goto_label_bbs[idx]
         if self.goto_label_defined[idx] != 0:
             return LoopInfo {
@@ -7570,81 +7586,30 @@ impl MirBuilder:
     // body runs as the closure `body: fn(T) -> bool`, capturing the enclosing
     // bindings it uses by place. Finishing the body or `continue` answers
     // true; `break` answers false and the generator leaves at its `yield`.
-    // `return`, `?`, cancellation and a break/continue of a label outside
-    // the loop answer false too, having recorded in this frame's flag what
-    // this frame does once `each` returns — and a returned value in this
+    // `return`, `?`, cancellation and a break/continue/goto of a label
+    // outside the loop answer false too, having recorded in this frame's flag
+    // what this frame does once `each` returns — and a returned value in this
     // frame's return slot (Go 1.23's range-over-func rewrite, with the stop
     // automatic: the generator never sees it).
     mut fn lower_for_gen(for_node: i32) -> i32:
         let pat_or_sym = self.ast.get_data0(for_node)
         let iter_expr = self.ast.get_data1(for_node)
         let body_expr = self.ast.get_data2(for_node)
-        let span = self.ast.get_start(for_node)
-        let i32_ty = self.sema.ty_i32 as i32
-        let bool_ty = self.sema.ty_bool as i32
         let elem_ty: i32 = self.sema.gen_for_elem_types.get(for_node).unwrap()
-        let body_fn_ty: i32 = self.sema.gen_for_body_types.get(for_node).unwrap()
-        let each_fn: i32 = self.sema.gen_for_each_syms.get(for_node).unwrap()
-        let each_sig: i32 = self.sema.gen_for_each_sigs.get(for_node).unwrap()
-        let each_mono: i32 = if self.sema.gen_for_each_monos.contains(for_node): self.sema.gen_for_each_monos.get(for_node).unwrap() else: 0
 
         // The generator value moves into `each`.
         let gen_op = self.lower_expr(iter_expr)
-
-        // This frame's side: the flag, and the enclosing function's return
-        // slot, which a `return` in the closure fills through its capture —
-        // this frame's own local 0, or the slot this frame itself captured
-        // when it is a gen-loop closure too.
-        let flag_local = self.new_temp(i32_ty)
-        self.assign_int_to_local(flag_local, GEN_LOOP_DONE, i32_ty)
-        let ret_ty = self.fn_return_type()
-        let ret_slot = if not self.fn_returns_value(): -1 else if self.gen_loop_flag_local >= 0: self.gen_loop_ret_local else: 0
-
-        // The loop body's captures, resolved in this frame. A body that moves
-        // out of a by-place capture blanks the outer slot (#1481); that
-        // slot's scope-exit drop keeps its null guard.
-        let capture_syms: Vec[i32] = Vec.new()
-        let capture_sources: Vec[ClosureCaptureSource] = Vec.new()
-        for ci in 0..self.sema.closure_capture_summary_count(for_node):
-            let sym = mir_symbol_for_pool(self.sema, self.pool, self.sema.closure_capture_summary_sym(for_node, ci))
-            let source = self.closure_capture_source(sym, for_node, ci)
-            if source.value_ty == 0 and self.sema.type_needs_drop_frozen(source.capture_ty) != 0:
-                self.body.mark_local_ever_moved(source.local)
-            capture_syms.push(sym)
-            capture_sources.push(source)
-        let body_local = self.gen_body_local
-        let body_local_ty = if body_local >= 0: self.local_type(body_local) else: 0
-        let label = self.for_label(for_node)
-        let body_sym = self.pool.intern(f"$genloop${self.body.fn_sym}${for_node}")
-        let flag_name = self.pool.intern(f"$genloop_flag${for_node}")
-        let ret_name = self.pool.intern(f"$genloop_ret${for_node}")
-        let gen_body_name = self.pool.intern(f"$genloop_body${for_node}")
-        let item_name = self.pool.intern(f"$genloop_item${for_node}")
-
-        // The closure: the loop body's captures, the protocol's captures,
-        // then the element parameter.
-        var child = MirBuilder.init(self.sema, self.ast, self.pool, body_sym)
-        child.contextual_fact_sig_idx = self.contextual_fact_sig_idx
-        child.body.anonymous_type = body_fn_ty
-        child.body.local_type_ids[0] = bool_ty
-        child.push_scope()
-        for ci in 0..capture_syms.len() as i32:
-            child.bind_capture(capture_syms[ci], capture_sources[ci])
-        child.gen_loop_flag_local = child.add_protocol_capture(flag_local, i32_ty, flag_name)
-        if ret_slot >= 0:
-            child.gen_loop_ret_local = child.add_protocol_capture(ret_slot, ret_ty, ret_name)
-        child.gen_loop_ret_ty = ret_ty
-        if body_local >= 0:
-            child.gen_body_local = child.add_protocol_capture(body_local, body_local_ty, gen_body_name)
-        let capture_count = child.body.anonymous_capture_sources.len() as i32
-        child.body.anonymous_capture_count = capture_count
-        let item_local = child.body.new_local(elem_ty, 1, item_name, 1)
-        child.body.n_params = capture_count + 1
+        let flag_local = self.new_gen_loop_flag()
+        var child = self.begin_gen_loop_closure(for_node, flag_local)
+        let item_local = child.add_gen_loop_item(elem_ty, for_node)
 
         let more_bb = child.new_block()
         let stop_bb = child.new_block()
-        child.push_control_target(label, ControlTargetKind.CT_LOOP, more_bb, stop_bb, -1)
+        child.push_control_target(self.for_label(for_node), ControlTargetKind.CT_LOOP, more_bb, stop_bb, -1)
         child.push_scope()
+        // The body's own labels; a goto to any other label of the function
+        // leaves the closure (lower_goto).
+        child.collect_goto_label_depths(body_expr, child.drop_scope_starts.len() as i32)
         let item_place = child.place_for_local(item_local)
         child.bind_for_element_or_skip(for_node, pat_or_sym, item_place, elem_ty, body_expr, more_bb, true)
         let body_frame = child.push_stmt_temp_frame()
@@ -7659,9 +7624,125 @@ impl MirBuilder:
         child.assign_bool_to_local(0, false)
         child.terminate(TermKind.TK_RETURN, 0, 0, 0, 0)
         child.pop_scope_inline()
+        self.finish_gen_loop(for_node, gen_op, flag_local, move child)
+
+    // D69 (§13.4, §13.6, #1727): a comprehension clause over a Gen[T] runs
+    // the rest of the comprehension — its filter, the later clauses and the
+    // leaf that adds to the collection — as the closure `each` calls, like
+    // the body of `for x in g`. A comprehension consumes the whole
+    // generator, so the closure answers false only for an exit of the
+    // enclosing function (`?`, cancellation), through the flag. The
+    // collection being built is the closure's capture of the frame's local.
+    mut fn lower_comprehension_gen(comp_node: i32, clause_index: i32, out_place: i32, out_elem_ty: i32, pat_or_sym: i32, iter_expr: i32):
+        let elem_ty: i32 = self.sema.gen_for_elem_types.get(iter_expr).unwrap()
+        let out_local = mir_place_plain_local(&self.body, out_place)
+        if out_local < 0:
+            sema_phase_bug(f"BUG: a comprehension's collection is not a local place (node {comp_node})")
+        let gen_op = self.lower_expr(iter_expr)
+        let flag_local = self.new_gen_loop_flag()
+        var child = self.begin_gen_loop_closure(iter_expr, flag_local)
+        let child_out_local = child.add_protocol_capture(out_local, self.local_type(out_local), self.pool.intern(f"$gencomp_out${iter_expr}"))
+        let item_local = child.add_gen_loop_item(elem_ty, iter_expr)
+        let child_out_place = child.place_for_local(child_out_local)
+
+        let more_bb = child.new_block()
+        child.push_scope()
+        let item_place = child.place_for_local(item_local)
+        child.bind_comprehension_element(comp_node, pat_or_sym, item_place, elem_ty, iter_expr, true, more_bb)
+        let clause_filter = child.ast.get_extra(child.comprehension_clause_start(comp_node) + clause_index * 3 + 2)
+        let join_bb = child.new_block()
+        if clause_filter != 0:
+            let pass_bb = child.new_block()
+            let cond_op = child.lower_expr(clause_filter)
+            let vals: Vec[i64] = Vec.new()
+            vals.push(1)
+            let targets: Vec[i32] = Vec.new()
+            targets.push(pass_bb as i32)
+            let table = child.body.new_switch_table(vals, targets)
+            child.terminate(TermKind.TK_SWITCH_INT, cond_op, table, join_bb, 0)
+            child.switch_to(pass_bb)
+        let leaf_frame = child.push_stmt_temp_frame()
+        child.lower_comprehension_next_or_push(comp_node, clause_index + 1, child_out_place, out_elem_ty)
+        child.finish_stmt_temp_frame(leaf_frame)
+        child.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
+        child.switch_to(join_bb)
+        child.pop_scope_with_goto(more_bb)
+        child.switch_to(more_bb)
+        child.assign_bool_to_local(0, true)
+        child.terminate(TermKind.TK_RETURN, 0, 0, 0, 0)
+        child.pop_scope_inline()
+        let _ = self.finish_gen_loop(iter_expr, gen_op, flag_local, move child)
+
+    // The owning frame's flag for one gen loop: what the loop body's closure
+    // tells this frame to do once `each` returns (GEN_LOOP_*).
+    mut fn new_gen_loop_flag() -> i32:
+        let i32_ty = self.sema.ty_i32 as i32
+        let flag_local = self.new_temp(i32_ty)
+        self.assign_int_to_local(flag_local, GEN_LOOP_DONE, i32_ty)
+        flag_local
+
+    // The closure a gen loop keyed by `key_node` (the NK_FOR, or a
+    // comprehension clause's iterable) runs as: Sema's captures of the body,
+    // then the protocol's — the flag; the enclosing function's return slot,
+    // which a `return` in the closure fills through its capture (this
+    // frame's own local 0, or the slot this frame itself captured when it is
+    // a gen-loop closure too); and a producer's `body` parameter, which a
+    // `yield` in the closure calls. The caller may add captures of its own,
+    // then the element parameter (add_gen_loop_item).
+    mut fn begin_gen_loop_closure(key_node: i32, flag_local: i32) -> MirBuilder:
+        let i32_ty = self.sema.ty_i32 as i32
+        let ret_ty = self.fn_return_type()
+        let ret_slot = if not self.fn_returns_value(): -1 else if self.gen_loop_flag_local >= 0: self.gen_loop_ret_local else: 0
+        // The body's captures, resolved in this frame. A body that moves out
+        // of a by-place capture blanks the outer slot (#1481); that slot's
+        // scope-exit drop keeps its null guard.
+        let capture_syms: Vec[i32] = Vec.new()
+        let capture_sources: Vec[ClosureCaptureSource] = Vec.new()
+        for ci in 0..self.sema.closure_capture_summary_count(key_node):
+            let sym = mir_symbol_for_pool(self.sema, self.pool, self.sema.closure_capture_summary_sym(key_node, ci))
+            let source = self.closure_capture_source(sym, key_node, ci)
+            if source.value_ty == 0 and self.sema.type_needs_drop_frozen(source.capture_ty) != 0:
+                self.body.mark_local_ever_moved(source.local)
+            capture_syms.push(sym)
+            capture_sources.push(source)
+        let body_local = self.gen_body_local
+        var child = MirBuilder.init(self.sema, self.ast, self.pool, self.pool.intern(f"$genloop${self.body.fn_sym}${key_node}"))
+        child.contextual_fact_sig_idx = self.contextual_fact_sig_idx
+        child.body.anonymous_type = self.sema.gen_for_body_types.get(key_node).unwrap()
+        child.body.local_type_ids[0] = self.sema.ty_bool as i32
+        child.push_scope()
+        for ci in 0..capture_syms.len() as i32:
+            child.bind_capture(capture_syms[ci], capture_sources[ci])
+        child.gen_loop_flag_local = child.add_protocol_capture(flag_local, i32_ty, self.pool.intern(f"$genloop_flag${key_node}"))
+        if ret_slot >= 0:
+            child.gen_loop_ret_local = child.add_protocol_capture(ret_slot, ret_ty, self.pool.intern(f"$genloop_ret${key_node}"))
+        child.gen_loop_ret_ty = ret_ty
+        if body_local >= 0:
+            child.gen_body_local = child.add_protocol_capture(body_local, self.local_type(body_local), self.pool.intern(f"$genloop_body${key_node}"))
+        child
+
+    // The gen-loop closure's element parameter, after all its captures.
+    mut fn add_gen_loop_item(elem_ty: i32, key_node: i32) -> i32:
+        let capture_count = self.body.anonymous_capture_sources.len() as i32
+        self.body.anonymous_capture_count = capture_count
+        let item_local = self.body.new_local(elem_ty, 1, self.pool.intern(f"$genloop_item${key_node}"), 1)
+        self.body.n_params = capture_count + 1
+        item_local
+
+    // `g.each(body)` with the finished closure, then the exits the closure
+    // took that leave this frame's loop too, read from the flag.
+    mut fn finish_gen_loop(key_node: i32, gen_op: i32, flag_local: i32, finished_child: MirBuilder) -> i32:
+        var child = finished_child
+        child.verify_goto_labels()
+        let span = self.ast.get_start(key_node)
+        let body_fn_ty: i32 = self.sema.gen_for_body_types.get(key_node).unwrap()
+        let each_fn: i32 = self.sema.gen_for_each_syms.get(key_node).unwrap()
+        let each_sig: i32 = self.sema.gen_for_each_sigs.get(key_node).unwrap()
+        let each_mono: i32 = if self.sema.gen_for_each_monos.contains(key_node): self.sema.gen_for_each_monos.get(key_node).unwrap() else: 0
+        let body_sym = child.body.fn_sym
         let used_codes = child.gen_loop_used_codes
         let exit_labels = mir_clone_i32_vec(&child.gen_loop_exit_labels)
-        let exit_continues = mir_clone_i32_vec(&child.gen_loop_exit_continues)
+        let exit_kinds = mir_clone_i32_vec(&child.gen_loop_exit_kinds)
         var finished = LoweredFunction { body: move child.body, anonymous_bodies: move child.anonymous_bodies }
         self.anonymous_bodies.push(move finished.body)
         while finished.anonymous_bodies.len() > 0:
@@ -7670,7 +7751,7 @@ impl MirBuilder:
         // g.each(body)
         let closure_local = self.new_temp(body_fn_ty)
         let in_loop = if self.loop_break_bbs.len() > 0: 1 else: 0
-        let closure_const = self.body.new_const(ConstKind.CK_CLOSURE, for_node, body_sym, in_loop, body_fn_ty)
+        let closure_const = self.body.new_const(ConstKind.CK_CLOSURE, key_node, body_sym, in_loop, body_fn_ty)
         let closure_const_op = self.body.new_operand(OperandKind.OK_CONSTANT, closure_const)
         let closure_rv = self.body.new_rvalue(RvalueKind.RK_USE, closure_const_op, 0, 0)
         let closure_place = self.place_for_local(closure_local)
@@ -7682,7 +7763,7 @@ impl MirBuilder:
         args.push(gen_op)
         args.push(closure_op)
         let args_id = self.body.new_call_args(args)
-        self.body.set_call_ast_node(args_id, for_node)
+        self.body.set_call_ast_node(args_id, key_node)
         if each_mono != 0:
             self.body.set_call_intrinsic(args_id, MirIntrinsic.GENERIC_CALL)
             self.body.set_call_contract(args_id, each_sig, each_mono)
@@ -7731,17 +7812,35 @@ impl MirBuilder:
                 self.terminate_fn_return(code)
             else:
                 let exit_label = exit_labels[code - GEN_LOOP_LABEL_BASE]
-                let is_continue = exit_continues[code - GEN_LOOP_LABEL_BASE] != 0
-                let target = self.find_control_target(exit_label, if is_continue: 1 else: 0)
-                let target_bb = if is_continue: target.continue_bb else: target.break_bb
-                if target_bb >= 0:
-                    self.emit_cleanup_to_target(target)
-                    self.terminate(TermKind.TK_GOTO, target_bb, 0, 0, 0)
-                else:
-                    let _ = self.lower_gen_loop_label_exit(exit_label, is_continue)
-                    self.terminate(TermKind.TK_UNREACHABLE, 0, 0, 0, 0)
+                let _ = self.lower_gen_loop_exit_arm(exit_label, exit_kinds[code - GEN_LOOP_LABEL_BASE])
         self.switch_to(exit_bb)
         self.forget_string_flow_facts()
+        self.unit_operand()
+
+    // In the frame that owns a gen loop, the exit its closure named: a break
+    // or continue of a loop of this frame, or a goto to a label of it, runs
+    // the cleanup of the scopes it leaves and jumps. A target this frame does
+    // not own is outside it too — this frame is itself a gen-loop closure —
+    // and the exit passes on to its owner.
+    mut fn lower_gen_loop_exit_arm(label: i32, kind: i32) -> i32:
+        if kind == GEN_EXIT_GOTO:
+            if self.gen_loop_flag_local >= 0 and self.find_goto_label_index(label) < 0:
+                let _ = self.lower_gen_loop_label_exit(label, kind)
+                self.terminate(TermKind.TK_UNREACHABLE, 0, 0, 0, 0)
+                return self.unit_operand()
+            let goto_target = self.goto_target_info(label)
+            self.emit_cleanup_to_target(goto_target)
+            self.terminate(TermKind.TK_GOTO, goto_target.break_bb, 0, 0, 0)
+            return self.unit_operand()
+        let is_continue = kind == GEN_EXIT_CONTINUE
+        let target = self.find_control_target(label, if is_continue: 1 else: 0)
+        let target_bb = if is_continue: target.continue_bb else: target.break_bb
+        if target_bb >= 0:
+            self.emit_cleanup_to_target(target)
+            self.terminate(TermKind.TK_GOTO, target_bb, 0, 0, 0)
+        else:
+            let _ = self.lower_gen_loop_label_exit(label, kind)
+            self.terminate(TermKind.TK_UNREACHABLE, 0, 0, 0, 0)
         self.unit_operand()
 
     // A capture the gen-loop protocol adds (the flag, the return slot, the
@@ -8283,6 +8382,9 @@ impl MirBuilder:
         let pat_or_sym = self.ast.get_extra(base)
         let iter_expr = self.ast.get_extra(base + 1)
 
+        if self.sema.gen_for_elem_types.contains(iter_expr):
+            self.lower_comprehension_gen(comp_node, clause_index, out_place, out_elem_ty, pat_or_sym, iter_expr)
+            return
         if self.ast.kind(iter_expr) == NodeKind.NK_RANGE:
             self.lower_comprehension_range(comp_node, clause_index, out_place, out_elem_ty, pat_or_sym, iter_expr)
             return
@@ -8340,8 +8442,12 @@ impl MirBuilder:
         if elem_ty == 0:
             elem_ty = self.sema.ty_i32 as i32
 
-        var out_local = self.new_temp(out_ty)
-        var out_place = self.place_for_local(out_local)
+        // The collection is the statement's temporary from the start, like a
+        // call's result: a `?` or cancellation while the clauses run releases
+        // it and what it holds; the finished value moves out as any result.
+        let out_local = self.new_temp(out_ty)
+        self.register_stmt_temp(out_local, out_ty)
+        let out_place = self.place_for_local(out_local)
         if out_base == self.sema.syms.hashset or out_base == self.sema.syms.hashmap:
             self.emit_map_new_into(out_place, self.ast.get_start(comp_node))
         else if self.is_btreeset_base_sym(out_base) != 0 or self.is_btreemap_base_sym(out_base) != 0:
@@ -9277,7 +9383,7 @@ impl MirBuilder:
     mut fn lower_break(node: i32) -> i32:
         let loop_info = self.find_control_target(self.ast.get_data1(node), 0)
         if loop_info.break_bb < 0:
-            return self.lower_gen_loop_label_exit(self.ast.get_data1(node), false)
+            return self.lower_gen_loop_label_exit(self.ast.get_data1(node), GEN_EXIT_BREAK)
 
         let value_expr = self.ast.get_data0(node)
         if value_expr != 0:
@@ -9297,7 +9403,7 @@ impl MirBuilder:
     mut fn lower_continue(node: i32) -> i32:
         let loop_info = self.find_control_target(self.ast.get_data0(node), 1)
         if loop_info.continue_bb < 0:
-            return self.lower_gen_loop_label_exit(self.ast.get_data0(node), true)
+            return self.lower_gen_loop_label_exit(self.ast.get_data0(node), GEN_EXIT_CONTINUE)
 
         self.flush_stmt_temp_frame()
         self.emit_cleanup_to_target(loop_info)
@@ -9306,22 +9412,22 @@ impl MirBuilder:
         self.switch_to(after_continue)
         self.unit_operand()
 
-    // D69 (§13.4): a labeled break/continue in a gen-loop closure whose label
-    // is outside the closure leaves the closure — its own scopes released, the
-    // generator stopped — and the flag names the exit for the owning frame.
-    // Sema resolved every label, so outside a gen-loop closure a missing target
-    // is a compiler bug.
-    mut fn lower_gen_loop_label_exit(label: i32, is_continue: bool) -> i32:
+    // D69 (§13.4): a labeled break/continue, or a goto, in a gen-loop closure
+    // whose label is outside the closure leaves the closure — its own scopes
+    // released, the generator stopped — and the flag names the exit for the
+    // owning frame. Sema resolved every label, so outside a gen-loop closure
+    // a missing target is a compiler bug.
+    mut fn lower_gen_loop_label_exit(label: i32, kind: i32) -> i32:
         if self.gen_loop_flag_local < 0:
-            sema_phase_bug(f"BUG: break/continue has no control target (label sym {label})")
+            sema_phase_bug(f"BUG: break/continue/goto has no target in this body (label sym {label}, exit kind {kind})")
         var exit = -1
         for ei in 0..self.gen_loop_exit_labels.len() as i32:
-            if self.gen_loop_exit_labels[ei] == label and (self.gen_loop_exit_continues[ei] != 0) == is_continue:
+            if self.gen_loop_exit_labels[ei] == label and self.gen_loop_exit_kinds[ei] == kind:
                 exit = ei
         if exit < 0:
             exit = self.gen_loop_exit_labels.len() as i32
             self.gen_loop_exit_labels.push(label)
-            self.gen_loop_exit_continues.push(if is_continue: 1 else: 0)
+            self.gen_loop_exit_kinds.push(kind)
         self.emit_pending_resets_since(0, 0, 0)
         self.emit_defers_for_return()
         self.emit_drops_for_return()
@@ -9330,22 +9436,29 @@ impl MirBuilder:
         self.switch_to(after_exit)
         self.unit_operand()
 
+    // §13.5b: a goto exits scopes to a label of this function. In a gen-loop
+    // closure (D69) a label the closure's own body does not declare is the
+    // owning function's: the goto leaves the closure like a labeled break.
     mut fn lower_goto(node: i32) -> i32:
         let label = self.ast.get_data0(node)
+        if self.gen_loop_flag_local >= 0 and self.find_goto_label_index(label) < 0:
+            return self.lower_gen_loop_label_exit(label, GEN_EXIT_GOTO)
         let target = self.goto_target_info(label)
-        if target.break_bb < 0:
-            // D69: a `goto` out of a `for` body over a Gen[T] would leave the
-            // closure that body runs as; it is not lowered (the whole
-            // function fails loudly rather than drop the jump).
-            if self.gen_loop_flag_local >= 0:
-                self.mark_unsupported()
-            return self.unit_operand()
         self.flush_stmt_temp_frame()
         self.emit_cleanup_to_target(target)
         self.terminate(TermKind.TK_GOTO, target.break_bb, 0, 0, 0)
         let after_goto = self.new_block()
         self.switch_to(after_goto)
         self.unit_operand()
+
+    // Every label a goto of this body targets is defined in it: Sema resolved
+    // each goto to a label of the same function, and a gen-loop closure hands
+    // the owning function's labels to it through the flag. A target left
+    // undefined would lower to a block that traps at run time.
+    fn verify_goto_labels():
+        for idx in 0..self.goto_label_syms.len() as i32:
+            if self.goto_label_jumped[idx] != 0 and self.goto_label_defined[idx] == 0:
+                sema_phase_bug(f"BUG: goto targets label sym {self.goto_label_syms[idx]}, which body {self.body.fn_sym} never defines")
 
     mut fn lower_label(node: i32) -> i32:
         let label = self.ast.get_data0(node)
@@ -14955,6 +15068,7 @@ impl MirBuilder:
         child.finish_stmt_temp_frame(frame)
         child.pop_scope_inline()
         child.terminate(TermKind.TK_RETURN, 0, 0, 0, 0)
+        child.verify_goto_labels()
         var finished = LoweredFunction { body: move child.body, anonymous_bodies: move child.anonymous_bodies }
         self.anonymous_bodies.push(move finished.body)
         while finished.anonymous_bodies.len() > 0:
@@ -16363,6 +16477,8 @@ fn mir_symbol_for_pool(sema: &Sema, pool: InternPool, sym: i32) -> i32:
 
 type LoweredFunction {
     body: MirBody,
+    // The bodies lowered along with it: its closures and gen-loop bodies,
+    // and, for a gen fn's producer, the constructor and `each`.
     anonymous_bodies: Vec[MirBody],
 }
 
@@ -16561,6 +16677,7 @@ fn lower_fn_with_sig(builder: MirBuilder, fn_node: i32, sig_idx: i32) -> Lowered
 
     // D32: field vacates need a mutable path — rebind the owned param.
     var owned_builder = builder
+    owned_builder.verify_goto_labels()
     LoweredFunction { body: move owned_builder.body, anonymous_bodies: move owned_builder.anonymous_bodies }
 
 fn lower_fn_clause_dispatcher(sema: &Sema, ast_pool: AstPool, pool: InternPool, group: i32) -> MirBody:
@@ -16766,7 +16883,8 @@ impl MirBody:
 
 // D69 (§13.4): calling a gen fn evaluates its arguments into the generator
 // value and runs nothing. The state struct's fields are the parameters in
-// order; each argument moves in.
+// order; each argument moves in, except a generator method's borrowed
+// receiver, whose place the value views.
 fn lower_generator_constructor(sema: &Sema, ast_pool: AstPool, pool: InternPool, fn_node: i32, fn_sym: i32, body_sym: i32, sig_idx: i32) -> MirBody:
     let state_tid: i32 = sema.generator_fn_state_types.get(fn_sym).unwrap()
     var builder = MirBuilder.init(sema, ast_pool, pool, body_sym)
@@ -16776,21 +16894,46 @@ fn lower_generator_constructor(sema: &Sema, ast_pool: AstPool, pool: InternPool,
     let names: Vec[i32] = Vec.new()
     let param_count = sema.sig_get_param_count(sig_idx)
     let meta = ast_pool.find_fn_meta(fn_node)
+    // The parameters are locals 1..=param_count, before any temporary.
     for pi in 0..param_count:
         let p_name = ast_pool.fn_param_name(ast_pool.fn_meta_param_start(meta), pi)
-        let p_ty = sema.sig_param_type(sig_idx, pi)
-        let local_id = builder.body.new_local(p_ty, 0, p_name, 1)
+        let local_id = builder.body.new_local(sema.sig_param_type(sig_idx, pi), 0, p_name, 1)
         builder.body.push_stmt(builder.cur_bb, StmtKind.StorageLive, local_id, 0, span)
         names.push(p_name)
-        let param_place = builder.place_for_local(local_id)
-        fields.push(builder.operand_for_place(param_place, p_ty))
     builder.body.n_params = param_count
+    for pi in 0..param_count:
+        let p_ty = sema.sig_param_type(sig_idx, pi)
+        let param_place = builder.place_for_local(pi + 1)
+        if pi == 0 and sema.generator_fn_receiver_views.contains(fn_sym):
+            // A borrowed receiver is the caller's place (by-place ABI); the
+            // generator value keeps a view of it.
+            let view_ty = sema.type_extra[(sema.get_type_d1(state_tid) + 1)]
+            let view_local = builder.new_temp(view_ty)
+            let view_place = builder.place_for_local(view_local)
+            let view_rv = builder.body.new_rvalue(RvalueKind.RK_REF, BorrowKind.SHARED, param_place, 0)
+            builder.body.push_stmt(builder.cur_bb, StmtKind.Assign, view_place, view_rv, span)
+            fields.push(builder.body.new_operand(OperandKind.OK_COPY, view_place))
+        else:
+            fields.push(builder.operand_for_place(param_place, p_ty))
     let fid = builder.body.new_agg_fields(fields, names)
     let rv = builder.body.new_rvalue(RvalueKind.RK_AGGREGATE, 0, fid, 0)
     let ret_place = builder.place_for_local(0)
     builder.body.push_stmt(builder.cur_bb, StmtKind.Assign, ret_place, rv, span)
     builder.terminate(TermKind.TK_RETURN, 0, 0, 0, 0)
     return move builder.body
+
+// D69 (§13.4): the three functions behind a gen fn, or behind one
+// specialization of a generic gen fn (`fn_sym` is then its specialization
+// symbol, `body_sym` the constructor's body): the producer — the gen fn's
+// body with its consumer's body as a last parameter — whose MIR body leads,
+// then the constructor and `each`.
+fn lower_generator_functions(sema: &Sema, ast_pool: AstPool, pool: InternPool, fn_node: i32, fn_sym: i32, body_sym: i32, sig_idx: i32) -> LoweredFunction:
+    let run_sym: i32 = sema.generator_fn_run_syms.get(fn_sym).unwrap()
+    let producer_builder = MirBuilder.init(sema, ast_pool, pool, mir_symbol_for_pool(sema, pool, run_sym))
+    var lowered = lower_fn_with_sig(move producer_builder, fn_node, sema.get_sig(run_sym))
+    lowered.anonymous_bodies.push(lower_generator_constructor(sema, ast_pool, pool, fn_node, fn_sym, body_sym, sig_idx))
+    lowered.anonymous_bodies.push(lower_generator_each_body(sema, ast_pool, pool, fn_sym))
+    lowered
 
 // D69 (§13.4): the generator value's `move fn each(body)` hands its stored
 // arguments and `body` to the producer, which runs the gen fn's body.
@@ -16812,7 +16955,13 @@ fn lower_generator_each_body(sema: &Sema, ast_pool: AstPool, pool: InternPool, f
         let field_sym: i32 = sema.type_extra[(field_start + fi * 3)]
         let field_ty: i32 = sema.type_extra[(field_start + fi * 3 + 1)]
         let field_place = builder.body.new_field_place(self_place, field_sym, field_ty)
-        args.push(builder.operand_for_place(field_place, field_ty))
+        if fi == 0 and sema.generator_fn_receiver_views.contains(fn_sym):
+            // The producer takes the receiver by place: the place the view
+            // names.
+            let recv_ty = sema.sig_param_type(run_sig, 0)
+            args.push(builder.body.new_operand(OperandKind.OK_COPY, builder.body.new_deref_place(field_place, recv_ty)))
+        else:
+            args.push(builder.operand_for_place(field_place, field_ty))
     let body_place = builder.place_for_local(body_local)
     args.push(builder.operand_for_place(body_place, sema.sig_param_type(each_sig, 1)))
     let args_id = builder.body.new_call_args(args)
@@ -16963,8 +17112,10 @@ fn lower_concrete_specialization(sema: Sema, ast_pool: AstPool, pool: InternPool
     let decl_index = sema.find_decl_index(fn_node)
     if decl_index >= 0:
         sema.update_decl_source_context(decl_index)
-    var builder = MirBuilder.init(&sema, ast_pool, pool, mono_sym)
-    let lowered = lower_fn_with_sig(move builder, fn_node, sig_idx)
+    let lowered = if (ast_pool.get_data2(fn_node) / FnFlags.GEN) % 2 == 1:
+        lower_generator_functions(&sema, ast_pool, pool, fn_node, mono_sym, mono_sym, sig_idx)
+    else:
+        lower_fn_with_sig(MirBuilder.init(&sema, ast_pool, pool, mono_sym), fn_node, sig_idx)
     sema.local_file_id = saved_file_id
     sema.current_module_path = saved_module_path
     sema.current_module_has_ci = saved_module_has_ci
@@ -17032,13 +17183,7 @@ pub fn lower_module(input_sema: Sema, ast_pool: AstPool, pool: InternPool) -> Mi
             let sig_idx = sema.get_sig(fn_sym)
             if sig_idx < 0:
                 continue
-            // D69 (§13.4): the constructor, the producer (the gen fn's body
-            // with its consumer's body as a last parameter), and `each`.
-            let run_sym: i32 = sema.generator_fn_run_syms.get(fn_sym).unwrap()
-            let producer_builder = MirBuilder.init(&sema, ast_pool, pool, mir_symbol_for_pool(&sema, pool, run_sym))
-            mir_mod.add_lowered_function(lower_fn_with_sig(move producer_builder, decl as i32, sema.get_sig(run_sym)))
-            mir_mod.add_body(lower_generator_constructor(&sema, ast_pool, pool, decl as i32, fn_sym, mir_fn_sym, sig_idx))
-            mir_mod.add_body(lower_generator_each_body(&sema, ast_pool, pool, fn_sym))
+            mir_mod.add_lowered_function(lower_generator_functions(&sema, ast_pool, pool, decl as i32, fn_sym, mir_fn_sym, sig_idx))
             continue
         let sig_idx = sema.get_sig(fn_sym)
         var builder = MirBuilder.init(&sema, ast_pool, pool, mir_fn_sym)
