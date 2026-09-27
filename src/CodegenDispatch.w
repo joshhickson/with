@@ -3809,6 +3809,7 @@ impl Codegen:
                         let coerced_val = self.coerce_value_to_type(val, field_ty)
                         let gep = wl_build_struct_gep(self.builder, struct_ty, alloca, llvm_fi)
                         wl_build_store(self.builder, coerced_val, gep)
+                self.mir_store_liveness_byte(struct_ty, alloca)
                 return wl_build_load(self.builder, struct_ty, alloca)
             return wl_get_undef(fallback_ty)
 
@@ -14423,7 +14424,7 @@ impl Codegen:
 
                 if self.sema.try_branch_fns.contains(gc_node):
                     let try_branch_sym: i32 = self.sema.try_branch_fns.get(gc_node).unwrap()
-                    let try_from_break_sym = self.sema.try_from_break_fns.get(gc_node).unwrap()
+                    let try_from_break_sym: i32 = self.sema.try_from_break_fns.get(gc_node).unwrap()
                     if gc_callee_sym == try_branch_sym or gc_callee_sym == try_from_break_sym:
                         let gc_mir_start = body.call_arg_starts[args_id]
                         let gc_mir_count = body.call_arg_counts[args_id]
@@ -15396,32 +15397,14 @@ impl Codegen:
                         let spawn_recv_op = body.call_arg_operands[gc_mir_start_spawn]
                         let spawn_scope_val = self.mir_eval_operand(body, spawn_recv_op, 0)
                         let spawn_worker_op = body.call_arg_operands[(gc_mir_start_spawn + gc_mir_count_spawn - 1)]
-                        var spawn_worker_node = 0
-                        let spawn_call_node = body.call_ast_node(args_id)
-                        if spawn_call_node > 0 and self.pool.kind(spawn_call_node) == NodeKind.NK_CALL:
-                            let spawn_arg_start = self.pool.get_data1(spawn_call_node)
-                            let spawn_arg_count = self.pool.get_data2(spawn_call_node)
-                            if spawn_arg_count > 0:
-                                spawn_worker_node = self.pool.get_extra(spawn_arg_start)
-                        var spawn_worker_val: i64 = 0
-                        if spawn_worker_node > 0 and self.pool.kind(spawn_worker_node) == NodeKind.NK_CLOSURE:
-                            for spawn_li in 0..body.local_count():
-                                let spawn_name_sym = body.local_names[spawn_li]
-                                if spawn_name_sym != 0:
-                                    let spawn_ptr_opt = self.mir_local_ptrs.get(spawn_li)
-                                    if spawn_ptr_opt.is_some():
-                                        let spawn_ptr: i64 = spawn_ptr_opt.unwrap()
-                                        self.local_allocas.insert(spawn_name_sym, spawn_ptr)
-                                        let spawn_ty_opt = self.mir_local_types.get(spawn_li)
-                                        if spawn_ty_opt.is_some():
-                                            let spawn_ty: i64 = spawn_ty_opt.unwrap()
-                                            self.local_types.insert(spawn_name_sym, spawn_ty)
-                                    let spawn_sema_ty = body.local_type_ids[spawn_li]
-                                    if spawn_sema_ty != 0:
-                                        self.local_sema_types.insert(spawn_name_sym, spawn_sema_ty)
-                            spawn_worker_val = self.gen_closure(spawn_worker_node, body)
-                        else:
-                            spawn_worker_val = self.mir_eval_operand(body, spawn_worker_op, 0)
+                        // The worker is the closure MIR built and moved into
+                        // the call (lower_method_call consumes it for the
+                        // task). A closure written at the call used to be
+                        // built a second time from the AST: a `move ()`
+                        // closure then captured locals the first build had
+                        // already moved out (blank), and the thread read
+                        // them empty — `v.len()` was 0.
+                        let spawn_worker_val = self.mir_eval_operand(body, spawn_worker_op, 0)
                         let spawn_worker_ty = wl_type_of(spawn_worker_val)
                         let spawn_worker_alloca = self.create_entry_alloca(spawn_worker_ty)
                         wl_build_store(self.builder, spawn_worker_val, spawn_worker_alloca)
@@ -18917,8 +18900,8 @@ impl Codegen:
         for si in 0..self.sema.concrete_specialization_syms.len() as i32:
             if self.sema.concrete_specialization_syms[si] != fn_sym:
                 continue
-            let start = self.sema.concrete_specialization_subst_starts[si]
-            let count = self.sema.concrete_specialization_subst_counts[si]
+            let start: i32 = self.sema.concrete_specialization_subst_starts[si]
+            let count: i32 = self.sema.concrete_specialization_subst_counts[si]
             for ti in 0..count:
                 let p_sym: i32 = self.sema.concrete_specialization_subst_syms[(start + ti)]
                 let p_ty: i32 = self.sema.concrete_specialization_subst_types[(start + ti)]
@@ -19257,7 +19240,7 @@ impl Codegen:
 
     mut fn gen_async_block(node: i32, parent: &MirBody) -> i64:
         let ab_body = self.prepared_anonymous_body(parent, node, ConstKind.CK_ASYNC_BLOCK)
-        let ctx = self.context
+        let ctx: i64 = self.context
         let ptr_ty = wl_ptr_type(ctx)
         let i32_ty = wl_i32_type(ctx)
         let i64_ty = wl_i64_type(ctx)

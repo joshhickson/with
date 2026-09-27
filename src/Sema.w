@@ -995,6 +995,9 @@ pub type Sema {
     method_symbol_flags: HashMap[i32, i32],
     method_lookup: SemaMethodLookup,
     drop_method_cache: HashMap[i32, i32],
+    // D72 (§2.5.1, #1431): struct name sym -> 1 when the struct carries the
+    // hidden liveness byte (struct_needs_liveness_byte), 0 otherwise.
+    liveness_byte_cache: HashMap[i32, i32],
     // is_copy cycle guard — HashSet (heap handle) so is_copy can be `&Self` and
     // mutate it through a copied handle (D7 interior-mutability recipe).
     copy_visit_stack: HashSet[i32],
@@ -1061,6 +1064,10 @@ pub type Sema {
     label_loop_entry_binds: Vec[i32],
     label_break_off: Vec[i32],
     label_break_seen: Vec[i32],
+    // #1733: every loop or labeled block a checked `break` exits, by node.
+    // Whether a `while true` or `loop` falls through is this fact: a syntax
+    // walk looking for the `break` missed one in a let-else's else branch.
+    break_target_nodes: HashMap[i32, i32],
     loop_break_flat: Vec[i32],
     // Parallel to loop_break_flat and sharing its per-frame offset (label_break_off):
     // the loop-entry move-state snapshot, one region per active loop. It lets the
@@ -1101,6 +1108,29 @@ pub type Sema {
     current_block_stmt_count: i32,
     current_block_stmt_index: i32,
     current_block_tail: i32,
+    // #1722: every block being checked, outermost first (check_block), and
+    // the statement each is at — the current block is the last. A view's
+    // later use may be in any of them up to the block that declares it.
+    live_block_starts: Vec[i32],
+    live_block_counts: Vec[i32],
+    live_block_indexes: Vec[i32],
+    live_block_tails: Vec[i32],
+    live_block_depths: Vec[i32],
+    // #1722: every loop being checked, outermost first: the part that runs
+    // again (a `while` and its condition; a `loop`'s or `for`'s body), the
+    // scope depth at its entry, and the loop_depth of its body. A view
+    // declared outside a loop and used anywhere in it is used again after
+    // a mutation in it, on the next iteration.
+    live_loop_nodes: Vec[i32],
+    live_loop_depths: Vec[i32],
+    live_loop_body_depths: Vec[i32],
+    // The first block and loop frame of the body being checked: a function,
+    // closure, `async` or scope body (push_label_boundary) starts its own —
+    // a generic callee checked in the middle of its caller must not see the
+    // caller's blocks. live_floor_saved holds the enclosing body's pair.
+    live_block_floor: i32,
+    live_loop_floor: i32,
+    live_floor_saved: Vec[i32],
     // Transient storage for closure field-level capture analysis.
     capture_field_syms: Vec[i32],
     capture_field_kinds: Vec[i32],
@@ -1499,12 +1529,27 @@ pub type Sema {
     // §9.1 / D60: the assignments whose value is the body's returned value —
     // the body tail under a declared non-`Unit` return, or an arm of a tail
     // `if`/`match` that the return takes. MirLower lowers each as its store
-    // followed by a read of its place (tail_reads_place).
+    // followed by a read of its place (tail_reads_place): 1 for the tail
+    // (D60: a whole local moves), 2 for any other value position (D73: the
+    // read is a view of the place, assign_reads_view).
     tail_read_assigns: HashMap[i32, i32],
+    // Signatures whose parameter summaries a `c facade` declares
+    // (facade_declare_view_of_param: constructors' dependency facts, text,
+    // record and Borrowed<R> views): the body check merges its own findings
+    // into them and never replaces them (D65: the facade fact is the owner;
+    // the rendered body reads a raw pointer and can derive no foreign origin).
+    facade_declared_effect_sigs: HashMap[i32, i32],
+    // D73: assignment node -> the whole non-Copy local it assigns, when its
+    // view (assign_reads_view) is rooted at that local (a view origin).
+    assign_view_targets: HashMap[i32, i32],
     // D55 (§18.2): the `if`/`match` node that is the argument of a generic
     // parameter bounded by Display (`print(match ..)`). Its arms join under
     // the ordinary rule; when nothing joins, the fix-it is the f-string.
     display_join_node: i32,
+    // D73: 1 while an `if`/`match` join may take an assignment arm as a view
+    // of its place; 0 for the tail join of an unannotated body, whose arms
+    // join as values (D43, D60: the body returns a read of the place).
+    join_assign_arms_as_views: i32,
     // #1196: signatures whose return type has been taken from their body. Until
     // then an unannotated signature reads as Unit, which a caller cannot tell
     // from a function that returns nothing.
@@ -1517,7 +1562,8 @@ pub type Sema {
     discarded_stmt_node: i32,
     // check_bodies order (#1196): per declaration 0 unchecked / 1 in progress /
     // 2 done; the node id its subtree starts after; and, for the functions that
-    // take their type from their body, declaration index by name symbol, with
+    // take their type from their body (#1196) or return a view whose origins
+    // their body decides (#1473), declaration index by name symbol, with
     // same-name declarations chained through body_typed_next.
     body_order_state: Vec[i32],
     body_order_lower: Vec[i32],
@@ -2361,6 +2407,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
     let extension_method_paths = sema_new_vec_str()
     let qualified_extension_call_nodes = sema_new_map_i32_i32()
     let drop_method_cache = sema_new_map_i32_i32()
+    let liveness_byte_cache = sema_new_map_i32_i32()
     let typed_expr_types = sema_new_map_i32_i32()
     let typed_binding_types = sema_new_map_i32_i32()
     let call_callable_types = sema_new_map_i32_i32()
@@ -2601,6 +2648,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         method_symbol_flags,
         method_lookup,
         drop_method_cache,
+        liveness_byte_cache,
         copy_visit_stack: HashSet.new(),
         needs_drop_visit: HashSet.new(),
         current_drop_type_sym: 0,
@@ -2645,6 +2693,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         label_loop_entry_binds: Vec.new(),
         label_break_off: Vec.new(),
         label_break_seen: Vec.new(),
+        break_target_nodes: sema_new_map_i32_i32(),
         loop_break_flat: Vec.new(),
         loop_entry_flat: Vec.new(),
         fn_label_syms: Vec.new(),
@@ -2675,6 +2724,17 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         current_block_stmt_count: 0,
         current_block_stmt_index: 0,
         current_block_tail: 0,
+        live_block_starts: Vec.new(),
+        live_block_counts: Vec.new(),
+        live_block_indexes: Vec.new(),
+        live_block_tails: Vec.new(),
+        live_block_depths: Vec.new(),
+        live_loop_nodes: Vec.new(),
+        live_loop_depths: Vec.new(),
+        live_loop_body_depths: Vec.new(),
+        live_block_floor: 0,
+        live_loop_floor: 0,
+        live_floor_saved: Vec.new(),
         capture_field_syms: Vec.new(),
         capture_field_kinds: Vec.new(),
         call_resolved_arg_starts: sema_new_map_i32_i32(),
@@ -2891,7 +2951,10 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         body_tail_discards: true,
         discarded_tails: sema_new_map_i32_i32(),
         tail_read_assigns: sema_new_map_i32_i32(),
+        facade_declared_effect_sigs: sema_new_map_i32_i32(),
+        assign_view_targets: sema_new_map_i32_i32(),
         display_join_node: 0,
+        join_assign_arms_as_views: 0,
         body_typed_sigs: sema_new_map_i32_i32(),
         untyped_callee_calls: Vec.new(),
         discarded_stmt_node: 0,
@@ -6196,7 +6259,7 @@ impl Sema:
         if sema_debug_move_enabled() != 0:
             let dbg_name = with_str_clone_ref(self.pool_resolve(sym))
             with_eprint(f"[state] sym=" ++ dbg_name ++ f" -> {state}")
-        let opt = self.scope_name_map.get(sym)
+        let opt = self.scope_name_map.get(sym).copied()
         if opt.is_some():
             if state == VarState.MOVED:
                 self.check_live_views_for_origin(sym, self.move_site_node)
@@ -6435,10 +6498,10 @@ impl Sema:
     mut fn capture_loop_break_move_state(frame_idx: i32):
         if frame_idx < 0 or frame_idx >= self.label_break_off.len() as i32:
             return
-        let off = self.label_break_off[frame_idx]
+        let off: i32 = self.label_break_off[frame_idx]
         if off < 0:
             return
-        let boundary = self.label_loop_entry_binds[frame_idx]
+        let boundary: i32 = self.label_loop_entry_binds[frame_idx]
         var i = 0
         while i < boundary:
             if i < self.bind_states.len() as i32 and self.bind_states[i] == VarState.MOVED and self.type_needs_drop(self.bind_types[i]) != 0:
@@ -6463,7 +6526,7 @@ impl Sema:
     mut fn check_loop_continue_carried_move(frame_idx: i32, node: i32):
         if frame_idx < 0 or frame_idx >= self.label_loop_entry_binds.len() as i32:
             return
-        let boundary = self.label_loop_entry_binds[frame_idx]
+        let boundary: i32 = self.label_loop_entry_binds[frame_idx]
         let off = if frame_idx < self.label_break_off.len() as i32: self.label_break_off[frame_idx] else: -1
         let trace_move = runtime_getenv("WITH_TRACE_MOVE").len() > 0
         if trace_move:
@@ -6871,6 +6934,140 @@ impl Sema:
                     vidx = vidx + 1
         let _ = self.needs_drop_visit.remove(resolved as i32)
         result
+
+    // D72 (§2.5.1, #1431): a `Drop` struct whose all-zero storage can be a
+    // live value (`Fd { n: 0 }`) cannot use its storage as the reset
+    // sentinel; the compiler appends a hidden liveness byte that a
+    // construction sets, the reset-on-move blank clears with the rest of the
+    // storage, and the guarded drop reads through the ordinary all-zero test.
+    // A struct with an owning non-null field — a str, a container, a raw
+    // pointer (Box, Rc, a facade resource's repr), a callable, another Drop
+    // value — keeps the storage test and gains no byte. Decided per
+    // declaration, so every instance of a generic struct agrees; a type
+    // parameter counts as a live-zero field (the byte is added, never
+    // withheld, when the answer depends on the argument). Explicit layouts
+    // (packed, bitpacked, repr(C), aligned fields), unions, distinct types
+    // and facade resources (whose `live` field is this byte, D51) are never
+    // changed.
+    mut fn struct_needs_liveness_byte(name_sym: i32) -> i32:
+        if name_sym == 0:
+            return 0
+        let cached = self.liveness_byte_cache.get(name_sym)
+        if cached.is_some():
+            return cached.unwrap()
+        // Recorded before the walk: a self-referential field reads as 0.
+        self.liveness_byte_cache.insert(name_sym, 0)
+        let result = self.struct_decl_needs_liveness_byte(name_sym)
+        self.liveness_byte_cache.insert(name_sym, result)
+        result
+
+    fn struct_liveness_byte_frozen(name_sym: i32) -> i32:
+        self.liveness_byte_cache.get(name_sym) ?? 0
+
+    mut fn struct_decl_needs_liveness_byte(name_sym: i32) -> i32:
+        if not self.type_decl_nodes.contains(name_sym) or self.distinct_type_names.contains(name_sym) or self.facade_resource_index.contains(name_sym):
+            return 0
+        let decl: i32 = self.type_decl_nodes.get(name_sym).unwrap()
+        let packed = self.ast.get_data2(decl)
+        if type_decl_sub_kind(packed) != TypeDeclKind.Struct or type_decl_is_packed(packed) != 0 or type_decl_is_bitpacked(packed) != 0 or type_decl_is_repr_c(packed) != 0:
+            return 0
+        if not self.named_types.contains(name_sym) or self.type_has_drop_impl(self.named_types.get(name_sym).unwrap()) == 0:
+            return 0
+        let extra_start = self.ast.get_data1(decl)
+        let field_count = self.ast.get_extra(extra_start)
+        for fi in 0..field_count:
+            if self.ast.get_extra(extra_start + 1 + field_count * 3 + fi) != 0:
+                return 0
+            if self.type_node_zero_is_sentinel(self.ast.get_extra(extra_start + 1 + fi * 3 + 1), decl) != 0:
+                return 0
+        1
+
+    // Whether a field of this declared type is non-zero whenever it holds a
+    // value, so the enclosing struct's zero storage is the sentinel.
+    mut fn type_node_zero_is_sentinel(node: i32, decl: i32) -> i32:
+        if node == 0:
+            return 0
+        let kind = self.ast.kind(node)
+        if kind == NodeKind.NK_TYPE_PTR or kind == NodeKind.NK_TYPE_REF or kind == NodeKind.NK_TYPE_FN or kind == NodeKind.NK_TYPE_EXTERN_FN or kind == NodeKind.NK_TYPE_SLICE or kind == NodeKind.NK_TYPE_TRAIT_OBJ:
+            return 1
+        if kind == NodeKind.NK_TYPE_OPTIONAL:
+            return 0
+        if kind == NodeKind.NK_TYPE_ARRAY:
+            return self.type_node_zero_is_sentinel(self.ast.get_data0(node), decl)
+        if kind == NodeKind.NK_TYPE_TUPLE:
+            let start = self.ast.get_data0(node)
+            for ei in 0..self.ast.get_data1(node):
+                if self.type_node_zero_is_sentinel(self.ast.get_extra(start + ei), decl) != 0:
+                    return 1
+            return 0
+        if kind == NodeKind.NK_TYPE_NAMED or kind == NodeKind.NK_TYPE_GENERIC:
+            let sym = self.ast.get_data0(node)
+            let tp_start = self.type_decl_tp_start(decl)
+            for ti in 0..self.type_decl_tp_count(decl):
+                if self.ast.get_extra(tp_start + ti) == sym:
+                    return 0
+            if kind == NodeKind.NK_TYPE_GENERIC:
+                return self.generic_base_zero_is_sentinel(sym)
+            let prim = self.primitive_type_by_sym(sym)
+            if prim != 0:
+                return if self.get_type_kind(self.resolve_alias(prim as TypeId)) == TypeKind.TY_STR: 1 else: 0
+            let named = self.lookup_named_type_visible(sym)
+            if named == 0:
+                return 0
+            return self.type_zero_is_sentinel(named)
+        // A type this walk cannot classify keeps the storage test.
+        1
+
+    fn generic_base_zero_is_sentinel(sym: i32) -> i32:
+        if sym == self.syms.vec or sym == self.syms.hashmap or sym == self.syms.hashset or sym == self.syms.slotmap or sym == self.syms.box:
+            return 1
+        let name = self.pool_resolve(sym)
+        if name == "Sender" or name == "Receiver" or name == "Rc" or name == "Arc":
+            return 1
+        0
+
+    mut fn type_zero_is_sentinel(tid: i32) -> i32:
+        if tid == 0:
+            return 0
+        let resolved = self.resolve_alias(tid as TypeId)
+        let tk = self.get_type_kind(resolved)
+        if tk == TypeKind.TY_STR or tk == TypeKind.TY_FN or tk == TypeKind.TY_PTR or tk == TypeKind.TY_REF or tk == TypeKind.TY_SLICE or tk == TypeKind.TY_EXTERN_FN or tk == TypeKind.TY_GENERIC_FN or tk == TypeKind.TY_TRAIT_OBJ:
+            return 1
+        if tk == TypeKind.TY_ARRAY or tk == TypeKind.TY_RANGE:
+            return self.type_zero_is_sentinel(self.get_type_d0(resolved))
+        if tk == TypeKind.TY_TUPLE:
+            let te_start = self.get_type_d0(resolved)
+            for ei in 0..self.get_type_d1(resolved):
+                if self.type_zero_is_sentinel(self.type_extra[(te_start + ei)]) != 0:
+                    return 1
+            return 0
+        if tk == TypeKind.TY_GENERIC_INST:
+            let base_sym = self.get_generic_inst_base(resolved as i32)
+            if self.generic_base_zero_is_sentinel(base_sym) != 0:
+                return 1
+            if self.named_types.contains(base_sym) and self.get_type_kind(self.resolve_alias(self.named_types.get(base_sym).unwrap())) == TypeKind.TY_STRUCT:
+                return self.struct_zero_is_sentinel(base_sym)
+            return 0
+        if tk == TypeKind.TY_STRUCT:
+            return self.struct_zero_is_sentinel(self.get_type_d0(resolved))
+        0
+
+    // A Drop struct is never zero when live: it carries the byte, or an
+    // owning field. A plain struct is the sum of its fields.
+    mut fn struct_zero_is_sentinel(name_sym: i32) -> i32:
+        if name_sym == 0 or not self.type_decl_nodes.contains(name_sym):
+            return 0
+        if self.named_types.contains(name_sym) and self.type_has_drop_impl(self.named_types.get(name_sym).unwrap()) != 0:
+            return 1
+        let decl: i32 = self.type_decl_nodes.get(name_sym).unwrap()
+        if type_decl_sub_kind(self.ast.get_data2(decl)) != TypeDeclKind.Struct:
+            return 0
+        let extra_start = self.ast.get_data1(decl)
+        let field_count = self.ast.get_extra(extra_start)
+        for fi in 0..field_count:
+            if self.type_node_zero_is_sentinel(self.ast.get_extra(extra_start + 1 + fi * 3 + 1), decl) != 0:
+                return 1
+        0
 
     // Whether a value of this type transitively carries a USER Drop impl
     // (W, Vec[W], Holder{item: W}). Narrower than `type_needs_drop`: pure
@@ -8038,7 +8235,7 @@ impl Sema:
         let fn_tid = self.sig_type_ids[source_sig]
         let ret = self.sig_ret_types[source_sig]
         let param_start = self.sig_param_starts[source_sig]
-        let param_count = self.sig_param_counts[source_sig]
+        let param_count: i32 = self.sig_param_counts[source_sig]
         let variadic = self.sig_variadic[source_sig]
         self.add_sig(alias, fn_tid, ret, param_start, param_count, variadic)
         let alias_sig = self.get_sig(alias)

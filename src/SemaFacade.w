@@ -2893,10 +2893,7 @@ impl Sema:
                         pi = shift + c_pi - 1
                     else if slot >= 0 and c_pi > slot:
                         pi = c_pi - 1
-                    let eff = self.sig_param_effect(sig, pi) | EFF_ESCAPE_VIEW
-                    self.set_sig_param_effect(sig, pi, eff)
-                    self.set_sig_param_direct_effect(sig, pi, eff)
-                    self.set_sig_param_view_origin(sig, pi, self.sig_param_view_origin(sig, pi) | sema_param_origin_bit(pi))
+                    self.facade_declare_view_of_param(sig, pi)
 
     // The signature of a rendered constructor `R.p`, or -1.
     fn facade_constructor_sig(want: &str) -> i32:
@@ -3086,7 +3083,7 @@ impl Sema:
         false
 
     mut fn report_facade_layout_errors():
-        let saved_file = self.local_file_id
+        let saved_file: i32 = self.local_file_id
         for i in 0..self.facade_layout_nodes.len() as i32:
             self.local_file_id = self.facade_layout_files[i]
             self.emit_facade_layout_error(self.facade_layout_msgs[i], self.facade_layout_nodes[i], self.facade_layout_tids[i], self.facade_layout_containers[i])
@@ -3282,10 +3279,7 @@ impl Sema:
             if msig < 0:
                 self.emit_error(f"fn '{fname}': 'returns borrow {rn}' passed every facade check but no method '{host}.{mname}' was rendered — a compiler defect (§16.2b.6)", node)
                 continue
-            let eff = self.sig_param_effect(msig, from) | EFF_ESCAPE_VIEW
-            self.set_sig_param_effect(msig, from, eff)
-            self.set_sig_param_direct_effect(msig, from, eff)
-            self.set_sig_param_view_origin(msig, from, self.sig_param_view_origin(msig, from) | sema_param_origin_bit(from))
+            self.facade_declare_view_of_param(msig, from)
 
     // ── record views (D66, spec §16.2b.6) ────────────────────────────────
     //
@@ -3735,6 +3729,7 @@ impl Sema:
     // parameter `pi` (its receiver when 0), as the constructors and
     // `Borrowed<R>` methods state theirs (apply_facade_dependency_effects).
     mut fn facade_declare_view_of_param(sig: i32, pi: i32):
+        self.facade_declared_effect_sigs.insert(sig, 1)
         let eff = self.sig_param_effect(sig, pi) | EFF_ESCAPE_VIEW
         self.set_sig_param_effect(sig, pi, eff)
         self.set_sig_param_direct_effect(sig, pi, eff)

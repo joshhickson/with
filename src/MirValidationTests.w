@@ -513,8 +513,9 @@ pub fn mir_test_vacated_payload_drop() -> Unit:
 //   2  moved twice on one path (Moved)
 //   3  initialized on one arm only, moved at the join (Maybe: not judged —
 //      a path that never wrote the place is not a path that moved it)
-//   4  moved on one arm, passed by move to a call at the join (not judged:
-//      a call argument OK_MOVE is a borrow for some receivers until #1505)
+//   4  moved on one arm, passed by move to a call at the join (MaybeMoved:
+//      call arguments are judged since #1505 lowered borrowed receivers
+//      as reads)
 fn moved_twice_verdict(shape: i32, drops: bool) -> str:
     var mir_mod = MirModule.init()
     for kind in [0, TypeKind.TY_INT, TypeKind.TY_STRUCT, TypeKind.TY_VOID]:
@@ -589,7 +590,8 @@ pub fn mir_test_move_of_moved_place() -> Unit:
     assert(moved_twice_verdict(1, true) == "")
     assert(moved_twice_verdict(2, true).contains("move of _2, which a path reaching it already moved out (Moved)"))
     assert(moved_twice_verdict(3, true) == "")
-    assert(moved_twice_verdict(4, true) == "")
+    assert(moved_twice_verdict(4, true).contains("bb3: move of _2, which a path reaching it already moved out (MaybeMoved)"))
+    assert(moved_twice_verdict(4, false) == "")
     // A value with no drop glue is not freed twice.
     assert(moved_twice_verdict(0, false) == "")
 
@@ -869,3 +871,250 @@ fn aggregate_borrow_verdict(arg_is_ref: bool) -> str:
 pub fn mir_test_enum_aggregate_missing_borrow:
     assert(aggregate_borrow_verdict(false).contains("enum payload 0 is a value where the variant's payload is a reference to it"))
     assert(aggregate_borrow_verdict(true) == "")
+
+// #1736: validate-all skipped a body whose lowering failed — the typed and
+// ownership validators both `continue` past it — and said ok over a
+// comprehension codegen then refused to compile. A module holding such a
+// body is refused; the same module with the body lowered is not.
+fn lowering_failed_verdict(failed: bool) -> str:
+    var mir_mod = MirModule.init()
+    mir_mod.sema_type_kinds.push(0)
+    mir_mod.sema_type_d0.push(0)
+    mir_mod.sema_type_d1.push(0)
+    mir_mod.sema_type_d2.push(0)
+    var body = MirBody.init_for_fn(9)
+    let entry = body.new_block()
+    body.set_terminator(entry, TermKind.TK_RETURN, 0, 0, 0, 0, 0)
+    if failed: body.lowering_failed = 1
+    mir_mod.add_body(body)
+    validate_all_mir_module(mir_mod)
+
+pub fn mir_test_lowering_failed_body:
+    assert(lowering_failed_verdict(true).contains("fn sym9: MIR lowering failed"))
+    assert(lowering_failed_verdict(false) == "")
+
+// #1539, #1559, #1487: the drop-state a whole-place drop or a reset blank
+// reaches. `shape`:
+//   0  written, moved out, dropped (Moved: frees what the new owner holds)
+//   1  written, moved out, reset, dropped (Reset: the blank frees nothing)
+//   2  written; one arm moves it out and does not reset; dropped at the
+//      join (MaybeMoved)
+//   3  written; one arm moves it out and resets it; dropped at the join
+//      (Reset beside Init joins to Init)
+//   4  storage without a value; one arm writes it; dropped at the join
+//      (Maybe: the other path holds no value, not even the blank)
+//   5  zero-initialized storage; one arm writes it; dropped at the join
+//   6  written, then reset though nothing moved it (the value is lost)
+//   7  written, moved out, reset
+//   8  storage without a value, reset (a zero-init)
+fn drop_state_verdict(shape: i32, drops: bool) -> str:
+    var mir_mod = MirModule.init()
+    for kind in [0, TypeKind.TY_INT, TypeKind.TY_STRUCT]:
+        mir_mod.sema_type_kinds.push(kind)
+        mir_mod.sema_type_d0.push(0)
+        mir_mod.sema_type_d1.push(0)
+        mir_mod.sema_type_d2.push(0)
+    let flag_ty = 1
+    let value_ty = 2
+    if drops:
+        mir_mod.sema_moved_drop_types.insert(value_ty, 1)
+        mir_mod.sema_dropped_types.insert(value_ty, 1)
+    var body = MirBody.init_for_fn(1)
+    body.n_params = 1
+    let flag_local = body.new_temp(flag_ty)
+    let flag = body.new_place(flag_local)
+    let value_local = body.new_temp(value_ty)
+    let value = body.new_place(value_local)
+    let taken_local = body.new_temp(value_ty)
+    let taken = body.new_place(taken_local)
+    let entry = body.new_block()
+    let arm = body.new_block()
+    let other = body.new_block()
+    let join = body.new_block()
+    let blank = body.new_const(ConstKind.CK_ZERO_SIZED, 0, 0, 0, value_ty)
+    let blank_op = body.new_operand(OperandKind.OK_CONSTANT, blank)
+    let reset = body.new_rvalue(RvalueKind.RK_USE, blank_op, 0, 0)
+    let no_fields: Vec[i32] = Vec.new()
+    let no_field_table = body.new_agg_fields(&no_fields, &no_fields)
+    let init = body.new_rvalue(RvalueKind.RK_AGGREGATE, 0, no_field_table, 0)
+    let move_op = body.new_operand(OperandKind.OK_MOVE, value)
+    let take = body.new_rvalue(RvalueKind.RK_USE, move_op, 0, 0)
+    body.push_stmt(entry, StmtKind.StorageLive, value_local, if shape == 5: 1 else: 0, 0)
+    if shape != 4 and shape != 5 and shape != 8:
+        body.push_stmt(entry, StmtKind.Assign, value, init, 0)
+    if shape == 0 or shape == 1 or shape == 7:
+        body.push_stmt(entry, StmtKind.Assign, taken, take, 0)
+    if shape == 1 or shape == 6 or shape == 7 or shape == 8:
+        body.push_stmt(entry, StmtKind.Assign, value, reset, 0)
+    let vals: Vec[i64] = Vec.new()
+    vals.push(1)
+    let targets: Vec[i32] = Vec.new()
+    targets.push(arm)
+    let table = body.new_switch_table(&vals, &targets)
+    let flag_op = body.new_operand(OperandKind.OK_COPY, flag)
+    body.set_terminator(entry, TermKind.TK_SWITCH_INT, flag_op, table, other, 0, 0)
+    if shape == 2 or shape == 3:
+        body.push_stmt(arm, StmtKind.Assign, taken, take, 0)
+    if shape == 3:
+        body.push_stmt(arm, StmtKind.Assign, value, reset, 0)
+    if shape == 4 or shape == 5:
+        body.push_stmt(arm, StmtKind.Assign, value, init, 0)
+    body.set_terminator(arm, TermKind.TK_GOTO, join, 0, 0, 0, 0)
+    body.set_terminator(other, TermKind.TK_GOTO, join, 0, 0, 0, 0)
+    if shape <= 5:
+        body.push_stmt(join, StmtKind.Drop, value, 0, 0)
+    body.set_terminator(join, TermKind.TK_RETURN, 0, 0, 0, 0, 0)
+    validate_ownership_body(mir_mod, body)
+
+pub fn mir_test_moved_drop:
+    assert(drop_state_verdict(0, true).contains("drop of _2 after a path reaching it moved it out and before its reset (Moved)"))
+    assert(drop_state_verdict(1, true) == "")
+    assert(drop_state_verdict(2, true).contains("drop of _2 after a path reaching it moved it out and before its reset (MaybeMoved)"))
+    assert(drop_state_verdict(3, true) == "")
+    // A value with no drop glue frees nothing twice (a moved CStr view).
+    assert(drop_state_verdict(0, false) == "")
+
+pub fn mir_test_maybe_uninit_drop:
+    assert(drop_state_verdict(4, true).contains("drop of _2 reaches a path where it holds no value"))
+    assert(drop_state_verdict(4, true).contains("(Maybe)"))
+    assert(drop_state_verdict(5, true) == "")
+    // Storage with no drop glue frees nothing.
+    assert(drop_state_verdict(4, false) == "")
+
+// #1559: a field's drop before it is overwritten (`drop(_1.f0); _1.f0 =
+// v`) keeps the whole value, so the whole's later drop is legal; a field
+// dropped and not written again is freed a second time by the whole's
+// drop. (A sub-place drop used to join Uninit into the whole place, which
+// read as "Maybe" for a struct that holds a value on every path.)
+fn field_redrop_verdict(rewrite: bool) -> str:
+    var mir_mod = MirModule.init()
+    for kind in [0, TypeKind.TY_STRUCT, TypeKind.TY_STRUCT]:
+        mir_mod.sema_type_kinds.push(kind)
+        mir_mod.sema_type_d0.push(0)
+        mir_mod.sema_type_d1.push(0)
+        mir_mod.sema_type_d2.push(0)
+    let whole_ty = 1
+    let field_ty = 2
+    for ty in [whole_ty, field_ty]:
+        mir_mod.sema_moved_drop_types.insert(ty, 1)
+        mir_mod.sema_dropped_types.insert(ty, 1)
+    var body = MirBody.init_for_fn(1)
+    let whole_local = body.new_temp(whole_ty)
+    let whole = body.new_place(whole_local)
+    let field = body.new_field_place(whole, 0, field_ty)
+    let entry = body.new_block()
+    let no_fields: Vec[i32] = Vec.new()
+    let no_field_table = body.new_agg_fields(&no_fields, &no_fields)
+    let init = body.new_rvalue(RvalueKind.RK_AGGREGATE, 0, no_field_table, 0)
+    body.push_stmt(entry, StmtKind.StorageLive, whole_local, 0, 0)
+    body.push_stmt(entry, StmtKind.Assign, whole, init, 0)
+    body.push_stmt(entry, StmtKind.Drop, field, 0, 0)
+    if rewrite:
+        body.push_stmt(entry, StmtKind.Assign, field, init, 0)
+    body.push_stmt(entry, StmtKind.Drop, whole, 0, 0)
+    body.set_terminator(entry, TermKind.TK_RETURN, 0, 0, 0, 0, 0)
+    validate_ownership_body(mir_mod, body)
+
+pub fn mir_test_field_redrop:
+    assert(field_redrop_verdict(true) == "")
+    assert(field_redrop_verdict(false).contains("drop of _1 frees _1.f0 again: a path reaching it dropped that part and nothing wrote it since (Uninit)"))
+
+pub fn mir_test_reset_of_init:
+    assert(drop_state_verdict(6, true).contains("reset of _2 on a path where it was never moved: the value it holds is lost"))
+    assert(drop_state_verdict(7, true) == "")
+    assert(drop_state_verdict(8, true) == "")
+    // A value with no drop glue owns nothing to lose.
+    assert(drop_state_verdict(6, false) == "")
+
+// #1742: `call fn 7(copy _1)` where the signature snapshot says parameter
+// 0 of fn 7 takes ownership (`consumes`), and this body also drops `_1`.
+// `moved` passes `move _1` and resets `_1` instead; `dropped` keeps the
+// body's own drop of `_1` after the call; `never` makes fn 7 return Never
+// (with_panic: the drop is on no path the call returns to).
+fn consuming_param_verdict(consumes: bool, moved: bool, dropped: bool, never: bool = false) -> str:
+    var mir_mod = MirModule.init()
+    for kind in [0, TypeKind.TY_VOID, TypeKind.TY_STRUCT]:
+        mir_mod.sema_type_kinds.push(kind)
+        mir_mod.sema_type_d0.push(0)
+        mir_mod.sema_type_d1.push(0)
+        mir_mod.sema_type_d2.push(0)
+    let unit_ty = 1
+    let value_ty = 2
+    mir_mod.sema_moved_drop_types.insert(value_ty, 1)
+    mir_mod.sema_callable_syms.insert(7, MirCallableClass.Signature as i32)
+    mir_mod.sema_sig_param_starts.insert(7, 0)
+    mir_mod.sema_sig_param_data.push(1)
+    mir_mod.sema_sig_param_data.push(value_ty)
+    mir_mod.sema_sig_param_data.push(if consumes: 1 else: 0)
+    if never: mir_mod.sema_never_returning_syms.insert(7, 1)
+    var body = MirBody.init_for_fn(1)
+    let value_local = body.new_temp(value_ty)
+    let value = body.new_place(value_local)
+    let result_local = body.new_temp(unit_ty)
+    let result = body.new_place(result_local)
+    let entry = body.new_block()
+    let after = body.new_block()
+    let no_fields: Vec[i32] = Vec.new()
+    let no_field_table = body.new_agg_fields(&no_fields, &no_fields)
+    let init = body.new_rvalue(RvalueKind.RK_AGGREGATE, 0, no_field_table, 0)
+    body.push_stmt(entry, StmtKind.StorageLive, value_local, 0, 0)
+    body.push_stmt(entry, StmtKind.Assign, value, init, 0)
+    let callee_const = body.new_const(ConstKind.CK_FN, 7, 0, 0, unit_ty)
+    let callee = body.new_operand(OperandKind.OK_CONSTANT, callee_const)
+    let args: Vec[i32] = Vec.new()
+    args.push(body.new_operand(if moved: OperandKind.OK_MOVE else: OperandKind.OK_COPY, value))
+    let call_id = body.new_call_args(&args)
+    body.set_terminator(entry, TermKind.TK_CALL, callee, call_id, result, after, 0)
+    if moved:
+        let blank = body.new_const(ConstKind.CK_ZERO_SIZED, 0, 0, 0, value_ty)
+        let blank_op = body.new_operand(OperandKind.OK_CONSTANT, blank)
+        let reset = body.new_rvalue(RvalueKind.RK_USE, blank_op, 0, 0)
+        body.push_stmt(after, StmtKind.Assign, value, reset, 0)
+    if dropped:
+        body.push_stmt(after, StmtKind.Drop, value, 0, 0)
+    body.set_terminator(after, TermKind.TK_RETURN, 0, 0, 0, 0, 0)
+    validate_ownership_body(mir_mod, body)
+
+pub fn mir_test_copy_into_consuming_param:
+    assert(consuming_param_verdict(true, false, true).contains("copy of _1 into parameter 0 of fn sym7, which takes ownership of it, while this body drops _1 too"))
+    // A parameter that borrows (`&T`, an in-place receiver) leaves the caller the owner.
+    assert(consuming_param_verdict(false, false, true) == "")
+    // A move with its reset hands the value over.
+    assert(consuming_param_verdict(true, true, true) == "")
+    // Without the caller's own drop the callee is the one owner.
+    assert(consuming_param_verdict(true, false, false) == "")
+    // A callee that never returns leaves no path to the caller's drop.
+    assert(consuming_param_verdict(true, false, true, true) == "")
+
+// #1735: body `fn 7(self: Counter, times: i32)`. `shape` 0 lays the
+// parameter locals out as the signature says; 1 allocates a temporary
+// between them (#1735's generator constructor: `times` read from a
+// `&Counter` slot); 2 gives the body one parameter local fewer.
+fn body_params_verdict(shape: i32) -> str:
+    var mir_mod = MirModule.init()
+    for kind in [0, TypeKind.TY_INT, TypeKind.TY_STRUCT, TypeKind.TY_REF]:
+        mir_mod.sema_type_kinds.push(kind)
+        mir_mod.sema_type_d0.push(if kind == TypeKind.TY_REF: 2 else: 0)
+        mir_mod.sema_type_d1.push(0)
+        mir_mod.sema_type_d2.push(0)
+    let int_ty = 1
+    let counter_ty = 2
+    let ref_ty = 3
+    mir_mod.sema_sig_param_starts.insert(7, 0)
+    for word in [2, counter_ty, 0, int_ty, 0]:
+        mir_mod.sema_sig_param_data.push(word)
+    var body = MirBody.init_for_fn(7)
+    let _ = body.new_temp(counter_ty)
+    if shape == 1:
+        let _ = body.new_temp(ref_ty)
+    if shape != 2:
+        let _ = body.new_temp(int_ty)
+    body.n_params = if shape == 2: 1 else: 2
+    let entry = body.new_block()
+    body.set_terminator(entry, TermKind.TK_RETURN, 0, 0, 0, 0, 0)
+    with_str_clone_ref(validate_typed_mir_body(mir_mod, body).message)
+
+pub fn mir_test_body_params_match_signature:
+    assert(body_params_verdict(0) == "")
+    assert(body_params_verdict(1).contains("parameter 1 is local _2 of ty=3, but the signature's parameter 1 is ty=1"))
+    assert(body_params_verdict(2).contains("the body has 1 parameter local(s), its signature 2 parameter(s)"))

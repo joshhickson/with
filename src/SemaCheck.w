@@ -1263,7 +1263,7 @@ impl Sema:
                 if concrete_sym != 0:
                     // Find which trait provides assoc_sym for concrete_sym
                     for ti in 0..self.trait_name_syms.len() as i32:
-                        let at_start_t = self.trait_assoc_starts[ti]
+                        let at_start_t: i32 = self.trait_assoc_starts[ti]
                         let at_count_t = self.trait_assoc_counts[ti]
                         for ai in 0..at_count_t:
                             if self.trait_assoc_names[(at_start_t + ai)] == assoc_sym:
@@ -1715,7 +1715,7 @@ impl Sema:
                 continue
             if mi >= self.module_import_starts.len() as i32:
                 continue
-            let start = self.module_import_starts[mi]
+            let start: i32 = self.module_import_starts[mi]
             let count = self.module_import_counts[mi]
             for ii in 0..count:
                 let idx = start + ii
@@ -1781,7 +1781,7 @@ impl Sema:
             self.check_decl_body_in_order(di)
         // A call typed before its callee's body was: wrong only if that body
         // turned out to produce a value.
-        let saved_file_id = self.local_file_id
+        let saved_file_id: i32 = self.local_file_id
         var ci = 0
         while ci + 3 < self.untyped_callee_calls.len() as i32:
             let call_node: i32 = self.untyped_callee_calls[ci]
@@ -1794,6 +1794,24 @@ impl Sema:
             ci = ci + 4
         self.local_file_id = saved_file_id
         self.validate_global_data_race_accesses()
+
+    // #1473 (§21.1 Rule 6): a function whose declared return is a view — a
+    // reference, or a value carrying one (`Option[&T]`, an ephemeral value) —
+    // records which parameters the result may borrow from when its body is
+    // checked (EFF_ESCAPE_VIEW, sig_param_view_origin), and a call ties its
+    // result to those arguments from that summary (record_call_view_origins).
+    // A caller checked first read an empty summary and tied nothing:
+    // `let r = first(v); v.push(2); print(r)` compiled when `first` was
+    // declared below `main`. Such a function is checked before the first
+    // declaration that calls it, as an unannotated one is (#1196).
+    fn decl_returns_view(decl: i32, di: i32) -> bool:
+        let sig = self.get_sig(self.fn_decl_semantic_symbol_at(decl, self.ast.get_data0(decl), di))
+        if sig < 0:
+            return false
+        let ret = self.sig_return_type(sig)
+        if ret == 0:
+            return false
+        self.get_type_kind(self.resolve_alias(ret as TypeId)) == TypeKind.TY_REF or self.type_is_ephemeral_value(ret) != 0
 
     // Nodes are appended children first, so a declaration's subtree is the ids
     // between the nearest declaration node below it and its own.
@@ -1817,7 +1835,8 @@ impl Sema:
             let decl = self.ast.get_decl(di)
             if self.ast.kind(decl) != NodeKind.NK_FN_DECL: continue
             let meta = self.ast.find_fn_meta(decl)
-            if meta < 0 or self.ast.fn_meta_ret(meta) != 0 or self.ast.fn_meta_tp_count(meta) != 0 or self.fn_decl_is_entry_point(decl) != 0: continue
+            if meta < 0 or self.ast.fn_meta_tp_count(meta) != 0 or self.fn_decl_is_entry_point(decl) != 0: continue
+            if self.ast.fn_meta_ret(meta) != 0 and not self.decl_returns_view(decl, di): continue
             // A call names it by its bare name: `later(x)`, `self.later()`.
             let parsed = self.ast.get_data0(decl)
             let text: str = with_str_clone_ref(self.pool_resolve(parsed))
@@ -2120,7 +2139,7 @@ impl Sema:
         let mt_count = self.trait_method_counts[trait_idx]
         for mi in 0..mt_count:
             let mt_idx = mt_start + mi
-            let method_sym = self.trait_method_names[mt_idx]
+            let method_sym: i32 = self.trait_method_names[mt_idx]
             if self.pool_resolve(method_sym) != method_name:
                 continue
             let impl_type_sym = self.ast.get_data0(impl_node)
@@ -2348,9 +2367,9 @@ impl Sema:
         self.current_fn_sig_idx = sig_idx
 
         // Set current return type
-        let saved_ret = self.current_return_type
-        let saved_gen_yield_type = self.current_gen_yield_type
-        let saved_has_gen_yield_type = self.has_gen_yield_type
+        let saved_ret: i32 = self.current_return_type
+        let saved_gen_yield_type: i32 = self.current_gen_yield_type
+        let saved_has_gen_yield_type: i32 = self.has_gen_yield_type
         let is_gen = (flags / FnFlags.GEN) % 2
         if is_gen == 1:
             // Keyed by the signature's symbol: a generic gen fn's
@@ -2549,8 +2568,18 @@ impl Sema:
         // References may carry returned-view origins; raw pointers carry raw
         // validity preconditions instead. Neither owns through the parameter.
         var raw_validity_param_sym = 0
+        // A facade declared this signature's summary before any body was
+        // checked (facade_declare_view_of_param: a constructor's dependency
+        // facts, a text/record view's `from param N`); the rendered body
+        // reads a raw pointer and derives no origin of its own, so writing
+        // its findings over the declared ones lost the caller's view tie
+        // whenever this body was checked before the caller — always, once
+        // #1473 checks a view-returning function first.
+        let facade_declared = sig_idx >= 0 and self.facade_declared_effect_sigs.contains(sig_idx)
         for pi in 0..self.current_fn_param_effs.len() as i32:
             var eff: i32 = self.current_fn_param_effs[pi]
+            if facade_declared and sig_idx >= 0:
+                eff = eff | self.sig_param_effect(sig_idx, pi)
             if eff != 0:
                 if sig_idx >= 0:
                     let p_tid = self.sig_param_type(sig_idx, pi)
@@ -2576,10 +2605,11 @@ impl Sema:
                     direct_eff = direct_eff | EFF_CONSUME
                 self.set_sig_param_effect(sig_idx, pi, eff)
                 self.set_sig_param_direct_effect(sig_idx, pi, direct_eff)
+                let declared_origin = if facade_declared: self.sig_param_view_origin(sig_idx, pi) else: 0
                 if (eff & EFF_ESCAPE_VIEW) != 0:
-                    self.set_sig_param_view_origin(sig_idx, pi, self.current_fn_param_origins[pi])
+                    self.set_sig_param_view_origin(sig_idx, pi, self.current_fn_param_origins[pi] | declared_origin)
                 else:
-                    self.set_sig_param_view_origin(sig_idx, pi, 0)
+                    self.set_sig_param_view_origin(sig_idx, pi, declared_origin)
                 if raw_validity_param_sym == 0 and (eff & EFF_RAW_PTR_VALIDITY) != 0 and pi < self.current_fn_param_syms.len() as i32:
                     raw_validity_param_sym = self.current_fn_param_syms[pi]
             // D63 call-once: published for every parameter — a callable
@@ -2783,7 +2813,7 @@ impl Sema:
                 self.assoc_type_bindings.insert(at_name, at_tid as i32)
 
         self.push_scope()
-        let param_start = self.trait_method_param_starts[method_idx]
+        let param_start: i32 = self.trait_method_param_starts[method_idx]
         let param_count = self.trait_method_param_counts[method_idx]
         for pi in 0..param_count:
             let p_name = self.ast.fn_param_name(param_start, pi)
@@ -3175,7 +3205,7 @@ impl Sema:
             diag.set_code("unused-label")
             self.diags.emit(move diag)
 
-    fn push_label_boundary() -> Unit:
+    mut fn push_label_boundary() -> Unit:
         self.label_syms.push(0)
         self.label_kinds.push(LabelFrameKind.LFK_BOUNDARY)
         self.label_nodes.push(0)
@@ -3185,6 +3215,12 @@ impl Sema:
         self.label_loop_entry_binds.push(self.bind_names.len() as i32)
         self.label_break_off.push(-1)
         self.label_break_seen.push(0)
+        // #1722: the body behind the boundary has its own blocks and loops
+        // for view liveness; pop_label_frame restores the enclosing floors.
+        self.live_floor_saved.push(self.live_block_floor)
+        self.live_floor_saved.push(self.live_loop_floor)
+        self.live_block_floor = self.live_block_starts.len() as i32
+        self.live_loop_floor = self.live_loop_nodes.len() as i32
 
     mut fn push_label_frame(sym: i32, kind: i32, node: i32) -> Unit:
         if sym != 0:
@@ -3205,9 +3241,12 @@ impl Sema:
         self.label_break_off.push(-1)
         self.label_break_seen.push(0)
 
-    fn pop_label_frame():
+    mut fn pop_label_frame():
         if self.label_syms.len() as i32 == 0:
             return
+        if self.label_kinds[self.label_kinds.len() as i32 - 1] == LabelFrameKind.LFK_BOUNDARY and self.live_floor_saved.len() >= 2:
+            self.live_loop_floor = self.live_floor_saved.pop().unwrap()
+            self.live_block_floor = self.live_floor_saved.pop().unwrap()
         self.label_syms.pop()
         self.label_kinds.pop()
         self.label_nodes.pop()
@@ -4508,7 +4547,7 @@ impl Sema:
         let start = self.dyn_impl_flat_method_names.len() as i32
         self.dyn_impl_starts.insert(reg_key, start)
         self.dyn_impl_counts.insert(reg_key, 0)
-        let m_start = self.trait_method_starts[trait_idx]
+        let m_start: i32 = self.trait_method_starts[trait_idx]
         let m_count = self.trait_method_counts[trait_idx]
         var rows = 0
         for mi in 0..m_count:
@@ -6137,6 +6176,23 @@ impl Sema:
     // its store followed by a read of its place (MirLower, ComptimeEval).
     fn tail_reads_place(node: i32): node != 0 and self.tail_read_assigns.contains(node)
 
+    // §9.1 / D73: an assignment in a value position other than the body's
+    // tail yields a view of its place after the store — the read that the
+    // place spelled there would be under D22/D27: a Copy demand copies, an
+    // owned demand on a non-Copy view is refused (view_projection_exprs).
+    fn assign_reads_view(node: i32): node != 0 and (self.tail_read_assigns.get(node) ?? 0) == 2
+
+    // An assignment is a statement when it is the statement being checked
+    // (check_block, check_expr_statement_context set the root), through
+    // any grouping. Every other position is a value position; a body's tail
+    // is re-classified once the body is typed (record_tail_reads,
+    // discard_body_tail).
+    fn assign_in_statement_position(node: i32) -> bool:
+        var root = self.current_statement_expr_root
+        while root != 0 and self.ast.kind(root) == NodeKind.NK_GROUPED:
+            root = self.ast.get_data0(root)
+        root == node
+
     fn recorded_value_type(node: i32) -> bool:
         let ty = self.recorded_expr_type_or_zero(node)
         ty != 0 and ty != self.ty_void as i32 and ty != self.ty_never as i32
@@ -6273,89 +6329,14 @@ impl Sema:
                 return 1
         0
 
-    // Whether the subtree contains a `break 'label` targeting exactly this
-    // label. Descends into nested loops (their breaks may still target the
-    // outer label) but not closures/fns. Used by body_can_fall_through: a
-    // labeled block containing a break to its OWN label falls through to
-    // its after-edge.
-    fn body_contains_break_to_label(node: i32, label: i32) -> i32:
-        if node == 0 or label == 0:
-            return 0
-        let kind = self.ast.kind(node)
-        if kind == NodeKind.NK_CLOSURE or kind == NodeKind.NK_FN_DECL:
-            return 0
-        if kind == NodeKind.NK_BREAK:
-            if self.ast.get_data1(node) == label: return 1
-            return 0
-        if kind == NodeKind.NK_BLOCK:
-            let extra_start = self.ast.get_data0(node)
-            let stmt_count = self.ast.get_data1(node)
-            for si in 0..stmt_count:
-                if self.body_contains_break_to_label(self.ast.get_extra(extra_start + si), label) != 0:
-                    return 1
-            return self.body_contains_break_to_label(self.ast.get_data2(node), label)
-        if kind == NodeKind.NK_IF_EXPR:
-            if self.body_contains_break_to_label(self.ast.get_data1(node), label) != 0:
-                return 1
-            return self.body_contains_break_to_label(self.ast.get_data2(node), label)
-        if kind == NodeKind.NK_MATCH:
-            let arm_start = self.ast.get_data1(node)
-            let arm_count = self.ast.get_data2(node)
-            for ai in 0..arm_count:
-                if self.body_contains_break_to_label(self.ast.get_extra(arm_start + ai), label) != 0:
-                    return 1
-            return 0
-        if kind == NodeKind.NK_MATCH_ARM:
-            return self.body_contains_break_to_label(self.ast.get_data1(node), label)
-        if kind == NodeKind.NK_LOOP:
-            return self.body_contains_break_to_label(self.ast.get_data0(node), label)
-        if kind == NodeKind.NK_WHILE:
-            return self.body_contains_break_to_label(self.ast.get_data1(node), label)
-        if kind == NodeKind.NK_DO_WHILE:
-            return self.body_contains_break_to_label(self.ast.get_data0(node), label)
-        if kind == NodeKind.NK_FOR:
-            return self.body_contains_break_to_label(self.ast.get_data2(node), label)
-        if kind == NodeKind.NK_LET_BINDING or kind == NodeKind.NK_LET_DECL:
-            return self.body_contains_break_to_label(self.ast.get_data1(node), label)
-        0
-
-    fn body_contains_break(node: i32) -> i32:
-        if node == 0:
-            return 0
-        let kind = self.ast.kind(node)
-        if kind == NodeKind.NK_CLOSURE or kind == NodeKind.NK_FN_DECL:
-            return 0
-        if kind == NodeKind.NK_BREAK:
-            return 1
-        if kind == NodeKind.NK_BLOCK:
-            let extra_start = self.ast.get_data0(node)
-            let stmt_count = self.ast.get_data1(node)
-            for si in 0..stmt_count:
-                if self.body_contains_break(self.ast.get_extra(extra_start + si)) != 0:
-                    return 1
-            return self.body_contains_break(self.ast.get_data2(node))
-        if kind == NodeKind.NK_IF_EXPR:
-            if self.body_contains_break(self.ast.get_data1(node)) != 0:
-                return 1
-            return self.body_contains_break(self.ast.get_data2(node))
-        if kind == NodeKind.NK_MATCH:
-            let arm_start = self.ast.get_data1(node)
-            let arm_count = self.ast.get_data2(node)
-            for ai in 0..arm_count:
-                if self.body_contains_break(self.ast.get_extra(arm_start + ai)) != 0:
-                    return 1
-            return 0
-        if kind == NodeKind.NK_MATCH_ARM:
-            return self.body_contains_break(self.ast.get_data1(node))
-        if kind == NodeKind.NK_LOOP:
-            return 0
-        if kind == NodeKind.NK_WHILE:
-            return 0
-        if kind == NodeKind.NK_DO_WHILE:
-            return 0
-        if kind == NodeKind.NK_FOR:
-            return 0
-        0
+    // Whether a checked `break` exits this loop or labeled block (#1733):
+    // Sema's own resolution of every `break` (check_expr's NK_BREAK arm
+    // records its target), not a walk of the syntax. The walk looked into
+    // blocks, `if`s and `match`es only, so `while true: let Some(x) = e
+    // else: break` read as a loop that never exits — the function "never
+    // fell through" and MIR never stored its result (garbage return).
+    fn is_break_target(node: i32) -> bool:
+        self.break_target_nodes.contains(node)
 
     fn bool_literal_is_true(node: i32) -> i32:
         if node == 0 or self.ast.kind(node) != NodeKind.NK_BOOL_LIT:
@@ -6366,6 +6347,15 @@ type SemaIntLiteralValue {
     ok: i32,
     value: i64,
 }
+
+// A use found by scan_block_frame (0 for none), or how the scanned block
+// was left before any use (stmt_exit_kind).
+type SemaLaterUse {
+    node: i32,
+    exit: i32,
+}
+
+impl Copy for SemaLaterUse
 
 impl Sema:
     fn int_literal_i64_value(node: i32) -> SemaIntLiteralValue:
@@ -6419,10 +6409,8 @@ impl Sema:
             // #779: a `break` targeting THIS block's own label exits to the
             // block's after-edge — the block itself falls through.
             let bcf_meta = self.ast.find_block_meta(node)
-            if bcf_meta >= 0:
-                let bcf_label = self.ast.block_meta_label(bcf_meta)
-                if bcf_label != 0 and self.body_contains_break_to_label(node, bcf_label) != 0:
-                    return 1
+            if bcf_meta >= 0 and self.ast.block_meta_label(bcf_meta) != 0 and self.is_break_target(node):
+                return 1
             let extra_start = self.ast.get_data0(node)
             let stmt_count = self.ast.get_data1(node)
             for si in 0..stmt_count:
@@ -6451,17 +6439,11 @@ impl Sema:
         if kind == NodeKind.NK_MATCH_ARM:
             return self.body_can_fall_through(self.ast.get_data1(node))
         if kind == NodeKind.NK_LOOP:
-            if self.body_contains_break(self.ast.get_data0(node)) == 0:
-                return 0
-            return 1
+            return if self.is_break_target(node): 1 else: 0
         if kind == NodeKind.NK_WHILE:
-            if self.condition_is_static_true(self.ast.get_data0(node)) != 0 and self.body_contains_break(self.ast.get_data1(node)) == 0:
-                return 0
-            return 1
+            return if self.condition_is_static_true(self.ast.get_data0(node)) != 0 and not self.is_break_target(node): 0 else: 1
         if kind == NodeKind.NK_DO_WHILE:
-            if self.condition_is_static_true(self.ast.get_data1(node)) != 0 and self.body_contains_break(self.ast.get_data0(node)) == 0:
-                return 0
-            return 1
+            return if self.condition_is_static_true(self.ast.get_data1(node)) != 0 and not self.is_break_target(node): 0 else: 1
         1
 
     mut fn check_bitwise_literal_with_expected(node: i32, expected: TypeId) -> TypeId:
@@ -6849,6 +6831,8 @@ impl Sema:
             let label = self.ast.get_data2(node)
             self.check_bool_condition(cond, "while")
             self.loop_depth = self.loop_depth + 1
+            // The condition runs again after the body: both are re-run.
+            self.push_live_loop(node, self.scope_starts.len() as i32)
             self.push_label_frame(label, LabelFrameKind.LFK_WHILE, node)
             let while_frame_idx = self.label_syms.len() as i32 - 1
             self.alloc_loop_break_region(while_frame_idx)
@@ -6867,7 +6851,9 @@ impl Sema:
             // loop; finalize_loop_move_state runs the back-edge use-after-move check
             // and computes the post-loop state (#613).
             self.push_move_control_flow_context(1)
+            let while_scoped = self.enter_body_scope(body)
             let while_body_type = self.check_expr_statement_context(body)
+            self.leave_body_scope(while_scoped)
             self.pop_move_control_flow_context()
             self.drop_control_flow_depth = saved_drop_cf
             if pushed_regex_capture_scope != 0:
@@ -6875,6 +6861,7 @@ impl Sema:
             let while_body_diverges = if self.get_type_kind(self.resolve_alias(while_body_type as TypeId)) == TypeKind.TY_NEVER: 1 else: 0
             self.finalize_loop_move_state(&while_entry_states, while_frame_idx, while_body_diverges, 1, node)
             self.pop_label_frame()
+            self.pop_live_loop()
             self.loop_depth = self.loop_depth - 1
             return self.ty_void
 
@@ -6883,6 +6870,7 @@ impl Sema:
             let cond = self.ast.get_data1(node)
             let label = self.ast.get_data2(node)
             self.loop_depth = self.loop_depth + 1
+            self.push_live_loop(node, self.scope_starts.len() as i32)
             self.push_label_frame(label, LabelFrameKind.LFK_WHILE, node)
             let dw_frame_idx = self.label_syms.len() as i32 - 1
             self.alloc_loop_break_region(dw_frame_idx)
@@ -6891,12 +6879,15 @@ impl Sema:
             if self.current_drop_type_sym != 0:
                 self.drop_control_flow_depth = self.drop_control_flow_depth + 1
             self.push_move_control_flow_context(1)
+            let dw_scoped = self.enter_body_scope(body)
             let dw_body_type = self.check_expr_statement_context(body)
+            self.leave_body_scope(dw_scoped)
             self.pop_move_control_flow_context()
             self.drop_control_flow_depth = saved_drop_cf_dw
             let dw_body_diverges = if self.get_type_kind(self.resolve_alias(dw_body_type as TypeId)) == TypeKind.TY_NEVER: 1 else: 0
             self.finalize_loop_move_state(&dw_entry_states, dw_frame_idx, dw_body_diverges, 1, node)
             self.pop_label_frame()
+            self.pop_live_loop()
             self.loop_depth = self.loop_depth - 1
             self.check_bool_condition(cond, "do-while")
             return self.ty_void
@@ -6904,6 +6895,7 @@ impl Sema:
         if kind == NodeKind.NK_LOOP:
             self.union_clear_last_written()
             self.loop_depth = self.loop_depth + 1
+            self.push_live_loop(node, self.scope_starts.len() as i32)
             self.push_scope()
             self.push_label_frame(self.ast.get_data1(node), LabelFrameKind.LFK_LOOP, node)
             let loop_frame_idx = self.label_syms.len() as i32 - 1
@@ -6923,6 +6915,7 @@ impl Sema:
             let result_ty = if loop_frame_idx >= 0: self.label_break_value_types[loop_frame_idx] else: 0
             self.pop_label_frame()
             self.pop_scope()
+            self.pop_live_loop()
             self.loop_depth = self.loop_depth - 1
             let loop_ty = if result_ty != 0: result_ty else: self.ty_never as i32
             self.typed_expr_types.insert(node, loop_ty)
@@ -6936,15 +6929,13 @@ impl Sema:
                 self.emit_error_code("break not allowed in defer", node, "E0901")
             let val = self.ast.get_data0(node)
             let label = self.ast.get_data1(node)
+            let target = if label != 0: self.resolve_labeled_control(label, node) else: self.resolve_innermost_loop_control(node, "break")
             if label != 0:
-                let target = self.resolve_labeled_control(label, node)
                 self.mark_function_label_used(label)
-                self.capture_loop_break_move_state(target)
-                self.check_break_value_for_target(target, val, node)
-            else:
-                let target = self.resolve_innermost_loop_control(node, "break")
-                self.capture_loop_break_move_state(target)
-                self.check_break_value_for_target(target, val, node)
+            if target >= 0:
+                self.break_target_nodes.insert(self.label_nodes[target], 1)
+            self.capture_loop_break_move_state(target)
+            self.check_break_value_for_target(target, val, node)
             return self.ty_never
 
         if kind == NodeKind.NK_CONTINUE:
@@ -10061,11 +10052,17 @@ impl Sema:
 
         let saved_block_extra: i32 = self.current_block_extra_start
         let saved_block_count: i32 = self.current_block_stmt_count
-        let saved_block_index = self.current_block_stmt_index
+        let saved_block_index: i32 = self.current_block_stmt_index
         let saved_block_tail: i32 = self.current_block_tail
         self.current_block_extra_start = extra_start
         self.current_block_stmt_count = stmt_count
         self.current_block_tail = tail
+        let live_frame = self.live_block_starts.len() as i32
+        self.live_block_starts.push(extra_start)
+        self.live_block_counts.push(stmt_count)
+        self.live_block_indexes.push(0)
+        self.live_block_tails.push(tail)
+        self.live_block_depths.push(self.scope_starts.len() as i32)
 
         var last_stmt_ty: TypeId = 0 as TypeId
         // Unreachable-code detection: once a statement unconditionally transfers
@@ -10076,6 +10073,7 @@ impl Sema:
         var reported_unreachable = 0
         for i in 0..stmt_count:
             self.current_block_stmt_index = i
+            self.live_block_indexes[live_frame] = i
             let stmt = self.ast.get_extra(extra_start + i)
             let stmt_kind = self.ast.kind(stmt)
             if self.stmt_starts_reachable_region(stmt) != 0:
@@ -10118,6 +10116,8 @@ impl Sema:
         if tail != 0 and block_diverged != 0 and reported_unreachable == 0:
             self.emit_error("unreachable code", tail)
             reported_unreachable = 1
+        // The block is at its tail: past every statement (later_use_of).
+        self.live_block_indexes[live_frame] = stmt_count
         if tail != 0:
             // If the tail is a match in a void/unspecified-return context, treat as statement
             // position so partial enum match is allowed (value is not used).
@@ -10168,6 +10168,12 @@ impl Sema:
                 self.check_returned_closure_env(tail, tail)
         self.expire_dead_borrows_in_block(extra_start, stmt_count, stmt_count, 0)
 
+        while self.live_block_starts.len() as i32 > live_frame:
+            self.live_block_starts.pop()
+            self.live_block_counts.pop()
+            self.live_block_indexes.pop()
+            self.live_block_tails.pop()
+            self.live_block_depths.pop()
         self.current_block_extra_start = saved_block_extra
         self.current_block_stmt_count = saved_block_count
         self.current_block_stmt_index = saved_block_index
@@ -10177,7 +10183,7 @@ impl Sema:
         // its after-edge — it falls through and must not type as Never, whether
         // the break is a statement or the block's tail. A `break 'label value`
         // gives the block that value's type (§29.13).
-        if result == self.ty_never and block_label != 0 and self.body_contains_break_to_label(node, block_label) != 0:
+        if result == self.ty_never and block_label != 0 and self.is_break_target(node):
             let blk_frame_idx = self.label_syms.len() as i32 - 1
             let blk_break_ty: i32 = if blk_frame_idx >= 0: self.label_break_value_types[blk_frame_idx] else: 0
             result = if blk_break_ty != 0: blk_break_ty as TypeId else: self.ty_void
@@ -10230,7 +10236,11 @@ impl Sema:
             return
         self.view_projection_exprs.insert(expr, field_ty)
 
-    mut fn reject_owned_demand_from_view_projection(value_node: i32, demanded: i32, context: &str):
+    mut fn reject_owned_demand_from_view_projection(value_node0: i32, demanded: i32, context: &str):
+        // D73: `(s = e)` is the view its assignment yields, through the grouping.
+        var value_node = value_node0
+        while value_node > 0 and self.ast.kind(value_node) == NodeKind.NK_GROUPED:
+            value_node = self.ast.get_data0(value_node)
         if value_node <= 0:
             return
         if not self.view_projection_exprs.contains(value_node):
@@ -10495,7 +10505,11 @@ impl Sema:
         // keeps `let _ = param` a non-consuming acknowledgement: the param stays
         // share-place (borrowed) instead of being forced to owned.
         var field_view_let = 0
-        if self.pool_resolve(name) != "_" and not self.view_projection_exprs.contains(value):
+        // D73: `let t = (s = e)` binds the view the grouped assignment yields.
+        var value_core = value
+        while value_core != 0 and self.ast.kind(value_core) == NodeKind.NK_GROUPED:
+            value_core = self.ast.get_data0(value_core)
+        if self.pool_resolve(name) != "_" and not self.view_projection_exprs.contains(value) and not self.view_projection_exprs.contains(value_core):
             // §2.4: a drop-body let of a self field CONSUMES (the 84ebff6d
             // observation rule contradicted the spec — spec_ss02_4 pins the
             // WFN order: consumed local drops before the remaining-field
@@ -10566,7 +10580,7 @@ impl Sema:
         else:
             self.binding_closure_nodes.remove(name)
         let bind_kind = self.get_type_kind(self.resolve_alias(bind_type))
-        if bind_kind == TypeKind.TY_REF or self.view_projection_exprs.contains(value) or field_view_let != 0:
+        if bind_kind == TypeKind.TY_REF or self.view_projection_exprs.contains(value) or self.view_projection_exprs.contains(value_core) or field_view_let != 0:
             self.scope_set_is_view_bound(name)
         if self.scope_is_view_bound(name) != 0 or self.type_has_drop_impl(bind_type as i32) != 0 or self.type_is_ephemeral_value(bind_type as i32) != 0 or self.closure_expr_has_by_place_captures(value) != 0:
             self.record_view_binding_from_expr(name, value)
@@ -10610,6 +10624,19 @@ impl Sema:
         t
 
 
+    // #1559: a body that is no block — `if c:` then one `let` on its own
+    // line, a one-statement `while` body — is its own scope, as a block
+    // body is (check_block opens that one itself).
+    mut fn enter_body_scope(body: i32) -> bool:
+        if body == 0 or self.ast.kind(body) == NodeKind.NK_BLOCK:
+            return false
+        self.push_scope()
+        true
+
+    mut fn leave_body_scope(scoped: bool):
+        if scoped:
+            self.pop_scope()
+
     mut fn check_if_expr(node: i32) -> i32:
         let cond = self.ast.get_data0(node)
         let then_body = self.ast.get_data1(node)
@@ -10640,7 +10667,7 @@ impl Sema:
             self.stmt_pos_depth > 0 or self.current_return_type == self.ty_void or (self.current_return_type == 0 and else_body == 0)
         let in_value_context = in_statement_context == 0
         let outer_expected: TypeId = if is_infer_tail: 0 as TypeId else if in_value_context and self.has_expected_type != 0: self.expected_expr_type else: 0 as TypeId
-        let saved_infer_tail = self.infer_tail_node
+        let saved_infer_tail: i32 = self.infer_tail_node
         // Save scope states before then branch so early-return branches don't
         // permanently mark outer variables as MOVED when control continues past the if.
         // Branch move-state join (MaybeUninitialized half — docs/completed/branch-merge-soundness.md):
@@ -10664,6 +10691,10 @@ impl Sema:
         // Each arm sees only an independently established enclosing expectation.
         // The first arm never becomes the second arm's expected type: Stage 3's
         // shared resolver decides the join after both exact types are known.
+        // #1559: an arm that is no block (`if c:` then one `let` on its own
+        // line) is still the arm's scope: its binding was visible, and
+        // uninitialized, after an `if` that did not take the arm.
+        let then_scoped = self.enter_body_scope(then_body)
         let then_type = if outer_expected != 0:
             self.check_expr_with_expected(then_body, outer_expected)
         else if in_value_context:
@@ -10673,6 +10704,7 @@ impl Sema:
             self.check_expr_statement_context(then_body)
         else:
             self.check_expr(then_body)
+        self.leave_body_scope(then_scoped)
         self.infer_tail_node = saved_infer_tail
         self.pop_move_control_flow_context()
         self.drop_control_flow_depth = saved_drop_cf_then
@@ -10694,6 +10726,7 @@ impl Sema:
             if self.current_drop_type_sym != 0:
                 self.drop_control_flow_depth = self.drop_control_flow_depth + 1
             self.push_move_control_flow_context(1)
+            let else_scoped = self.enter_body_scope(else_body)
             let else_type = if outer_expected != 0:
                 self.check_expr_with_expected(else_body, outer_expected)
             else if in_value_context:
@@ -10703,6 +10736,7 @@ impl Sema:
                 self.check_expr_statement_context(else_body)
             else:
                 self.check_expr(else_body)
+            self.leave_body_scope(else_scoped)
             self.infer_tail_node = saved_infer_tail
             self.pop_move_control_flow_context()
             self.drop_control_flow_depth = saved_drop_cf_else
@@ -10724,7 +10758,9 @@ impl Sema:
                 join_roles.push(D22_JOIN_ROLE_EXPR)
                 // #1754: at a `&T` parameter the arms decide the join (no anchor).
                 let if_anchor = if self.borrow_pointee_join_node == node: 0 as TypeId else: outer_expected
+                self.join_assign_arms_as_views = if is_infer_tail: 0 else: 1
                 let arm_types = self.join_field_arms_as_views(if_anchor as i32, &join_nodes, move join_types)
+                self.join_assign_arms_as_views = 0
                 let saved_infer_join: i32 = self.infer_tail_join
                 self.infer_tail_join = if is_infer_tail: 1 else: 0
                 result_type = self.resolve_contextual_join(if_anchor as i32, &join_nodes, &origin_nodes, &arm_types, &join_roles, node, "if") as TypeId
@@ -10946,6 +10982,10 @@ impl Sema:
         if kind == NodeKind.NK_ASSIGN:
             out = self.collect_expr_view_deps(self.ast.get_data0(node), move out)
             out = self.collect_expr_view_deps(self.ast.get_data1(node), move out)
+            // D73: in a value position the assignment is a view of its place,
+            // so an owned whole-local target is an origin, as an element's or
+            // field's root is (a join of such arms binds a view of it).
+            out = self.push_unique_i32(move out, self.assign_view_targets.get(node) ?? 0)
             return out
         // #1406 (§3.4, §21.1 rule 10, D27): an element view carries the
         // origins check_index recorded on it (record_view_producer_origins:
@@ -11201,11 +11241,18 @@ impl Sema:
             var peeled_place = expr_node
             while peeled_place != 0 and self.ast.kind(peeled_place) == NodeKind.NK_GROUPED:
                 peeled_place = self.ast.get_data0(peeled_place)
+            // D73: the view an assignment yields is of its target place.
+            var assign_view = false
+            if peeled_place != 0 and self.ast.kind(peeled_place) == NodeKind.NK_ASSIGN and self.assign_reads_view(peeled_place):
+                assign_view = true
+                peeled_place = self.ast.get_data0(peeled_place)
+                while peeled_place != 0 and self.ast.kind(peeled_place) == NodeKind.NK_GROUPED:
+                    peeled_place = self.ast.get_data0(peeled_place)
             // #1244: an auto-referenced initializer (`let s: &T = x`) borrows
             // its root exactly as `&x` does.
             // #1530: a field view of an owned root (`let p = x.s`, D22)
             // borrows that root exactly as an element view does.
-            if peeled_place != 0 and (self.ast.kind(peeled_place) == NodeKind.NK_INDEX or self.ast.kind(peeled_place) == NodeKind.NK_FIELD_ACCESS or self.auto_ref_binding_values.contains(expr_node)):
+            if peeled_place != 0 and (assign_view or self.ast.kind(peeled_place) == NodeKind.NK_INDEX or self.ast.kind(peeled_place) == NodeKind.NK_FIELD_ACCESS or self.auto_ref_binding_values.contains(expr_node)):
                 let root = self.place_root_sym(peeled_place)
                 if root != 0 and root != sym:
                     deps = self.push_unique_i32(move deps, root)
@@ -12185,6 +12232,23 @@ impl Sema:
         else if self.ast.kind(target) == NodeKind.NK_FIELD_ACCESS:
             self.clear_moved_fields_for_place_expr(target)
 
+        // §9.1 / D73: in a value position the assignment yields a read of
+        // `place` after the store, a view (assign_reads_view). A non-Copy
+        // place's view is recorded as a view projection, so an owned demand
+        // on it — `a = b = s`, `let t: str = (s = e)` — is refused at the
+        // demand with the clone fix-it, and the value is never duplicated.
+        if not self.assign_in_statement_position(node):
+            self.tail_read_assigns.insert(node, 2)
+            if target_type != 0 and self.is_copy(target_type) == 0:
+                let tk = self.get_type_kind(self.resolve_alias(target_type))
+                if tk != TypeKind.TY_REF and tk != TypeKind.TY_PTR:
+                    self.view_projection_exprs.insert(node, target_type as i32)
+                    var view_target = target
+                    while view_target != 0 and self.ast.kind(view_target) == NodeKind.NK_GROUPED:
+                        view_target = self.ast.get_data0(view_target)
+                    if view_target != 0 and self.ast.kind(view_target) == NodeKind.NK_IDENT and self.scope_has(self.ast.get_data0(view_target)) != 0:
+                        self.assign_view_targets.insert(node, self.ast.get_data0(view_target))
+
         if target_type != 0:
             return target_type as i32
         self.ty_void as i32
@@ -12308,6 +12372,7 @@ impl Sema:
         // loop variable is sound (#613).
         let for_entry_states = self.save_scope_states()
         let for_view_count = self.for_view_binding_syms.len()
+        let for_live_depth = self.scope_starts.len() as i32
         self.push_scope()
         if gen_elem != 0:
             self.register_gen_loop_view_borrows(iterable)
@@ -12338,7 +12403,9 @@ impl Sema:
         let saved_drop_cf_for: i32 = self.drop_control_flow_depth
         if self.current_drop_type_sym != 0:
             self.drop_control_flow_depth = self.drop_control_flow_depth + 1
+        self.push_live_loop(body, for_live_depth)
         let for_body_type = self.check_expr_statement_context(body)
+        self.pop_live_loop()
         self.drop_control_flow_depth = saved_drop_cf_for
         // `for` exits when the iterable is exhausted (like a condition) → has_condition_exit = 1.
         let for_body_diverges = if self.get_type_kind(self.resolve_alias(for_body_type as TypeId)) == TypeKind.TY_NEVER: 1 else: 0
@@ -14592,7 +14659,9 @@ impl Sema:
         if match_is_value:
             // #1754: at a `&T` parameter the arms decide the join (no anchor).
             let match_anchor = if self.borrow_pointee_join_node == node: 0 as TypeId else: match_expected
+            self.join_assign_arms_as_views = if is_infer_tail: 0 else: 1
             let arm_types = self.join_field_arms_as_views(match_anchor as i32, &join_expr_nodes, move join_expr_types)
+            self.join_assign_arms_as_views = 0
             let saved_infer_join: i32 = self.infer_tail_join
             self.infer_tail_join = if is_infer_tail: 1 else: 0
             result_type = self.resolve_contextual_join(match_anchor as i32, &join_expr_nodes, &join_origin_nodes, &arm_types, &join_roles, node, "match") as TypeId
@@ -15654,10 +15723,10 @@ impl Sema:
         var other_first_variant = 0
         var qi = 0
         while qi < queue_types.len() as i32:
-            let current_ty = queue_types[qi]
-            let current_start = queue_starts[qi]
-            let current_count = queue_counts[qi]
-            let current_first = queue_first_variants[qi]
+            let current_ty: i32 = queue_types[qi]
+            let current_start: i32 = queue_starts[qi]
+            let current_count: i32 = queue_counts[qi]
+            let current_first: i32 = queue_first_variants[qi]
             qi = qi + 1
             if best_count >= 0 and current_count >= best_count:
                 continue
@@ -15743,10 +15812,10 @@ impl Sema:
         var other_first_variant = 0
         var qi = 0
         while qi < queue_types.len() as i32:
-            let current_ty = queue_types[qi]
-            let current_start = queue_starts[qi]
-            let current_count = queue_counts[qi]
-            let current_first = queue_first_variants[qi]
+            let current_ty: i32 = queue_types[qi]
+            let current_start: i32 = queue_starts[qi]
+            let current_count: i32 = queue_counts[qi]
+            let current_first: i32 = queue_first_variants[qi]
             qi = qi + 1
             if best_count >= 0 and current_count >= best_count:
                 continue
@@ -19601,10 +19670,10 @@ impl Sema:
     mut fn check_expr_with_expected(node: i32, expected: TypeId) -> TypeId:
         let saved_expected: i32 = self.expected_expr_type
         let saved_has: i32 = self.has_expected_type
-        let saved_statement_root = self.current_statement_expr_root
-        let saved_value_root = self.current_value_expr_root
-        let saved_match_stmt = self.match_in_stmt_pos
-        let saved_stmt_depth = self.stmt_pos_depth
+        let saved_statement_root: i32 = self.current_statement_expr_root
+        let saved_value_root: i32 = self.current_value_expr_root
+        let saved_match_stmt: i32 = self.match_in_stmt_pos
+        let saved_stmt_depth: i32 = self.stmt_pos_depth
         self.expected_expr_type = expected
         self.has_expected_type = if expected != 0: 1 else: 0
         if expected != 0 and expected != self.ty_void:
@@ -20512,7 +20581,7 @@ impl Sema:
                 let impl_args_idx = self.ast.find_impl_trait_type_args(decl as NodeId)
                 if impl_args_idx < 0:
                     continue
-                let impl_arg_start = self.ast.state.impl_trait_type_args[(impl_args_idx + 1)]
+                let impl_arg_start: i32 = self.ast.state.impl_trait_type_args[(impl_args_idx + 1)]
                 let impl_arg_count = self.ast.state.impl_trait_type_args[(impl_args_idx + 2)]
                 let bind_count = if trait_arg_count < impl_arg_count: trait_arg_count else: impl_arg_count
                 for tai in 0..bind_count:
@@ -20569,7 +20638,7 @@ impl Sema:
             return self.resolve_type_expr(node) as i32
         let saved_file_id: i32 = self.local_file_id
         let saved_module_path = with_str_clone_ref(self.current_module_path)
-        let saved_module_has_ci = self.current_module_has_ci
+        let saved_module_has_ci: i32 = self.current_module_has_ci
         self.local_file_id = self.ast.file(node as NodeId) as i32
         self.current_module_path = with_str_clone_ref(owner)
         if self.scoping_active != 0:
@@ -20857,7 +20926,7 @@ impl Sema:
             let target_base = self.blanket_target_base_syms[bi]
             if target_base != base_sym:
                 continue
-            let impl_node = self.blanket_impl_nodes[bi]
+            let impl_node: i32 = self.blanket_impl_nodes[bi]
             let target_node = self.ast.find_impl_target_type_node(impl_node)
             if target_node == 0:
                 continue
@@ -20866,8 +20935,8 @@ impl Sema:
             let tp_meta = self.ast.find_impl_type_params(impl_node)
             if tp_meta < 0:
                 continue
-            let tp_start = self.ast.state.impl_type_params[(tp_meta + 1)]
-            let tp_count = self.ast.state.impl_type_params[(tp_meta + 2)]
+            let tp_start: i32 = self.ast.state.impl_type_params[(tp_meta + 1)]
+            let tp_count: i32 = self.ast.state.impl_type_params[(tp_meta + 2)]
             let pattern_arg_count = self.ast.get_data2(target_node)
             if pattern_arg_count != self.get_generic_inst_arg_count(resolved as i32):
                 continue
@@ -21002,7 +21071,7 @@ impl Sema:
         let variant_count = self.get_type_d2(resolved)
         var pos = self.get_type_d1(resolved)
         for vi in 0..variant_count:
-            let payload_count = self.type_extra[(pos + 1)]
+            let payload_count: i32 = self.type_extra[(pos + 1)]
             for pi in 0..payload_count:
                 let payload_ty: i32 = self.type_extra[(pos + 2 + pi)]
                 if self.type_satisfies_thread_trait(payload_ty, trait_sym) == 0:
@@ -21045,7 +21114,7 @@ impl Sema:
             let variant_count = self.get_type_d2(base_resolved)
             var epos = self.get_type_d1(base_resolved)
             for vi in 0..variant_count:
-                let payload_count = self.type_extra[(epos + 1)]
+                let payload_count: i32 = self.type_extra[(epos + 1)]
                 for pi in 0..payload_count:
                     let payload_ty = self.substitute_type(self.type_extra[(epos + 2 + pi)], subst_syms, subst_tids, tp_count)
                     if self.type_satisfies_thread_trait(payload_ty, trait_sym) == 0:
@@ -24250,7 +24319,7 @@ impl Sema:
         // not moved.
         if obj_type != 0 and self.get_type_kind(self.resolve_alias(obj_type)) == TypeKind.TY_FN and self.pool_resolve(field) == "clone" and arg_count == 0:
             if self.ast.kind(expr) == NodeKind.NK_IDENT and self.binding_closure_nodes.contains(self.ast.get_data0(expr)):
-                let known_closure = self.binding_closure_nodes.get(self.ast.get_data0(expr)).unwrap()
+                let known_closure: i32 = self.binding_closure_nodes.get(self.ast.get_data0(expr)).unwrap()
                 if self.ast.is_move_closure(known_closure) != 0:
                     for ci in 0..self.closure_capture_summary_count(known_closure):
                         let cap_sym = self.closure_capture_summary_sym(known_closure, ci)
@@ -26299,7 +26368,7 @@ impl Sema:
             return self.borrow_root_place(self.ast.get_data0(node))
         if kind == NodeKind.NK_INDEX:
             return self.borrow_root_place(self.ast.get_data0(node))
-        if kind == NodeKind.NK_GROUPED or kind == NodeKind.NK_NO_SUSPEND:
+        if kind == NodeKind.NK_GROUPED or kind == NodeKind.NK_NO_SUSPEND or (kind == NodeKind.NK_ASSIGN and self.assign_reads_view(node)):
             return self.borrow_root_place(self.ast.get_data0(node))
         0
 
@@ -26558,15 +26627,122 @@ impl Sema:
                 last_node = tail_use
         last_node
 
-    // A view's last use in the current block — and, when the view was handed
-    // to a pair's userdata setter (§16.2b.9 "Retained borrows"), the
-    // retaining resource's last use: the resource holds the view until its
-    // last callback-capable operation, so the resource's uses are the view's.
-    fn view_last_use(ref_sym: i32, after_node: i32) -> i32:
-        var last = self.find_last_use_in_block(self.current_block_extra_start, self.current_block_stmt_count, self.current_block_stmt_index + 1, self.current_block_tail, ref_sym, after_node)
+    // #1722: a loop whose `rerun` part (see live_loop_nodes) is checked now;
+    // `entry_depth` is the scope depth at the loop, before its own scopes.
+    mut fn push_live_loop(rerun: i32, entry_depth: i32):
+        self.live_loop_nodes.push(rerun)
+        self.live_loop_depths.push(entry_depth)
+        self.live_loop_body_depths.push(self.loop_depth)
+
+    mut fn pop_live_loop():
+        self.live_loop_nodes.pop()
+        self.live_loop_depths.pop()
+        self.live_loop_body_depths.pop()
+
+    // How control leaves a statement: 0 on to the next one, 1 out of the
+    // function (`return`), 2 out of the innermost loop (`break`), 3 to its
+    // next iteration (`continue`). A labeled `break`/`continue` is read as
+    // the innermost loop's, which only scans more than it must.
+    fn stmt_exit_kind(stmt: i32) -> i32:
+        if stmt == 0:
+            return 0
+        let kind = self.ast.kind(stmt)
+        if kind == NodeKind.NK_RETURN:
+            return 1
+        if kind == NodeKind.NK_BREAK:
+            return 2
+        if kind == NodeKind.NK_CONTINUE:
+            return 3
+        0
+
+    // The first use of `sym` in block frame `f` from statement `start` on,
+    // stopping at the first statement that leaves the block: its exit kind
+    // (stmt_exit_kind) is returned when no use comes before it. The tail is
+    // read positionally, after `after_node`, as find_last_use_in_block does.
+    fn scan_block_frame(f: i32, start: i32, sym: i32, after_node: i32) -> SemaLaterUse:
+        let extra = self.live_block_starts[f]
+        let count = self.live_block_counts[f]
+        var si = start
+        while si < count:
+            let stmt = self.ast.get_extra(extra + si)
+            if self.expr_uses_symbol(stmt, sym) != 0:
+                return SemaLaterUse { node: stmt, exit: 0 }
+            let exit = self.stmt_exit_kind(stmt)
+            if exit != 0:
+                return SemaLaterUse { node: 0, exit }
+            si = si + 1
+        let tail = self.live_block_tails[f]
+        if tail == 0:
+            return SemaLaterUse { node: 0, exit: 0 }
+        let tail_use = self.find_symbol_use_after_in_span(tail, sym, self.ast.get_end(after_node))
+        if tail_use != 0:
+            return SemaLaterUse { node: tail_use, exit: 0 }
+        SemaLaterUse { node: 0, exit: self.stmt_exit_kind(tail) }
+
+    // A later use of `sym` after `after_node`, reachable from it, within the
+    // scope that holds the view (`view_depth`, the borrow's
+    // borrow_scope_depths): in the current block (as before); else, while
+    // control falls out of the current block, in each enclosing block of this
+    // body; and in every loop it falls through or continues, whose body (a
+    // `while`'s condition too) runs again. A `return` reaches nothing more; a
+    // `break` leaves the innermost loop without running it again.
+    // #1722: only the current block was scanned, so `while k < 2: x.s = ...;
+    // k += 1` followed by `print(p)` dropped `p`'s borrow and accepted the
+    // write — `p` then read the replacement string after the one it viewed
+    // was freed. A single-statement body is no block, which is why the
+    // issue's `for` body was refused.
+    fn later_use_of(sym: i32, after_node: i32, view_depth: i32) -> i32:
+        let current = self.find_last_use_in_block(self.current_block_extra_start, self.current_block_stmt_count, self.current_block_stmt_index + 1, self.current_block_tail, sym, after_node)
+        if current != 0:
+            return current
+        let top = self.live_block_starts.len() as i32 - 1
+        if top < self.live_block_floor:
+            return 0
+        let top_index: i32 = self.live_block_indexes[top]
+        let top_stmt = if top_index < self.live_block_counts[top]: self.ast.get_extra(self.live_block_starts[top] + top_index) else: self.live_block_tails[top]
+        var exit = self.stmt_exit_kind(top_stmt)
+        if exit == 0:
+            exit = self.scan_block_frame(top, top_index + 1, sym, after_node).exit
+        var inner_depth: i32 = 2147483647
+        var li = self.live_loop_nodes.len() as i32 - 1
+        var f = top
+        while f >= self.live_block_floor and self.live_block_depths[f] >= view_depth:
+            let depth: i32 = self.live_block_depths[f]
+            // The loops between the point and this block: entered in it, and
+            // holding the point.
+            while li >= self.live_loop_floor and self.live_loop_depths[li] >= depth and self.live_loop_depths[li] < inner_depth:
+                if exit == 1:
+                    return 0
+                if exit != 2:
+                    let rerun = self.live_loop_nodes[li]
+                    if self.expr_uses_symbol(rerun, sym) != 0:
+                        let again = self.find_symbol_use_after_in_span(rerun, sym, self.ast.get_start(rerun) - 1)
+                        return if again != 0: again else: rerun
+                // Past the loop, control goes on after it.
+                exit = 0
+                li = li - 1
+            if exit == 1:
+                return 0
+            // The current block's own statements were scanned above; an
+            // enclosing block is scanned once control falls out into it.
+            if exit == 0 and f != top:
+                let scan = self.scan_block_frame(f, self.live_block_indexes[f] + 1, sym, after_node)
+                if scan.node != 0:
+                    return scan.node
+                exit = scan.exit
+            inner_depth = depth
+            f = f - 1
+        0
+
+    // A view's last use after this point (later_use_of) — and, when the view
+    // was handed to a pair's userdata setter (§16.2b.9 "Retained borrows"),
+    // the retaining resource's: the resource holds the view until its last
+    // callback-capable operation, so the resource's uses are the view's.
+    fn view_last_use(ref_sym: i32, after_node: i32, view_depth: i32) -> i32:
+        var last = self.later_use_of(ref_sym, after_node, view_depth)
         if self.facade_pair_retainers.contains(ref_sym):
             let retainer: i32 = self.facade_pair_retainers.get(ref_sym).unwrap()
-            let via = self.find_last_use_in_block(self.current_block_extra_start, self.current_block_stmt_count, self.current_block_stmt_index + 1, self.current_block_tail, retainer, after_node)
+            let via = self.later_use_of(retainer, after_node, view_depth)
             if via != 0 and (last == 0 or self.ast.get_start(via) > self.ast.get_start(last)):
                 last = via
         last
@@ -26602,7 +26778,7 @@ impl Sema:
                 i = i + 1
                 continue
             let stmt_root = self.current_statement_expr_root
-            let last_use = self.view_last_use(ref_sym, node)
+            let last_use = self.view_last_use(ref_sym, node, self.borrow_scope_depths[i])
             let used_here = stmt_root != 0 and self.view_used_in(stmt_root, ref_sym)
             if last_use == 0 and not used_here:
                 if self.for_view_binding_depth(ref_sym) == 0:
@@ -26654,7 +26830,7 @@ impl Sema:
             let ref_name: str = with_str_clone_ref(self.pool_resolve(ref_sym))
             let creation_node = self.borrow_creation_nodes[i]
             let binding_node = self.binding_decl_node(ref_sym)
-            let last_use = self.view_last_use(ref_sym, err_node)
+            let last_use = self.view_last_use(ref_sym, err_node, self.borrow_scope_depths[i])
             // A view whose final use is already behind this mutation is dead.
             // This also handles a mutation on a diverging arm: a lexical use
             // after the enclosing branch is not reachable from that mutation.
@@ -27441,7 +27617,8 @@ impl Sema:
             let carrier = self.pipeline_carrier_kinds.get(node)
             if carrier.is_some() and carrier.unwrap() != 0:
                 return self.place_root_sym(self.ast.get_data0(node))
-        if kind == NodeKind.NK_FIELD_ACCESS or kind == NodeKind.NK_COMPUTED_FIELD_ACCESS or kind == NodeKind.NK_INDEX or kind == NodeKind.NK_MULTI_INDEX or kind == NodeKind.NK_GROUPED or kind == NodeKind.NK_NO_SUSPEND:
+        // D73: an assignment in a value position is a read of its place.
+        if kind == NodeKind.NK_FIELD_ACCESS or kind == NodeKind.NK_COMPUTED_FIELD_ACCESS or kind == NodeKind.NK_INDEX or kind == NodeKind.NK_MULTI_INDEX or kind == NodeKind.NK_GROUPED or kind == NodeKind.NK_NO_SUSPEND or (kind == NodeKind.NK_ASSIGN and self.assign_reads_view(node)):
             return self.place_root_sym(self.ast.get_data0(node))
         // &x.field — strip the reference operator to get the underlying place's root
         if kind == NodeKind.NK_UNARY:
@@ -28366,17 +28543,30 @@ impl Sema:
     // when it can join as a view of its place, else 0.
     mut fn join_field_view_candidate(arm: i32) -> i32:
         let leaf = self.join_arm_leaf(arm)
-        if leaf == 0 or self.ast.kind(leaf) != NodeKind.NK_FIELD_ACCESS or self.d32_base_is_type_name(leaf) != 0:
+        if leaf == 0:
             return 0
-        let fty_opt = self.typed_expr_types.get(leaf)
-        let fty = if fty_opt.is_some(): fty_opt.unwrap() else: 0
+        // D73: an arm that is an assignment yields a view of its place, which
+        // joins as a field view does (`let t = if p: s = e1 else: s = e2`).
+        var place = leaf
+        if self.ast.kind(leaf) == NodeKind.NK_ASSIGN and self.assign_reads_view(leaf) and self.join_assign_arms_as_views != 0:
+            place = self.ast.get_data0(leaf)
+            while place != 0 and self.ast.kind(place) == NodeKind.NK_GROUPED:
+                place = self.ast.get_data0(place)
+            if place == 0 or (self.ast.kind(place) != NodeKind.NK_IDENT and self.ast.kind(place) != NodeKind.NK_FIELD_ACCESS):
+                return 0
+        else if self.ast.kind(leaf) != NodeKind.NK_FIELD_ACCESS or self.d32_base_is_type_name(leaf) != 0:
+            return 0
+        let fty_opt = self.typed_expr_types.get(place)
+        var fty = if fty_opt.is_some(): fty_opt.unwrap() else: 0
+        if place != leaf:
+            fty = self.assignment_target_value_type(place, fty) as i32
         // #1531 (§3.8, D27): a Copy field joins as a view too, as a Copy
         // element does (`if c: v[0] else: v[1]` is `&i32`).
         if fty == 0:
             return 0
-        if unpack_place_kind(self.classify_place(leaf)) == PlaceKind.PK_NotPlace:
+        if unpack_place_kind(self.classify_place(place)) == PlaceKind.PK_NotPlace:
             return 0
-        let root = self.place_root_sym(leaf)
+        let root = self.place_root_sym(place)
         if root == 0 or self.scope_has(root) == 0:
             return 0
         leaf

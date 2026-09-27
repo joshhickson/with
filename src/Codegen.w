@@ -252,6 +252,9 @@ pub type Codegen {
     struct_declared_align: HashMap[i64, i64],
     bitpacked_backing_types: HashMap[i32, i64],  // struct_idx → LLVM iN type (64-bit pointer)
     bitpacked_by_llvm_type: HashMap[i64, i32],  // LLVM iN type → struct_idx (reverse lookup)
+    // D72 (§2.5.1): LLVM struct type → the index of its hidden liveness byte
+    // (Sema decided the struct carries one: struct_needs_liveness_byte).
+    liveness_byte_indices: HashMap[i64, i32],
     bitpacked_field_bit_offsets: Vec[i32],  // indexed by bp_info_start + field_idx
     bitpacked_field_bit_widths: Vec[i32],   // indexed by bp_info_start + field_idx
     // Per-place bitpacked projection: when a place resolves to a bitpacked field,
@@ -1000,6 +1003,7 @@ fn Codegen.init_with_opt(module_name: &str, opt_level: i32) -> Codegen:
         struct_declared_align: HashMap.new(),
         bitpacked_backing_types: HashMap.new(),
         bitpacked_by_llvm_type: HashMap.new(),
+        liveness_byte_indices: HashMap.new(),
         bitpacked_field_bit_offsets: Vec.new(),
         bitpacked_field_bit_widths: Vec.new(),
         bitpacked_place_proj: HashMap.new(),
@@ -2647,6 +2651,16 @@ impl Codegen:
 
     // ── Helper: build default value for a type ────────────────────────
 
+    // D72 (§2.5.1): a constructed value of a struct with the hidden liveness
+    // byte is live — set the byte to 1 (its zero-filled storage is the reset
+    // sentinel; a move's reset clears it with the rest).
+    fn mir_store_liveness_byte(struct_ty: i64, alloca: i64):
+        let idx = self.liveness_byte_indices.get(struct_ty) ?? -1
+        if idx < 0:
+            return
+        let gep = wl_build_struct_gep(self.builder, struct_ty, alloca, idx)
+        wl_build_store(self.builder, wl_const_int(wl_i8_type(self.context), 1, 0), gep)
+
     fn build_default_value(ty: i64) -> i64:
         let kind = wl_get_type_kind(ty)
         if kind == wl_integer_type_kind():
@@ -3637,7 +3651,7 @@ impl Codegen:
                     return self.get_or_create_generic_enum_type(resolved_tid)
             // User-defined generic structs: monomorphize via type bindings
             if cg_base_sym != 0 and self.generic_structs.contains(cg_base_sym):
-                let saved_len = self.type_bindings_len
+                let saved_len: i32 = self.type_bindings_len
                 let saved_syms = move self.type_binding_syms
                 let saved_types = move self.type_binding_types
                 let tp_syms: Vec[i32] = Vec.new()
@@ -4423,8 +4437,14 @@ impl Codegen:
             if max_align > self.abi_align_of(st_type):
                 self.struct_declared_align.insert(st_type, max_align)
         else:
-            // No alignment annotations — identity mapping, direct field types
-            wl_struct_set_body(st_type, vec_data_i64(&ft_vec), field_count, is_packed)
+            // No alignment annotations — identity mapping, direct field types.
+            // D72: a Drop struct whose zero storage is a live value gets the
+            // hidden liveness byte appended (Sema decided; the source field
+            // indices are unchanged).
+            if self.sema.struct_liveness_byte_frozen(self.codegen_sema_sym_for(name_sym)) != 0:
+                ft_vec.push(wl_i8_type(self.context))
+                self.liveness_byte_indices.insert(st_type, field_count)
+            wl_struct_set_body(st_type, vec_data_i64(&ft_vec), ft_vec.len() as i32, is_packed)
 
     // ── Declare union type ────────────────────────────────────────────
 
@@ -6040,9 +6060,9 @@ impl Codegen:
         let abi_index = self.compute_fn_abi(ret_ty, orig_param_types, places, if uses_internal_abi: FN_ABI_WITH else: FN_ABI_C, is_variadic)
         let abi = self.fn_abis[abi_index]
         let has_sret = if abi.ret.pass == PM_INDIRECT: 1 else: 0
-        let sret_ty = abi.ret.source_ty
+        let sret_ty: i64 = abi.ret.source_ty
         let byval_types = self.fn_abi_byval_types(abi_index)
-        let fn_type = abi.llvm_ty
+        let fn_type: i64 = abi.llvm_ty
 
         // @[link_name("symbol")] overrides the C symbol this extern links against
         // (stored as a "link_name:" callconv prefix). Otherwise canonicalize the
@@ -6437,7 +6457,7 @@ impl Codegen:
         let gs_opt = self.generic_structs.get(name_sym)
         if not gs_opt.is_some():
             return 0
-        let type_node = gs_opt.unwrap()
+        let type_node: i32 = gs_opt.unwrap()
         let tp_count = self.type_decl_tp_count(type_node)
         if tp_count <= 0:
             let st_opt = self.struct_type_map.get(name_sym)
@@ -6542,7 +6562,11 @@ impl Codegen:
             ft_vec.push(f_ty)
 
         if invalid_layout == 0:
-            wl_struct_set_body(mono_ty, vec_data_i64(&ft_vec), field_count, 0)
+            // D72: decided per declaration, so every instance agrees.
+            if self.sema.struct_liveness_byte_frozen(self.codegen_sema_sym_for(name_sym)) != 0:
+                ft_vec.push(wl_i8_type(self.context))
+                self.liveness_byte_indices.insert(mono_ty, field_count)
+            wl_struct_set_body(mono_ty, vec_data_i64(&ft_vec), ft_vec.len() as i32, 0)
 
         self.type_binding_syms = saved_bind_syms
         self.type_binding_types = saved_bind_tys

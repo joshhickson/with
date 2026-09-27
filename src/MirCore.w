@@ -554,6 +554,10 @@ pub type MirModule {
     // validator asks it whether a vacated sub-place is one the whole
     // value's drop would free again; MirCore has no Sema to ask.
     sema_moved_drop_types: HashMap[i32, i32],
+    // #1559: the drop-glue types of every place a body drops (a Drop
+    // statement or a drop terminator): a place need not be moved for a
+    // drop of it on a path where it holds no value to free garbage.
+    sema_dropped_types: HashMap[i32, i32],
     // D65 (#1647, #1639): every symbol Sema accepts as a direct call target,
     // keyed by this module's pool: MirCallableClass.Signature for a declared
     // signature, Generic for a generic template, Intrinsic for a builtin
@@ -562,6 +566,17 @@ pub type MirModule {
     // the module and no intrinsic mark, so a callee re-derived from an AST
     // spelling (#1635's `r(21)`) can never reach codegen silently.
     sema_callable_syms: HashMap[i32, i32],
+    // #1735, #1742: each function's Sema signature, by this module's symbol
+    // (the canonical signature of its name, get_sig): the offset of
+    // [param count, then (type, consumes) per parameter] in
+    // sema_sig_param_data. `consumes` is 1 for a parameter that takes
+    // ownership of its argument — a plain `T` that is no in-place receiver
+    // (value_ref_abi), not a `&T` or a raw pointer.
+    sema_sig_param_starts: HashMap[i32, i32],
+    sema_sig_param_data: Vec[i32],
+    // #1742: every function whose signature returns Never (with_panic): a
+    // call to it has no continuation for the caller's drops to run on.
+    sema_never_returning_syms: HashMap[i32, i32],
 }
 
 pub enum MirCallableClass: i32:
@@ -592,7 +607,11 @@ fn MirModule.init -> MirModule:
         sema_task_sym: 0,
         sema_scoped_task_sym: 0,
         sema_moved_drop_types: HashMap.new(),
+        sema_dropped_types: HashMap.new(),
         sema_callable_syms: HashMap.new(),
+        sema_sig_param_starts: HashMap.new(),
+        sema_sig_param_data: Vec.new(),
+        sema_never_returning_syms: HashMap.new(),
     }
 
 impl MirModule:
@@ -1481,10 +1500,15 @@ impl MirDropStateMap:
         // keeps its state. Joining Moved into the base made a partial move
         // read as a conditional whole move (`_4=Maybe`), and the vacated
         // payload a whole-enum drop freed again read as the same Maybe as
-        // its parent (#1394).
+        // its parent (#1394). A sub-place drop (Uninit) is the same: the
+        // drop-before-overwrite of a field (`drop(_4.f); _4.f = move _6`)
+        // leaves the whole value there, and joining Uninit into the base
+        // made it Maybe — "holds no value on a path" (#1559) for a struct
+        // that holds one on every path. The dropped field stays Uninit in
+        // its own key, which the vacated-sub-place rule reads.
         if body.place_proj_counts[place_id] == 0:
             self.mark_local(keys, base, state)
-        else if state != MirDropState.Moved:
+        else if state != MirDropState.Moved and state != MirDropState.Uninit:
             self.set(keys, base, mir_drop_state_join(self.get(keys, base), state))
 
     mut fn note_operand(keys: &MirDropStateKeys, body: &MirBody, operand_id: i32):
@@ -2245,6 +2269,36 @@ fn mir_drop_vacated_message(keys: &MirDropStateKeys, state: &MirDropStateMap, bo
     let child_state = mir_drop_state_name(state.get(keys, child))
     "drop of " ++ mir_place_text(body, place_id) ++ " frees " ++ keys.names[child] ++ f", which a path reaching it moved out ({child_state}) and nothing reset (§2.5.1)"
 
+// #1559: the key of a sub-place of the whole local `place_id` that a path
+// reaching its drop already dropped and nothing wrote again (Uninit, or
+// Maybe at a join), or -1. A sub-place drop no longer turns the whole
+// place Maybe (mark_place): the drop-before-overwrite of a field keeps the
+// whole value. A field dropped and not rewritten is freed again by the
+// whole value's drop glue; this is where that shows.
+fn mir_drop_redropped_subplace(mir_mod: &MirModule, body: &MirBody, keys: &MirDropStateKeys, state: &MirDropStateMap, key_places: &Vec[i32], place_id: i32) -> i32:
+    if body.place_proj_counts[place_id] != 0:
+        return -1
+    let place_key: i32 = keys.place_key[place_id]
+    let whole_state = state.get(keys, place_key)
+    if whole_state != MirDropState.Init and whole_state != MirDropState.Maybe:
+        return -1
+    let base: i32 = keys.base_local[place_key]
+    for i in keys.child_starts[base]..keys.child_starts[base + 1]:
+        let child: i32 = keys.children[i]
+        let child_state = state.get(keys, child)
+        if child_state != MirDropState.Uninit and child_state != MirDropState.Maybe:
+            continue
+        let child_place: i32 = key_places[child]
+        if child_place < 0:
+            continue
+        if mir_mod.sema_dropped_types.contains(mir_validate_place_type(mir_mod, body, child_place)):
+            return child
+    -1
+
+fn mir_drop_redropped_message(keys: &MirDropStateKeys, state: &MirDropStateMap, body: &MirBody, place_id: i32, child: i32) -> str:
+    let child_state = mir_drop_state_name(state.get(keys, child))
+    "drop of " ++ mir_place_text(body, place_id) ++ " frees " ++ keys.names[child] ++ f" again: a path reaching it dropped that part and nothing wrote it since ({child_state}) (§2.5.1)"
+
 // #1415: a move out of a drop-bearing place projected through a reference
 // (`_4 = move _1.*.p` through `&self`). A reference never owns its pointee,
 // so the frame can neither own the moved value nor reset its source: both
@@ -2316,10 +2370,9 @@ fn mir_term_operands(body: &MirBody, bb: i32) -> Vec[i32]:
 // match guard's arm bound `move _3<as v0>.f0`, and the next arm bound it
 // again (the #1394 double free, validate-all: ok). A place Maybe
 // initialized is not judged here: MaybeMoved is exactly "moved on a path".
-// Statement moves only: three lowerings pass a receiver the callee borrows
-// as an OK_MOVE call argument (`ch in s`, IndexPlace get/set, a generator's
-// next), so a call's "second move" is a borrow until #1505 lowers them as
-// borrows.
+// Statement moves and call arguments alike (#1505): a receiver the callee
+// borrows (`ch in s`, IndexPlace get/set) is lowered as the read it is, so
+// an OK_MOVE argument is a move.
 fn mir_move_of_moved_place(mir_mod: &MirModule, body: &MirBody, keys: &MirDropStateKeys, state: &MirDropStateMap, ops: &Vec[i32]) -> str:
     for oi in 0..ops.len():
         let op = ops[oi]
@@ -2333,6 +2386,134 @@ fn mir_move_of_moved_place(mir_mod: &MirModule, body: &MirBody, keys: &MirDropSt
             continue
         let moved_name = mir_drop_state_name(moved)
         return "move of " ++ mir_place_text(body, place) ++ f", which a path reaching it already moved out ({moved_name}) and nothing re-initialized: two owners free one value (§2.5.1)"
+    ""
+
+// What is wrong with a drop of the whole place `place_id` whose state is
+// `drop_state`, or "". Codegen emits every drop (drop flags are retired,
+// and mir_elaborate_dead_drops has no caller); the null guard skips only a
+// reset blank, so the drop must reach a place every path left owning a
+// value or blanked.
+// - #729 class: MaybeGarbage means some predecessor never touched the
+//   place at all — the join-block temp drop that freed uninitialized stack
+//   passed this validator before the absence-aware join existed. Uninit
+//   means every reachable predecessor missed initialization, as an off-path
+//   defer temp does.
+// - #1539: Moved (or MaybeMoved at a join) means a path moved the value out
+//   and nothing reset the place: the drop frees what the new owner holds.
+//   A generator's next body did `_5 = move _10; drop(_10); _10 = const
+//   zst` — the reset after the drop — and `run --debug-alloc` reported a
+//   DOUBLE FREE that validate-ownership passed. Only a type with drop glue
+//   (sema_moved_drop_types: the place was moved, so its type is there when
+//   it has glue) frees anything: `Some(move _5); drop(_5)` of a CStr view
+//   is a no-op.
+// - #1559: Maybe is Init on one path and Uninit on another — storage never
+//   written, dead, or already dropped. None of those holds the reset blank
+//   (a StorageLive is not zeroed; a drop does not blank), so the guard does
+//   not protect it: a synthesized enum formatter's per-arm temp, dropped at
+//   the join, freed stack garbage on the arm that never wrote it ("invalid
+//   free"), and validate-all said ok.
+fn mir_whole_drop_verdict(mir_mod: &MirModule, body: &MirBody, place_id: i32, drop_state: i32) -> str:
+    let drop_key = mir_place_text(body, place_id)
+    let state_name = mir_drop_state_name(drop_state)
+    if drop_state == MirDropState.MaybeGarbage or drop_state == MirDropState.Uninit:
+        return f"drop of {drop_key} reaches a path that never initialized it ({state_name})"
+    let has_glue = mir_mod.sema_moved_drop_types.contains(mir_validate_place_type(mir_mod, body, place_id))
+    if (drop_state == MirDropState.Moved or drop_state == MirDropState.MaybeMoved) and has_glue:
+        return f"drop of {drop_key} after a path reaching it moved it out and before its reset ({state_name}): this frees the value its new owner holds (§2.5.1)"
+    if drop_state == MirDropState.Maybe and mir_mod.sema_dropped_types.contains(mir_validate_place_type(mir_mod, body, place_id)):
+        return f"drop of {drop_key} reaches a path where it holds no value — written on one path, never written, dead or already dropped on another ({state_name}); only a reset blank is safe to drop (§2.5.1)"
+    ""
+
+// The Sema signature snapshot of `sym` (sema_sig_param_starts): its
+// parameter count, or -1 when Sema has no signature by that name.
+pub fn mir_sig_param_count(mir_mod: &MirModule, sym: i32) -> i32:
+    let start: i32 = mir_mod.sema_sig_param_starts.get(sym) ?? -1
+    if start < 0: -1 else: mir_mod.sema_sig_param_data[start]
+
+// Parameter `pi`'s type in the signature snapshot of `sym`, 0 when absent.
+pub fn mir_sig_param_type(mir_mod: &MirModule, sym: i32, pi: i32) -> i32:
+    let start: i32 = mir_mod.sema_sig_param_starts.get(sym) ?? -1
+    if start < 0 or pi < 0 or pi >= mir_mod.sema_sig_param_data[start]: 0 else: mir_mod.sema_sig_param_data[start + 1 + pi * 2]
+
+// Whether parameter `pi` of `sym` takes ownership of its argument.
+pub fn mir_sig_param_consumes(mir_mod: &MirModule, sym: i32, pi: i32) -> bool:
+    let start: i32 = mir_mod.sema_sig_param_starts.get(sym) ?? -1
+    start >= 0 and pi >= 0 and pi < mir_mod.sema_sig_param_data[start] and mir_mod.sema_sig_param_data[start + 2 + pi * 2] != 0
+
+// Whether a whole drop of `local` is reachable from block `from` before
+// any statement writes it (a re-initialization or a reset blank).
+fn mir_drop_reachable_before_write(body: &MirBody, from: i32, local: i32) -> bool:
+    var seen: Vec[i32] = Vec.new()
+    for _ in 0..body.block_count():
+        seen.push(0)
+    var work: Vec[i32] = Vec.new()
+    work.push(from)
+    while work.len() > 0:
+        let bb: i32 = work.pop().unwrap()
+        if bb < 0 or bb >= body.block_count() or seen[bb] != 0:
+            continue
+        seen[bb] = 1
+        var written = false
+        for si in body.bb_stmt_starts[bb]..body.bb_stmt_starts[bb] + body.bb_stmt_counts[bb]:
+            let kind = body.stmt_kind(si)
+            let place = body.stmt_data0(si)
+            if place < 0 or place >= body.place_locals.len() or body.place_locals[place] != local or body.place_proj_counts[place] != 0:
+                continue
+            if kind == StmtKind.Drop:
+                return true
+            if kind == StmtKind.Assign:
+                written = true
+                break
+        if written:
+            continue
+        if body.term_kind(bb) == TermKind.TK_DROP_AND_GOTO:
+            let place = body.term_data0(bb)
+            if place >= 0 and place < body.place_locals.len() and body.place_locals[place] == local and body.place_proj_counts[place] == 0:
+                return true
+        for next in mir_drop_state_block_successors(body, bb):
+            work.push(next)
+    false
+
+// #1742: a call argument that is a COPY of a whole local this body drops,
+// at a parameter that takes ownership (a plain `T`, not `&T`, not an
+// in-place receiver): the callee owns the value and the caller frees it
+// too — a drop of the local is reachable after the call returns, before
+// anything writes it. A callee that returns Never (with_panic) has no
+// such path. `g.pull()` lowered its receiver as a method receiver (`copy` of the
+// generator temp) into `gen_pull(g: impl Gen[T])`, the caller's scope-exit
+// drop freed the generator's Vec again — DOUBLE FREE — and validate-all
+// and audit:all both passed. The callee is a direct `const fn`, or a
+// generic call's specialization; machinery dispatch and templates are not
+// judged (their callee name is no signature).
+fn mir_copy_into_consuming_param(mir_mod: &MirModule, body: &MirBody, bb: i32, dropped_local: &Vec[i32]) -> str:
+    let call_id = body.term_data1(bb)
+    if call_id < 0 or call_id >= body.call_arg_starts.len():
+        return ""
+    let intrinsic = body.call_intrinsic(call_id)
+    var sym = 0
+    if intrinsic == MirIntrinsic.NONE:
+        sym = mir_call_const_fn_sym(body, body.term_data0(bb))
+    else if intrinsic == MirIntrinsic.GENERIC_CALL and not body.call_is_machinery_dispatch(call_id):
+        sym = body.call_mono_sym(call_id)
+    if sym == 0 or mir_mod.sema_never_returning_syms.contains(sym):
+        return ""
+    let start = body.call_arg_starts[call_id]
+    for ai in 0..body.call_arg_counts[call_id]:
+        let op = body.call_arg_operands[start + ai]
+        if op < 0 or op >= body.operand_kinds.len() or body.operand_kinds[op] != OperandKind.OK_COPY:
+            continue
+        let place = body.operand_d0[op]
+        if place < 0 or place >= body.place_locals.len() or body.place_proj_counts[place] != 0:
+            continue
+        let local = body.place_locals[place]
+        if local < 0 or local >= dropped_local.len() or dropped_local[local] == 0:
+            continue
+        if not mir_sig_param_consumes(mir_mod, sym, ai):
+            continue
+        if not mir_drop_reachable_before_write(body, body.term_data3(bb), local):
+            continue
+        let place_text = mir_place_text(body, place)
+        return f"copy of {place_text} into parameter {ai} of fn sym{sym}, which takes ownership of it, while this body drops {place_text} too: two owners free one value (§2.5.1)"
     ""
 
 // Every move of a statement or terminator checked by the #1415 rule.
@@ -2392,27 +2573,37 @@ pub fn validate_ownership_body(mir_mod: &MirModule, body: &MirBody) -> str:
                 if mir_validate_place_type(mir_mod, body, d0) == 0:
                     return f"fn sym{body.fn_sym} stmt{stmt_id} span={span}: ownership target has no concrete MIR type"
             if kind == StmtKind.Drop and body.place_proj_counts[d0] == 0 and blocks.computed[bb] != 0:
-                // #729 class: a drop must only reach places every path has at
-                // least blanked. MaybeGarbage means some predecessor never
-                // touched the place at all — the join-block temp drop that
-                // freed uninitialized stack passed this validator before the
-                // absence-aware join existed. Uninit means every reachable
-                // predecessor missed initialization, as an off-path defer temp
-                // does. Unreachable blocks have no ownership input to check.
-                let drop_key = mir_place_text(body, d0)
-                let drop_state = state.place(blocks.keys, d0)
-                if drop_state == MirDropState.MaybeGarbage or drop_state == MirDropState.Uninit:
-                    let state_name = mir_drop_state_name(drop_state)
-                    return f"fn sym{body.fn_sym} stmt{stmt_id} span={span}: drop of {drop_key} reaches a path that never initialized it ({state_name})"
+                let bad_drop = mir_whole_drop_verdict(mir_mod, body, d0, state.place(blocks.keys, d0))
+                if bad_drop.len() > 0:
+                    return f"fn sym{body.fn_sym} stmt{stmt_id} span={span}: " ++ bad_drop
             if kind == StmtKind.Drop and blocks.computed[bb] != 0:
                 let vacated = mir_drop_vacated_subplace(mir_mod, body, blocks.keys, state, key_places, d0)
                 if vacated >= 0:
                     return f"fn sym{body.fn_sym} stmt{stmt_id} span={span}: " ++ mir_drop_vacated_message(blocks.keys, state, body, d0, vacated)
+                let redropped = mir_drop_redropped_subplace(mir_mod, body, blocks.keys, state, key_places, d0)
+                if redropped >= 0:
+                    return f"fn sym{body.fn_sym} stmt{stmt_id} span={span}: " ++ mir_drop_redropped_message(blocks.keys, state, body, d0, redropped)
             if kind == StmtKind.Assign and blocks.computed[bb] != 0:
                 let twice = mir_move_of_moved_place(mir_mod, body, blocks.keys, state, mir_rvalue_operands(body, body.stmt_data1(stmt_id)))
                 if twice.len() > 0:
                     return f"fn sym{body.fn_sym} stmt{stmt_id} span={span}: " ++ twice
+                // #1487: a reset-on-move blank stores the sentinel over a
+                // place a move left behind. Over a place still Init — no path
+                // moved it — it overwrites a live value without a drop: the
+                // value is lost (a leak) and every later read sees the blank.
+                // Moved, MaybeMoved, Reset, Uninit, Maybe and MaybeGarbage
+                // stay legal (a reset after a move, at a conditional-move
+                // join, a zero-init).
+                if mir_rvalue_is_zero_fill(body, body.stmt_data1(stmt_id)) != 0 and state.place(blocks.keys, d0) == MirDropState.Init and mir_mod.sema_moved_drop_types.contains(mir_validate_place_type(mir_mod, body, d0)):
+                    return f"fn sym{body.fn_sym} stmt{stmt_id} span={span}: reset of {mir_place_text(body, d0)} on a path where it was never moved: the value it holds is lost (§2.5.1)"
             state.transfer_stmt(blocks.keys, body, stmt_id)
+        if body.term_kind(bb) == TermKind.TK_CALL and blocks.computed[bb] != 0:
+            let twice = mir_move_of_moved_place(mir_mod, body, blocks.keys, state, mir_term_operands(body, bb))
+            if twice.len() > 0:
+                return f"fn sym{body.fn_sym} bb{bb}: " ++ twice
+            let copied = mir_copy_into_consuming_param(mir_mod, body, bb, dropped_local)
+            if copied.len() > 0:
+                return f"fn sym{body.fn_sym} bb{bb}: " ++ copied
         if body.term_kind(bb) == TermKind.TK_CALL or body.term_kind(bb) == TermKind.TK_DROP_AND_GOTO:
             let place_id = if body.term_kind(bb) == TermKind.TK_CALL: body.term_data2(bb) else: body.term_data0(bb)
             if place_id < 0 or place_id >= body.place_locals.len():
@@ -2420,15 +2611,16 @@ pub fn validate_ownership_body(mir_mod: &MirModule, body: &MirBody) -> str:
             if mir_validate_place_type(mir_mod, body, place_id) == 0:
                 return f"fn sym{body.fn_sym} bb{bb}: ownership terminator place has no concrete MIR type"
             if body.term_kind(bb) == TermKind.TK_DROP_AND_GOTO and body.place_proj_counts[place_id] == 0 and blocks.computed[bb] != 0:
-                let drop_state = state.place(blocks.keys, place_id)
-                if drop_state == MirDropState.MaybeGarbage or drop_state == MirDropState.Uninit:
-                    let drop_key = mir_place_text(body, place_id)
-                    let state_name = mir_drop_state_name(drop_state)
-                    return f"fn sym{body.fn_sym} bb{bb}: drop of {drop_key} reaches a path that never initialized it ({state_name})"
+                let bad_drop = mir_whole_drop_verdict(mir_mod, body, place_id, state.place(blocks.keys, place_id))
+                if bad_drop.len() > 0:
+                    return f"fn sym{body.fn_sym} bb{bb}: " ++ bad_drop
             if body.term_kind(bb) == TermKind.TK_DROP_AND_GOTO and blocks.computed[bb] != 0:
                 let vacated = mir_drop_vacated_subplace(mir_mod, body, blocks.keys, state, key_places, place_id)
                 if vacated >= 0:
                     return f"fn sym{body.fn_sym} bb{bb}: " ++ mir_drop_vacated_message(blocks.keys, state, body, place_id, vacated)
+                let redropped = mir_drop_redropped_subplace(mir_mod, body, blocks.keys, state, key_places, place_id)
+                if redropped >= 0:
+                    return f"fn sym{body.fn_sym} bb{bb}: " ++ mir_drop_redropped_message(blocks.keys, state, body, place_id, redropped)
         // #1384 / #1488: a local some `drop` targets is owned storage the lowering
         // scheduled a drop for. Still Init at a `return`, with no sub-place moved
         // out or blanked (a partial move leaves a shell nothing needs to free),
@@ -2687,6 +2879,13 @@ pub fn validate_all_mir_module(mir_mod: &MirModule) -> str:
     let shape = validate_mir_module(mir_mod)
     if shape.len() > 0:
         return "MIR shape: " ++ shape
+    // #1736: a body whose lowering failed has no MIR to validate, and codegen
+    // refuses to compile it ("MIR lowering failed for function ..."). The
+    // typed and ownership validators skip such a body, so validate-all said
+    // ok over a comprehension the build could not compile.
+    for bi in 0..mir_mod.bodies.len():
+        if mir_mod.bodies[bi].lowering_failed != 0:
+            return f"fn sym{mir_mod.bodies[bi].fn_sym}: MIR lowering failed; the body was not validated and codegen cannot compile it (WITH_MIR_AUDIT=1 names the unsupported node)"
     let typed = validate_typed_mir_module(mir_mod)
     if mir_validation_has_error(typed):
         return "typed MIR: " ++ typed.message
@@ -3835,10 +4034,37 @@ fn mir_validate_task_operand(mir_mod: &MirModule, body: &MirBody, call_id: i32) 
             return ""
     f"fiber intrinsic's task operand is ty={task_ty}, not a Task or ScopedTask handle"
 
+// #1735: a body's parameter locals are its signature's parameters, in
+// order (locals 1..=n_params). The generator constructor for `gen mut fn
+// tick(times: i32)` allocated a temporary between them, so `times` was read
+// from a `&Counter` slot and the loop ran zero times; validate-all and
+// audit:all both passed, since no validator compared a body with its
+// signature. The signature is Sema's (sema_sig_param_starts); a closure
+// or a body Sema has no signature for is not judged.
+fn mir_validate_body_params(mir_mod: &MirModule, body: &MirBody) -> str:
+    if body.fn_sym == 0 or body.anonymous_type != 0:
+        return ""
+    let count = mir_sig_param_count(mir_mod, body.fn_sym)
+    if count < 0:
+        return ""
+    if count != body.n_params:
+        return f"the body has {body.n_params} parameter local(s), its signature {count} parameter(s)"
+    for pi in 0..count:
+        let sig_ty = mir_sig_param_type(mir_mod, body.fn_sym, pi)
+        let local_ty = if pi + 1 < body.local_type_ids.len(): body.local_type_ids[pi + 1] else: 0
+        if sig_ty <= 0 or local_ty <= 0:
+            continue
+        if mir_mod.mir_resolve_alias(sig_ty) != mir_mod.mir_resolve_alias(local_ty):
+            return f"parameter {pi} is local _{pi + 1} of ty={local_ty}, but the signature's parameter {pi} is ty={sig_ty}"
+    ""
+
 pub fn validate_typed_mir_body(mir_mod: &MirModule, body: &MirBody) -> MirValidationError:
     let scalar_projection = mir_validate_scalar_field_projection(mir_mod, body)
     if scalar_projection.len() > 0:
         return mir_validation_fail(body.fn_sym, 0, scalar_projection)
+    let params = mir_validate_body_params(mir_mod, body)
+    if params.len() > 0:
+        return mir_validation_fail(body.fn_sym, 0, params)
     let stmt_count = body.stmt_count()
     for si in 0..stmt_count:
         let stmt_kind = body.stmt_kinds[si]
