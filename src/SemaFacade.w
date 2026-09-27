@@ -2431,6 +2431,14 @@ impl Sema:
 
     // Whether a resource clause names `fn_sym` (`from`, `init`, `preinit`,
     // `drop`, `destroys`): the clause assigns it.
+    // Whether `fn_sym` is a resource's in-place `init` or `preinit`.
+    fn facade_fn_is_init(fn_sym: i32) -> bool:
+        for ri in 0..self.facade_resources.len() as i32:
+            let r = &self.facade_resources[ri]
+            if self.facade_same_fn(r.init, fn_sym) or self.facade_same_fn(r.preinit, fn_sym):
+                return true
+        false
+
     fn facade_fn_is_resource_op(fn_sym: i32) -> bool:
         for ri in 0..self.facade_resources.len() as i32:
             let r = &self.facade_resources[ri]
@@ -3478,6 +3486,48 @@ impl Sema:
                     self.facade_domain_note_file(facade, self.facade_fn_file(ops[oi]))
             for di in 0..self.facade_resources[ri].destroyers.len() as i32:
                 self.facade_domain_note_file(facade, self.facade_fn_file(self.facade_resources[ri].destroyers[di]))
+        // Constructors: a producer receiving other resources touches them
+        // (their views), with the out slot removed from the indices as
+        // apply_facade_dependency_effects removes it. They go first (#1674):
+        // a producer rendered on its parent (`d.st_new(flags, o)`) is also a
+        // hosted method of the parent's, and the hosted-method pass below
+        // projects only fixed, buffer and destruction-callback parameters —
+        // not the out slot — so the parent's method took the C indices past
+        // the slot (`o`'s bit 3 on a three-parameter method) and a view of
+        // `o` survived the call. The first registration of a signature is
+        // the one kept (facade_add_call_effect).
+        for ri in 0..self.facade_resources.len() as i32:
+            let rname: str = self.pool_resolve(self.facade_resources[ri].name)
+            let owners = self.facade_owners(ri)
+            for oi in 0..owners.len() as i32:
+                let owner = owners[oi]
+                let f = self.facade_owner_fn(ri, owner)
+                if f == 0:
+                    continue
+                let sigs = self.facade_producer_sigs(ri, owner, f)
+                if sigs.len() == 0:
+                    continue
+                let ci = self.facade_contract_for(f)
+                let domains = self.facade_domains_touched(self.facade_fn_file(f), ci)
+                var shift = 0
+                if owner == FACADE_DEP_INIT and self.facade_resources[ri].preinit != 0:
+                    shift = self.sig_get_param_count(self.get_sig(self.facade_resources[ri].preinit))
+                let slot = self.facade_owner_skip(ri, owner)
+                let raw_mask = self.facade_touch_params_mask(f, ci, if owner == FACADE_DEP_INIT: 1 else: 0)
+                var mask = 0
+                for c_pi in 0..self.sig_get_param_count(self.get_sig(f)):
+                    if (raw_mask & sema_param_origin_bit(c_pi)) == 0 or c_pi == slot:
+                        continue
+                    var pi = c_pi
+                    if owner == FACADE_DEP_INIT:
+                        pi = shift + c_pi - 1
+                    else if slot >= 0 and c_pi > slot:
+                        pi = c_pi - 1
+                    mask = mask | sema_param_origin_bit(pi)
+                if mask != 0 or domains.len() > 0:
+                    for si in 0..sigs.len() as i32:
+                        self.facade_add_call_effect(sigs[si], f, ci, mask, &domains, -1, -1)
+
         // Every c_import function: the raw call, and the fn item's rendered
         // method when it has one.
         for di in 0..self.ast.decl_count():
@@ -3515,6 +3565,15 @@ impl Sema:
             let recv0 = self.facade_method_host(fn_sym)
             if recv0.len() != 1:
                 continue
+            // An in-place producer (`init z_init(self)`) is rendered as the
+            // constructor `R.init(rest…)`, whose signature the constructor
+            // pass above indexed with the storage slot removed. Its first C
+            // parameter is that slot, not a receiver: registering it here
+            // as a lend method of `R` put the slot's bit 0 on the
+            // constructor's first real parameter (#1674's audit caught it on
+            // behav_c_facade_resource_in_place_pinned.w).
+            if self.facade_fn_is_init(fn_sym):
+                continue
             let mname = self.facade_presented(recv0[0], self.pool_resolve(fn_sym))
             let host: str = self.pool_resolve(self.facade_resources[recv0[0]].name)
             let hosts: Vec[str] = Vec.new()
@@ -3529,41 +3588,6 @@ impl Sema:
                 let htext = hosts[hi].clone()
                 if self.sig_text_index.contains(htext):
                     self.facade_add_call_effect(self.sig_text_index.get(htext).unwrap(), fn_sym, ci, self.facade_presented_touch_mask(fn_sym, ci), &domains, borrow, -1)
-        // Constructors: a producer receiving other resources touches them
-        // (their views), with the out slot removed from the indices as
-        // apply_facade_dependency_effects removes it.
-        for ri in 0..self.facade_resources.len() as i32:
-            let rname: str = self.pool_resolve(self.facade_resources[ri].name)
-            let owners = self.facade_owners(ri)
-            for oi in 0..owners.len() as i32:
-                let owner = owners[oi]
-                let f = self.facade_owner_fn(ri, owner)
-                if f == 0:
-                    continue
-                let sigs = self.facade_producer_sigs(ri, owner, f)
-                if sigs.len() == 0:
-                    continue
-                let ci = self.facade_contract_for(f)
-                let domains = self.facade_domains_touched(self.facade_fn_file(f), ci)
-                var shift = 0
-                if owner == FACADE_DEP_INIT and self.facade_resources[ri].preinit != 0:
-                    shift = self.sig_get_param_count(self.get_sig(self.facade_resources[ri].preinit))
-                let slot = self.facade_owner_skip(ri, owner)
-                let raw_mask = self.facade_touch_params_mask(f, ci, if owner == FACADE_DEP_INIT: 1 else: 0)
-                var mask = 0
-                for c_pi in 0..self.sig_get_param_count(self.get_sig(f)):
-                    if (raw_mask & sema_param_origin_bit(c_pi)) == 0 or c_pi == slot:
-                        continue
-                    var pi = c_pi
-                    if owner == FACADE_DEP_INIT:
-                        pi = shift + c_pi - 1
-                    else if slot >= 0 and c_pi > slot:
-                        pi = c_pi - 1
-                    mask = mask | sema_param_origin_bit(pi)
-                if mask != 0 or domains.len() > 0:
-                    for si in 0..sigs.len() as i32:
-                        self.facade_add_call_effect(sigs[si], f, ci, mask, &domains, -1, -1)
-
     // The signatures of the free renderings presenting contract `ci`: its
     // D64 bridge under the C name, or the case functions of its variadic
     // contract (D66) — under the C name or the item's `rename`.
@@ -4527,9 +4551,36 @@ impl Sema:
                 let saved_ctor = self.facade_userdata_ctor
                 if context.nullable:
                     self.facade_userdata_ctor = ud_node
-                context.userdata_type = self.check_expr_value_context(ud_node) as i32
+                if context.nullable and self.ast.kind(ud_node) == NodeKind.NK_VARIANT_SHORTHAND:
+                    context.userdata_type = self.facade_check_userdata_shorthand(ud_node)
+                else:
+                    context.userdata_type = self.check_expr_value_context(ud_node) as i32
                 self.facade_userdata_ctor = saved_ctor
         context
+
+    // #1765 (§4 variant shorthand, §16.2b.9): a nullable callback's userdata
+    // parameter is `Option[&U]`, so a `.Some(x)` there names Option before
+    // `U` is known, and `U` is its payload's type — exactly what `Some(x)`
+    // gives the call form. The payload is checked once, with no expected
+    // type (it binds `U`), and borrowed for the call as the call form's is
+    // (payload_arg_auto_refs with this constructor as the userdata's).
+    mut fn facade_check_userdata_shorthand(node: i32) -> i32:
+        let name = self.ast.get_data0(node)
+        if name != self.syms.some or self.ast.get_data2(node) != 1:
+            return self.check_expr_value_context(node) as i32
+        let payload = self.ast.get_extra(self.ast.get_data1(node))
+        let payload_ty = self.check_expr_value_context(payload) as i32
+        if payload_ty == 0:
+            return 0
+        // The payload slot is `&U` (Option[&U]), as the call form types it.
+        let payload_kind = self.get_type_kind(self.resolve_alias(payload_ty as TypeId))
+        let slot_ty = if payload_kind == TypeKind.TY_REF: payload_ty else: self.ensure_exact_type(TypeKind.TY_REF, payload_ty, 0, 0) as i32
+        let option_ty = self.ensure_option_type_for(slot_ty)
+        self.comp_resolved.insert(node, self.qualified_enum_variant_sym(option_ty, name))
+        self.typed_expr_types.insert(node, option_ty)
+        if not self.payload_arg_auto_refs(slot_ty, payload_ty, payload, node):
+            self.mark_moved_if_consumed(payload)
+        option_ty
 
     // The callback method a method call `recv.field(…)` names, or -1.
     fn facade_callback_method_for_call(recv_type: i32, field: i32) -> i32:
