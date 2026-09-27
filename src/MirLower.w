@@ -844,6 +844,26 @@ impl MirBuilder:
         self.stmt_temp_locals.push(local_id)
         self.stmt_temp_drop_depths.push(self.drop_local_ids.len() as i32)
 
+    // The statement-temp slot that owns `local_id`, or -1 (the slot
+    // cancel_stmt_temp_for_local would retire).
+    fn stmt_temp_slot_for_local(local_id: i32) -> i32:
+        var i = self.stmt_temp_locals.len() as i32 - 1
+        while i >= 0:
+            if self.stmt_temp_locals[i] == local_id:
+                return i
+            i = i - 1
+        -1
+
+    // The scheduled value-drop slot of `local_id`, or -1 (the slot
+    // cancel_scheduled_value_drop_for_local would retire).
+    fn scheduled_value_drop_slot_for_local(local_id: i32) -> i32:
+        var i = self.drop_local_ids.len() as i32 - 1
+        while i >= 0:
+            if self.drop_local_ids[i] == local_id and self.drop_kind_owns_value(self.drop_kinds[i]) != 0:
+                return i
+            i = i - 1
+        -1
+
     mut fn cancel_stmt_temp_for_local(local_id: i32) -> Unit:
         var i = self.stmt_temp_locals.len() as i32 - 1
         while i >= 0:
@@ -6734,6 +6754,15 @@ impl MirBuilder:
         // cancelling it after the success path left the failing path with no
         // owner (a `str` Err payload leaked).
         let le_scrut_local = mir_place_plain_local(&self.body, rhs_place)
+        // #1750: the success path keeps the subject's cleanup — what the
+        // bindings moved out is blanked, so it frees only what remains. The
+        // cleanup is retired for the failing path only (below) and re-armed
+        // before the success path; retired on both, the success path left
+        // an owned subject Init at return, which validate-all reports.
+        let le_temp_slot = if le_scrut_local >= 0: self.stmt_temp_slot_for_local(le_scrut_local) else: -1
+        let le_drop_slot = if le_scrut_local >= 0: self.scheduled_value_drop_slot_for_local(le_scrut_local) else: -1
+        let le_drop_kind = if le_drop_slot >= 0: self.drop_kinds[le_drop_slot] else: 0
+        let le_was_moved = le_scrut_local >= 0 and self.local_value_moved(le_scrut_local) != 0
         if le_scrut_local >= 0:
             self.cancel_stmt_temp_for_local(le_scrut_local)
             self.cancel_scheduled_value_drop_for_local(le_scrut_local)
@@ -6755,6 +6784,14 @@ impl MirBuilder:
         self.lower_let_else_branch(else_body)
         // The else body diverges; its moves never reach the continuation.
         self.restore_move_state(&branch_move_state)
+
+        // Re-arm the subject's cleanup for the success path (#1750).
+        if le_temp_slot >= 0:
+            self.stmt_temp_locals[le_temp_slot] = le_scrut_local
+        if le_drop_slot >= 0:
+            self.drop_kinds[le_drop_slot] = le_drop_kind
+        if le_scrut_local >= 0 and not le_was_moved:
+            self.clear_local_value_moved(le_scrut_local)
 
         self.switch_to(success_bb)
         // §9.7: `var PATTERN = ... else` binds every name it introduces mutably (#1354).
@@ -7661,10 +7698,21 @@ impl MirBuilder:
             let table = child.body.new_switch_table(vals, targets)
             child.terminate(TermKind.TK_SWITCH_INT, cond_op, table, join_bb, 0)
             child.switch_to(pass_bb)
+        // A filter's pass branch moves on that path only (#1501, as in
+        // lower_comprehension_generic_iter): the join still drops a
+        // filtered-out element.
+        let pass_move_state = child.save_move_state()
+        let pass_reset_start = child.pending_reset_locals.len() as i32
+        let pass_reset_field_start = child.pending_reset_field_places.len() as i32
+        let pass_move_temp_start = child.pending_move_temp_locals.len() as i32
         let leaf_frame = child.push_stmt_temp_frame()
         child.lower_comprehension_next_or_push(comp_node, clause_index + 1, child_out_place, out_elem_ty)
         child.finish_stmt_temp_frame(leaf_frame)
+        if clause_filter != 0:
+            child.flush_pending_resets_since(pass_reset_start, pass_reset_field_start, pass_move_temp_start)
         child.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
+        if clause_filter != 0:
+            child.restore_move_state(&pass_move_state)
         child.switch_to(join_bb)
         child.pop_scope_with_goto(more_bb)
         child.switch_to(more_bb)
@@ -8361,10 +8409,22 @@ impl MirBuilder:
             // #771-style frame: the leaf push is a statement — its
             // reset-on-move flush is what blanks a moved-out binding so
             // the back-edge scope drop is inert for it.
+            // The pass branch is one arm of the filter (#1501): what it
+            // moves is moved on that path only, as in lower_if. Its moved
+            // marks left in place, the join's scope pop saw the binding
+            // moved on every path and skipped the drop of each filtered-out
+            // element; its resets are flushed inside the arm, so the
+            // binding the push took is blank at the join.
+            let pass_move_state = self.save_move_state()
+            let pass_reset_start = self.pending_reset_locals.len() as i32
+            let pass_reset_field_start = self.pending_reset_field_places.len() as i32
+            let pass_move_temp_start = self.pending_move_temp_locals.len() as i32
             let pass_frame = self.push_stmt_temp_frame()
             self.lower_comprehension_next_or_push(comp_node, clause_index + 1, out_place, out_elem_ty)
             self.finish_stmt_temp_frame(pass_frame)
+            self.flush_pending_resets_since(pass_reset_start, pass_reset_field_start, pass_move_temp_start)
             self.terminate(TermKind.TK_GOTO, iter_join_bb, 0, 0, 0)
+            self.restore_move_state(&pass_move_state)
         else:
             let leaf_frame = self.push_stmt_temp_frame()
             self.lower_comprehension_next_or_push(comp_node, clause_index + 1, out_place, out_elem_ty)
