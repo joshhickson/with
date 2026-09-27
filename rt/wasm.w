@@ -366,7 +366,7 @@ pub fn rt_set_process_memory_limit_bytes(limit: i64) -> i32:
     let _ = limit
     -1
 
-pub fn gethostname(name: *mut u8, len: u64) -> i32:
+pub fn rt_gethostname(name: *mut u8, len: u64) -> i32:
     if len < 5:
         return wasm_fail(WASI_EINVAL)
     let _ = with_memcpy(name, c"wasm".ptr, 5)

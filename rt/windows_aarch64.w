@@ -992,7 +992,7 @@ pub fn rt_getenv(name: *const u8) -> *const u8:
         rt_munmap(big, big_bytes)
     buf as *const u8
 
-pub fn gethostname(name: *mut u8, len: u64) -> i32:
+pub fn rt_gethostname(name: *mut u8, len: u64) -> i32:
     var wname: [256]u16 = [0; 256]
     var n: u32 = 256
     if GetComputerNameW(&raw mut wname as *mut [256]u16 as *mut u16, &raw mut n) == 0:
