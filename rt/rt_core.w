@@ -42,6 +42,7 @@ extern fn rt_clock_ns() -> i64
 extern fn rt_wall_clock_sec() -> i64
 extern fn rt_getenv(name: *const u8) -> *const u8
 extern fn rt_store_args(argc: i32, argv: *const *const u8)
+extern fn rt_args() -> (*const *const u8, i32)
 
 // Sleep + process + signal + sysinfo extras (provided by platform backend)
 extern fn rt_nanosleep(ns: i64) -> i32
@@ -2006,10 +2007,14 @@ fn write_all(fd: i32, buf: *const u8, len: i64):
 var saved_argc: i32 = 0
 var saved_argv_raw: i64 = 0
 
+// The platform backend decides what the arguments are: POSIX and wasm keep
+// main's argv; Windows swaps the ANSI-code-page argv for the wide one as
+// UTF-8 (rt/windows_*.w). args() reads what the backend kept.
 pub fn with_runtime_set_argv(argc: i32, argv: *const *const u8):
-    saved_argc = argc
-    saved_argv_raw = argv as i64
     rt_store_args(argc, argv)
+    let (kept_argv, kept_argc) = rt_args()
+    saved_argc = kept_argc
+    saved_argv_raw = kept_argv as i64
 
 // with_runtime_init, with_runtime_run, with_runtime_shutdown come from the
 // small runtime stub object when async is absent, or from fiber.c when the

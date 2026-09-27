@@ -420,9 +420,70 @@ fn win_alloc_fd(handle: i64) -> i32:
     let _ = CloseHandle(handle)
     -24
 
+// ── Arguments ──────────────────────────────────────────────────────
+// std.process.args() is UTF-8, as every `str` is. The narrow argv main
+// receives is the command line in the ANSI code page: "café" arrives as
+// "caf\xe9" under code page 1252, and a character the code page lacks as "?"
+// or a best-fit look-alike. So the runtime takes the UCRT's wide argv:
+// _configure_wide_argv runs the parser that built the narrow one (the UCRT's
+// argv_parsing.cpp: one parse_command_line template for both) over the
+// UTF-16 command line, in the mode the startup code used
+// (_get_startup_argv_mode), so quoting and backslashes read exactly as they
+// did. The UCRT keeps that argv for the life of the process.
+@[link_name("_configure_wide_argv")]
+extern fn rt_ucrt_configure_wide_argv(mode: i32) -> i32
+@[link_name("__p___argc")]
+extern fn rt_ucrt_argc_ptr() -> *mut i32
+@[link_name("__p___wargv")]
+extern fn rt_ucrt_wargv_ptr() -> *mut *const *const u16
+@[link_name("_get_startup_argv_mode")]
+extern fn rt_crt_startup_argv_mode() -> i32
+
+fn win_wide_arg(wargv: *const *const u16, i: i32) -> *const u16:
+    unsafe *((wargv as i64 + i * 8) as *const *const u16)
+
+// The wide argv as UTF-8 (an unpaired surrogate becomes U+FFFD) in one block
+// from rt_mmap, the pointers then the text, argv[argc] NULL: it lives as long
+// as the process, like the argv it replaces. Null if the UCRT refuses.
+fn win_utf8_argv(argc_out: *mut i32) -> *const *const u8:
+    if rt_ucrt_configure_wide_argv(rt_crt_startup_argv_mode()) != 0:
+        return 0 as *const *const u8
+    let argc = unsafe *rt_ucrt_argc_ptr()
+    let wargv = unsafe *rt_ucrt_wargv_ptr()
+    if argc < 0 or wargv as i64 == 0:
+        return 0 as *const *const u8
+    let table: i64 = (argc + 1) * 8
+    var bytes = table
+    for i in 0..argc:
+        bytes = bytes + win_utf16_utf8_len(win_wide_arg(wargv, i)) + 1
+    let block = rt_mmap(bytes)
+    if block as i64 == 0:
+        return 0 as *const *const u8
+    var text = block as i64 + table
+    for i in 0..argc:
+        let arg = win_wide_arg(wargv, i)
+        let n = win_utf16_utf8_len(arg)
+        let _ = win_utf16_to_utf8_buf(arg, text as *mut u8, n + 1)
+        unsafe *((block as i64 + i * 8) as *mut i64) = text
+        text = text + n + 1
+    // argv[argc] stays NULL: rt_mmap's pages come zero-filled.
+    unsafe *argc_out = argc
+    block as *const *const u8
+
+// `argc_val` and `argv_val` are main's narrow arguments; args() gets the
+// UTF-8 ones instead (above). Failing to read them is fatal, as the CRT's own
+// startup treats a failed argv (exe_common.inl: __scrt_fastfail); running on
+// the code-page text instead would hand the program the wrong arguments.
 pub fn rt_store_args(argc_val: i32, argv_val: *const *const u8):
-    rt_argc = argc_val
-    rt_argv_raw = argv_val as i64
+    let _ = argc_val
+    let _ = argv_val
+    var argc: i32 = 0
+    let argv = win_utf8_argv(&raw mut argc)
+    if argv as i64 == 0:
+        let _ = rt_write(2, "fatal: could not read the command line\n" as *const u8, 39)
+        ExitProcess(1)
+    rt_argc = argc
+    rt_argv_raw = argv as i64
     // PWD is the runtime's on Windows. The driver reads it for its working
     // directory (project root, absolutized paths, embed anchoring). No shell
     // maintains it here the way POSIX shells do: a git-bash parent exports the
@@ -1798,6 +1859,12 @@ c facade win32:
     fn rt_ucrt_isatty
         preserves domain environ
         preserves domain locale
+    // The argv setup calls are the CRT's startup interface, not the C
+    // standard's, so their rows say nothing.
+    fn rt_ucrt_configure_wide_argv
+    fn rt_ucrt_argc_ptr
+    fn rt_ucrt_wargv_ptr
+    fn rt_crt_startup_argv_mode
     fn WSAStartup
     fn socket
     fn connect
