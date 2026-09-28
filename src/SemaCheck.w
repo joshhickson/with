@@ -2442,9 +2442,13 @@ impl Sema:
         let saved_body_tail_block: i32 = self.body_tail_block
         let saved_body_tail_holder: i32 = self.body_tail_holder
         let saved_body_tail_discards: bool = self.body_tail_discards
+        let saved_body_tail_is_statement: bool = self.body_tail_is_statement
         let source_body = self.fn_body_inner(body)
         self.body_tail_block = source_body
         self.body_tail_holder = self.body_tail_holder_of(source_body)
+        // §9.1: an entry point's tail is statement position, whatever it is.
+        let body_tail_is_statement = self.fn_decl_is_entry_point(node) != 0
+        self.body_tail_is_statement = body_tail_is_statement
         // §9.1 / D60: under a declared non-Unit return the body's tail
         // assignment is its value; with no annotation (D43) or `-> Unit` it
         // is a statement.
@@ -2460,9 +2464,10 @@ impl Sema:
         self.body_tail_block = saved_body_tail_block
         self.body_tail_holder = saved_body_tail_holder
         self.body_tail_discards = saved_body_tail_discards
+        self.body_tail_is_statement = saved_body_tail_is_statement
         // §9.1: a single-statement assignment body is discarded exactly when
         // check_block discards the body block's assignment tail.
-        let body_ty = if self.discard_body_tail(source_body, body_tail_discards) != 0: self.ty_void else: checked_body_ty
+        let body_ty = if self.discard_body_tail(source_body, body_tail_discards, body_tail_is_statement) != 0: self.ty_void else: checked_body_ty
         self.infer_tail_node = saved_infer_tail
         self.infer_tail_is_closure = saved_infer_closure
         self.stamp_move_site_liveness(body_site_start)
@@ -2476,7 +2481,10 @@ impl Sema:
         self.current_value_expr_root = saved_body_value_root
         self.expected_expr_type = saved_expected_et
         self.has_expected_type = saved_has_et
-        self.typed_expr_types.insert(body, body_ty as i32)
+        // A single-statement entry body discarded as a statement keeps its
+        // own type (#1786), as check_block keeps a block's statement tail's.
+        let body_keeps_type = body_ty == self.ty_void and body_tail_is_statement and self.expr_is_assignment(source_body) == 0
+        self.typed_expr_types.insert(body, (if body_keeps_type: checked_body_ty else: body_ty) as i32)
         // §9.1 / D60: an assignment the body returns yields a read of its
         // place. Under a `Unit` return (declared, or a trait's contract, as
         // for `drop`) the tail is a statement: nothing is returned or read.
@@ -6152,8 +6160,13 @@ impl Sema:
             return self.expr_is_assignment(self.ast.get_data0(node))
         0
 
-    mut fn discard_body_tail(tail: i32, discards: bool) -> i32:
-        if self.expr_is_assignment(tail) == 0:
+    // `is_statement` (§9.1: an entry point's tail is statement position)
+    // discards any tail expression, not only an assignment.
+    mut fn discard_body_tail(tail: i32, discards: bool, is_statement: bool) -> i32:
+        if tail == 0:
+            return 0
+        let is_assign = self.expr_is_assignment(tail) != 0
+        if not is_assign and not is_statement:
             return 0
         var assign = tail
         while self.ast.kind(assign) == NodeKind.NK_GROUPED:
@@ -6164,7 +6177,8 @@ impl Sema:
             self.discarded_tails.remove(tail)
             return 0
         self.discarded_tails.insert(tail, 1)
-        self.tail_read_assigns.remove(assign)
+        if is_assign:
+            self.tail_read_assigns.remove(assign)
         1
 
     fn tail_is_discarded(node: i32): node != 0 and self.discarded_tails.contains(node)
@@ -6198,10 +6212,10 @@ impl Sema:
         holder
 
     // The type a tail-holding wrapper (`unsafe:`, `no_suspend`) yields: Unit
-    // when it holds the body's assignment tail and the body discards it
-    // (D73), else its child's type.
+    // when it holds the body's tail and the body discards it (an assignment
+    // tail, D73; any tail of an entry point, §9.1), else its child's type.
     mut fn wrapper_tail_type(node: i32, body: i32, child_ty: TypeId):
-        if node == self.body_tail_holder and self.discard_body_tail(body, self.body_tail_discards) != 0: self.ty_void else: child_ty
+        if node == self.body_tail_holder and self.discard_body_tail(body, self.body_tail_discards, self.body_tail_is_statement) != 0: self.ty_void else: child_ty
 
     // An `unsafe fn` body is its source body inside the implicit unsafe
     // block the parser wraps it in; §9.1's tail rule reads the source body,
@@ -10170,7 +10184,7 @@ impl Sema:
             // that of the `unsafe:` or plain block it ends in (D73,
             // body_tail_holder). An arm block's tail keeps the place's
             // type (D43).
-            let tail_discarded = node == self.body_tail_holder and self.discard_body_tail(tail, self.body_tail_discards) != 0
+            let tail_discarded = node == self.body_tail_holder and self.discard_body_tail(tail, self.body_tail_discards, self.body_tail_is_statement) != 0
             let tail_is_value = not tail_discarded and (self.current_value_expr_root == node or (self.stmt_pos_depth == 0 and self.current_return_type != 0 and self.current_return_type != self.ty_void) or (self.has_expected_type != 0 and self.expected_expr_type != 0 and self.expected_expr_type != self.ty_void))
             if tail_is_value:
                 self.current_value_expr_root = tail
@@ -10181,6 +10195,10 @@ impl Sema:
                 self.infer_tail_node = tail
             let checked_tail_type = if tail_is_value: self.check_expr(tail) else: self.check_expr_statement_context(tail)
             let tail_type = if tail_discarded: self.ty_void else: checked_tail_type
+            // A discarded statement tail keeps its own type (#1786): MirLower
+            // sizes the call's result temp from it, and a `Unit` there made a
+            // discarded `v.pop()` an undropped unit slot (and a trap).
+            let tail_keeps_type = tail_discarded and self.expr_is_assignment(tail) == 0
             self.infer_tail_node = saved_infer_tail
             if not tail_is_value:
                 self.check_task_statement_disposition(tail)
@@ -10188,7 +10206,7 @@ impl Sema:
             self.match_in_stmt_pos = saved_stmt_pos
             if tail_type as TypeId != self.ty_void and tail_type != 0:
                 result = tail_type
-            self.typed_expr_types.insert(tail, tail_type as i32)
+            self.typed_expr_types.insert(tail, (if tail_keeps_type: checked_tail_type else: tail_type) as i32)
             let tail_kind = self.get_type_kind(self.resolve_alias(tail_type))
             // D22: a tail view materializes when the return demands an owned
             // value; only an un-materialized view escapes (gate mirrors 9618).
@@ -11386,6 +11404,9 @@ impl Sema:
     fn view_origin_is_stack_local(sym: i32) -> i32:
         if sym == 0:
             return 0
+        // #1587: a str range view's header lives in this frame.
+        if sym == self.syms.str_range_view:
+            return 1
         let pi = self.param_index_for_sym(sym)
         if pi >= 0:
             // #718 (D5 §3.8): the DECLARED mode decides whether a parameter
@@ -11432,6 +11453,9 @@ impl Sema:
         if self.scope_binding_index(sym) >= block_scope_start: 1 else: 0
 
     mut fn report_view_escape(origin_sym: i32, report_node: i32, block_scope_start: i32):
+        if origin_sym == self.syms.str_range_view:
+            self.emit_error("a string slice cannot be returned yet (#1587): a `&str` points at a string header and the range's header lives in this function's frame; return `s.slice(a, b)` (an owned str) until `&str` carries its own {ptr, len}", report_node)
+            return
         let origin_name: str = with_str_clone_ref(self.pool_resolve(origin_sym))
         if block_scope_start < 0:
             self.emit_error("returned view may outlive its origin '" ++ origin_name ++ "'", report_node)
@@ -13970,17 +13994,88 @@ impl Sema:
             self.record_view_producer_origins(node, expr)
             return result
         if tk == TypeKind.TY_STR:
-            // A `&str` points at the string object, not at a byte range, so a
-            // sub-range has no view type yet (#1587). Name the spellings that
-            // exist rather than hand MIR a valueless expression.
-            self.emit_error("a range of a str has no view type yet (#1587): `s.slice(a, b)` copies the range into a new str; `s.as_bytes()[a..b]` views its bytes", node)
-            return 0
+            // D71 (§4.8a, #1587): a str range is a `&str` view of its bytes
+            // with the base's origins. A `&str` today points at a string
+            // header, so the view's header is a hidden local of this frame
+            // (lower_slice_expr): it carries the sentinel origin
+            // syms.str_range_view too, and a return of it is refused by name
+            // (check_view_escape_origins) until `&str` is its own {ptr, len}.
+            let result = self.ensure_exact_type(TypeKind.TY_REF, self.ty_str as i32, 0, 0) as i32
+            self.typed_expr_types.insert(node, result)
+            self.record_view_producer_origins(node, expr)
+            let param_mask = self.compute_expr_view_origin_mask(expr)
+            var deps: Vec[i32] = Vec.new()
+            deps = self.collect_expr_view_deps(node, move deps)
+            deps = self.push_unique_i32(move deps, self.syms.str_range_view)
+            self.set_expr_view_deps(node, param_mask, deps)
+            return result
         self.emit_error("range indexing needs an array, slice or Vec; this is " ++ self.type_name(arr_type as i32), node)
         0
+
+    // §4.3a (#1478): `[value; N]` — N is an integer literal or a `const`. A
+    // literal count is desugared by the parser into N copies; a non-literal
+    // count reaches Sema as the literal's d2, is evaluated here and recorded
+    // for MirLower and the comptime evaluator (array_fill_counts). It used
+    // to fall back to ONE copy with no diagnostic, and a typed binding then
+    // read uninitialized tail elements.
+    // §9.1b: a compile-time constant expression — integer literals,
+    // arithmetic, unary negate and `not`, and names of `const`s (casts and
+    // grouping of those too). A `let`, local or module-level, is a runtime
+    // value even when its initializer is a constant ("Difference from
+    // `let`"), so the evaluator's reading of an immutable module `let` does
+    // not make it a count.
+    fn expr_is_const_expr(node: i32) -> bool:
+        if node == 0:
+            return false
+        let kind = self.ast.kind(node)
+        if kind == NodeKind.NK_INT_LIT:
+            return true
+        if kind == NodeKind.NK_GROUPED:
+            return self.expr_is_const_expr(self.ast.get_data0(node))
+        if kind == NodeKind.NK_CAST:
+            return self.expr_is_const_expr(self.ast.get_data0(node))
+        if kind == NodeKind.NK_UNARY:
+            return self.expr_is_const_expr(self.ast.get_data1(node))
+        if kind == NodeKind.NK_BINARY:
+            return self.expr_is_const_expr(self.ast.get_data1(node)) and self.expr_is_const_expr(self.ast.get_data2(node))
+        if kind == NodeKind.NK_IDENT:
+            let sym = self.ast.get_data0(node)
+            if self.scope_binding_is_local(sym):
+                if not self.binding_decl_nodes.contains(sym):
+                    return false
+                return self.ast.is_const_decl_node(self.binding_decl_nodes.get(sym).unwrap() as NodeId) != 0
+            return self.const_global_syms.contains(sym)
+        false
+
+    mut fn array_fill_count(node: i32, count_node: i32) -> i32:
+        let count_ty = self.check_expr(count_node)
+        if count_ty == 0:
+            return -1
+        if self.get_type_kind(self.resolve_alias(count_ty)) != TypeKind.TY_INT:
+            self.emit_error("`[value; N]`: the count must be an integer, got `" ++ self.type_name(count_ty as i32) ++ "` (§4.3a)", count_node)
+            return -1
+        if not self.expr_is_const_expr(count_node):
+            self.emit_error("`[value; N]`: the count is not a compile-time constant; N is an integer literal or a `const` (§4.3a) — a `let` is a runtime value (§9.1b)", count_node)
+            return -1
+        let value = unsafe { comptime_try_eval_expr(self as *mut Sema, self.ast, self.pool, count_node) }
+        if value.kind != ComptimeValueKind.CV_INT:
+            self.emit_error("`[value; N]`: the count is not a compile-time constant; N is an integer literal or a `const` (§4.3a)", count_node)
+            return -1
+        if value.data0 < 0 or value.data0 > 2147483647:
+            self.emit_error(f"`[value; N]`: the count {value.data0} is out of range (§4.3a)", count_node)
+            return -1
+        self.array_fill_counts.insert(node, value.data0 as i32)
+        value.data0 as i32
 
     mut fn check_array_literal(node: i32) -> i32:
         let extra_start = self.ast.get_data0(node)
         let elem_count = self.ast.get_data1(node)
+        let fill_count_node = self.ast.get_data2(node)
+        var array_len = elem_count
+        if fill_count_node != 0:
+            array_len = self.array_fill_count(node, fill_count_node)
+            if array_len < 0:
+                return 0
         var expected_elem = 0
         var target_ty = 0
         var target_base = 0
@@ -14054,6 +14149,19 @@ impl Sema:
                 self.mark_moved_if_consumed(elem)
 
         let elem_type = self.resolve_contextual_join(expected_elem, &elem_nodes, &elem_origins, &elem_types, &elem_roles, node, "sequence literal")
+        // A fill builds an array or a Vec (§4.3a); a set of N copies of one
+        // value is one element, never what was written.
+        if fill_count_node != 0 and target_base != 0 and target_base != self.syms.vec:
+            self.emit_error("`[value; N]` fills an array or a Vec, not a `" ++ self.pool_resolve(target_base) ++ "` (§4.3a)", node)
+            return 0
+        // #1478: a fixed-size destination has the literal's length or the
+        // program is wrong; typing the literal as the annotation regardless
+        // read uninitialized tail elements (`let b: [4]i32 = [7; N]`).
+        if target_ty != 0 and self.get_type_kind(self.resolve_alias(target_ty as TypeId)) == TypeKind.TY_ARRAY:
+            let expected_len = self.get_type_d1(self.resolve_alias(target_ty as TypeId))
+            if expected_len != array_len:
+                self.emit_error(f"array literal has {array_len} elements, but `" ++ self.type_name(target_ty) ++ f"` holds {expected_len} (§4.3a)", node)
+                return 0
         let result: TypeId = if target_ty != 0:
             target_ty as TypeId
         else if target_base != 0:
@@ -14064,7 +14172,7 @@ impl Sema:
             // Array types have no side-table payload: reuse the canonical type
             // so frozen MIR lowering sees the same pointee identity as a
             // spelled `&[N]T` parameter.
-            self.ensure_exact_type(TypeKind.TY_ARRAY, elem_type, elem_count, 0)
+            self.ensure_exact_type(TypeKind.TY_ARRAY, elem_type, array_len, 0)
         self.typed_expr_types.insert(node, result as i32)
         if target_base == self.syms.btreeset:
             let ord_trait = self.pool_lookup_symbol("Ord")
@@ -17074,8 +17182,10 @@ impl Sema:
         let saved_body_tail_block: i32 = self.body_tail_block
         let saved_body_tail_holder: i32 = self.body_tail_holder
         let saved_body_tail_discards: bool = self.body_tail_discards
+        let saved_body_tail_is_statement: bool = self.body_tail_is_statement
         self.body_tail_block = body
         self.body_tail_holder = self.body_tail_holder_of(body)
+        self.body_tail_is_statement = false
         // §9.1 / D60: the expected function type's result is the closure's
         // declared return; a non-Unit one makes a tail assignment its value.
         let body_tail_discards = expected_ret_ty == 0 or expected_ret_ty == self.ty_void as i32
@@ -17084,10 +17194,11 @@ impl Sema:
         self.body_tail_block = saved_body_tail_block
         self.body_tail_holder = saved_body_tail_holder
         self.body_tail_discards = saved_body_tail_discards
+        self.body_tail_is_statement = saved_body_tail_is_statement
         // §9.1: an assignment closure body is discarded exactly as check_block
         // discards one; the recorded type is the verdict MirLower reads for
         // the implicit default.
-        let body_discarded = self.discard_body_tail(body, body_tail_discards) != 0
+        let body_discarded = self.discard_body_tail(body, body_tail_discards, false) != 0
         let body_ty = if body_discarded: self.ty_void else: checked_body_ty
         if body_discarded:
             self.typed_expr_types.insert(body, self.ty_void as i32)

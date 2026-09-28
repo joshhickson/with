@@ -6447,10 +6447,26 @@ impl ComptimeEvaluator:
 
     mut fn eval_array(node: i32) -> ComptimeControl:
         let extra_start = self.ast.get_data0(node)
-        let count = self.ast.get_data1(node)
+        var count = self.ast.get_data1(node)
+        // §4.3a (#1478): a `[value; N]` with a `const` count holds the one
+        // value; Sema evaluated N (array_fill_counts). Evaluating the value
+        // once per element is what the parser's literal-count desugar does.
+        let fill_count_node = self.ast.get_data2(node)
+        if fill_count_node != 0:
+            // A top-level `const A = [v; N]` is evaluated before its literal
+            // is checked, so the count is evaluated here when Sema has not.
+            if self.sema.array_fill_counts.contains(node):
+                count = self.sema.array_fill_counts.get(node).unwrap()
+            else:
+                var count_signal = self.eval_expr(fill_count_node)
+                if count_signal.kind != ComptimeControlKind.CTL_VALUE:
+                    return count_signal
+                if count_signal.value.kind != ComptimeValueKind.CV_INT or count_signal.value.data0 < 0:
+                    return self.fail(fill_count_node, "`[value; N]`: the count is not a compile-time integer constant (§4.3a)")
+                count = count_signal.value.data0 as i32
         let start = self.extra_values.len() as i32
         for i in 0..count:
-            var elem_signal = self.eval_expr(self.ast.get_extra(extra_start + i))
+            var elem_signal = self.eval_expr(self.ast.get_extra(extra_start + (if fill_count_node != 0: 0 else: i)))
             if elem_signal.kind != ComptimeControlKind.CTL_VALUE:
                 return elem_signal
             self.push_extra_value(move elem_signal.value)
@@ -6593,6 +6609,14 @@ impl ComptimeEvaluator:
         let idx = self.lookup_slot_index(sym)
         if idx >= 0:
             return comptime_control_value(comptime_value_share(self.slot_values[idx]))
+        // A local `const` in scope where Sema asks (a `[v; N]` count, #1478):
+        // its initializer is a compile-time constant (§9.1b). Only a live
+        // binding (Sema drops a name's decl when its scope ends), and only a
+        // `const` — a local `let` is a runtime value.
+        if self.sema.binding_decl_nodes.contains(sym) and self.sema.binding_value_nodes.contains(sym):
+            let local_decl: i32 = self.sema.binding_decl_nodes.get(sym).unwrap()
+            if self.ast.is_const_decl_node(local_decl as NodeId) != 0:
+                return self.eval_expr(self.sema.binding_value_nodes.get(sym).unwrap())
         let decl = self.find_module_let_decl(sym)
         if decl != 0:
             if self.ast.get_data2(decl) % 2 != 0:

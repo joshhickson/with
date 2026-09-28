@@ -190,6 +190,10 @@ type SemaBuiltinSymbols {
     debug_trait: i32,
     self_type: i32,
     vec: i32,
+    // #1587: the origin every str range view (`s[a..b]`, a `&str` whose
+    // header lives in this frame) carries besides its base's, so a return of
+    // it is refused (view_origin_escapes) until `&str` is its own {ptr, len}.
+    str_range_view: i32,
     fixed_string: i32,
     veciter: i32,
     mapiter: i32,
@@ -1248,6 +1252,10 @@ pub type Sema {
     // arguments (a generic struct field `items: Vec[T]`): literal node ->
     // the collection base the literal builds (§4.3c rule 1 and 2).
     collection_literal_hints: HashMap[i32, i32],
+    // §4.3a (#1478): `[value; N]` with a non-literal count keeps the count
+    // expression as the literal's d2; its evaluated value, by literal node.
+    // MirLower and the comptime evaluator read the count here.
+    array_fill_counts: HashMap[i32, i32],
     // #1754: the if/match argument now being checked at a `&T` parameter;
     // its arms meet `T` and its join has no owned anchor.
     borrow_pointee_join_node: i32,
@@ -1528,6 +1536,10 @@ pub type Sema {
     // when the body has no declared return (D43 infers) or declares `Unit`.
     // Under a declared non-`Unit` return the tail is the body's value.
     body_tail_discards: bool,
+    // §9.1: `main`, `@[entry]` and `test_*` functions do not infer; their
+    // tail is statement position whatever expression it is (#1786: a tail
+    // call's `str` was moved into the entry's return slot and leaked).
+    body_tail_is_statement: bool,
     // The assignment tails Sema discarded (body tails only); MirLower lowers
     // exactly these in discard mode.
     discarded_tails: HashMap[i32, i32],
@@ -2199,6 +2211,7 @@ fn sema_builtin_symbols_zero -> SemaBuiltinSymbols:
         debug_trait: 0,
         self_type: 0,
         vec: 0,
+        str_range_view: 0,
         fixed_string: 0,
         veciter: 0,
         mapiter: 0,
@@ -2802,6 +2815,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         autoderef_step_counts: sema_new_map_i32_i32(),
         slice_coerce_args: sema_new_map_i32_i32(),
         collection_literal_hints: sema_new_map_i32_i32(),
+        array_fill_counts: sema_new_map_i32_i32(),
         borrow_pointee_join_node: 0,
         contextual_copy_adjustment_indices: sema_new_map_i64_i32(),
         contextual_copy_adjustments: Vec.new(),
@@ -2955,6 +2969,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         body_tail_block: 0,
         body_tail_holder: 0,
         body_tail_discards: true,
+        body_tail_is_statement: false,
         discarded_tails: sema_new_map_i32_i32(),
         tail_read_assigns: sema_new_map_i32_i32(),
         facade_declared_effect_sigs: sema_new_map_i32_i32(),
@@ -4188,6 +4203,7 @@ impl Sema:
         self.syms.debug_trait = self.pool_intern("Debug")
         self.syms.self_type = self.pool_intern("Self")
         self.syms.vec = self.pool_intern("Vec")
+        self.syms.str_range_view = self.pool_intern("$str_range_view")
         self.syms.fixed_string = self.pool_intern("FixedString")
         self.syms.veciter = self.pool_intern("VecIter")
         self.syms.mapiter = self.pool_intern("MapIter")

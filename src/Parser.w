@@ -7787,7 +7787,12 @@ impl Parser:
             let type_extra = self.pool.extra_len()
             self.pool.add_extra(type_ann)
             flags = flags + (type_extra + 1) * 2
-        self.pool.add_node(NodeKind.NK_LET_BINDING, start, self.prev_end(), name_sym, value, flags)
+        let binding = self.pool.add_node(NodeKind.NK_LET_BINDING, start, self.prev_end(), name_sym, value, flags)
+        // A local `const` is a const as a module one is (§9.1b): Sema asks
+        // is_const_decl_node whether a name is a compile-time constant (a
+        // `[v; N]` count, #1478); the comptime wrapper alone is folded away.
+        self.pool.mark_const_decl(binding)
+        binding
 
     // ── With expression ──────────────────────────────────────────────
 
@@ -8047,21 +8052,23 @@ impl Parser:
                 self.advance()  // consume ;
                 let count_expr = self.parse_expr()
                 self.expect(TokenKind.TK_R_BRACKET)
-                // Desugar [value; N] to NodeKind.NK_ARRAY_LIT with N copies of value.
-                // The count is read here, so only an integer literal is known;
-                // a `const` or expression count (§4.3a) is refused loudly
-                // until the fill is a node Sema evaluates (#1478): it used to
-                // fall back to ONE copy, and a typed binding then read
-                // uninitialized tail elements.
+                // Desugar [value; N] to NodeKind.NK_ARRAY_LIT with N copies of value
+                // when N is an integer literal. Any other count (§4.3a: a
+                // `const`, or an expression of them) is kept as the literal's
+                // d2 with the value held once; Sema evaluates it
+                // (array_fill_count) and MirLower and the comptime evaluator
+                // read the count from Sema (#1478: it used to fall back to
+                // ONE copy silently, and a typed binding then read
+                // uninitialized tail elements).
                 var fill_count = -1
                 if self.pool.kind(count_expr) == NodeKind.NK_INT_LIT:
                     let fast = self.pool.int_literal_fast_i64(count_expr)
                     if fast.ok != 0 and fast.value >= 0:
                         fill_count = fast.value as i32
-                if fill_count < 0:
-                    self.emit_error_span("`[value; N]` needs an integer literal count; a `const` or expression count is not evaluated here yet (#1478)", self.pool.get_start(count_expr), self.prev_end())
-                    return self.poisoned_expr()
                 let extra_start = self.pool.extra_len()
+                if fill_count < 0:
+                    self.pool.add_extra(first as i32)
+                    return self.pool.add_node(NodeKind.NK_ARRAY_LIT, start, self.prev_end(), extra_start, 1, count_expr as i32)
                 for fi in 0..fill_count:
                     self.pool.add_extra(first as i32)
                 return self.pool.add_node(NodeKind.NK_ARRAY_LIT, start, self.prev_end(), extra_start, fill_count, 0)
@@ -8353,6 +8360,20 @@ impl Parser:
             if next_col < block_col:
                 self.pos = save
                 break
+            // §29.13 Form 2: a block's statements share its column. A line
+            // deeper than it was taken as its next statement without a word
+            // (#1781): a dedent to a level no enclosing block has (an `if`
+            // body at 12, its next line at 8, `main` at 4) silently joined
+            // the OUTER block, so the line ran with the `if` false, reading a
+            // binding from the arm that never ran. Report it; the line is
+            // still parsed here so the error names it and not what follows.
+            // Only a statement that begins its line has an indentation: the
+            // one after `a; b` starts mid-line.
+            if next_col > block_col and next_col == line_indent_of(self.source, self.current_start()):
+                let bad_start = self.current_start()
+                var diag = Diagnostic.err(f"unexpected indentation: this line is indented to column {next_col}, which is no enclosing block's indentation (the block here starts at column {block_col})", Span { file: self.file_id, start: bad_start, end: self.current_end() })
+                diag.add_help("a block's statements all start at its column; a line indented deeper than the statement before it belongs to a body that statement opens with ':' at the end of its line (§29.13)")
+                self.diags.emit(move diag)
 
             stmts.push(last_expr as i32)
             last_expr = self.parse_expr()

@@ -5684,10 +5684,16 @@ impl MirBuilder:
         // names (§3.7): the cast reads the string through the reference. As
         // a cast of the reference VALUE it took the pointer's bytes for the
         // string header and read garbage (found writing str.as_bytes()).
+        // #1782: the same through a distinct wrapper (§4.5, zero-cost): `r as
+        // str` with `r: &Name` where `Name = distinct str` names a string, and
+        // so does a `str` target; the reference value cast to the header
+        // printed a garbage byte.
         let src_res = self.sema.resolve_alias(src_sema_ty as TypeId)
-        if self.sema.get_type_kind(src_res) == TypeKind.TY_REF and self.sema.get_type_kind(self.sema.resolve_alias(target_type_id as TypeId)) == TypeKind.TY_SLICE:
+        let cast_target_kind = self.sema.get_type_kind(self.sema.resolve_alias(self.sema.unwrap_builtin_arg_distinct(target_type_id) as TypeId))
+        let cast_target_is_view_or_str = cast_target_kind == TypeKind.TY_SLICE or cast_target_kind == TypeKind.TY_STR or cast_target_kind == TypeKind.TY_ARRAY
+        if self.sema.get_type_kind(src_res) == TypeKind.TY_REF and cast_target_is_view_or_str:
             let pointee = self.sema.get_type_d0(src_res) as i32
-            let pointee_kind = self.sema.get_type_kind(self.sema.resolve_alias(pointee as TypeId))
+            let pointee_kind = self.sema.get_type_kind(self.sema.resolve_alias(self.sema.unwrap_builtin_arg_distinct(pointee) as TypeId))
             if pointee_kind == TypeKind.TY_STR or pointee_kind == TypeKind.TY_ARRAY or pointee_kind == TypeKind.TY_SLICE:
                 let ref_place = self.materialize_operand(op, src_sema_ty, self.ast.get_start(expr))
                 op = self.body.new_operand(OperandKind.OK_COPY, self.new_deref_place(ref_place))
@@ -6290,8 +6296,17 @@ impl MirBuilder:
             return self.lower_btree_seq_literal(node, elem_ty)
         let saved_expected = self.expected_type
         let args: Vec[i32] = Vec.new()
-        for i in 0..elem_count:
-            let elem_node = self.ast.get_extra(elem_start + i)
+        // §4.3a (#1478): a fill with a non-literal count holds its value
+        // once; Sema evaluated the count, and the Vec gets that many copies,
+        // each an evaluation of the value as the written form's are.
+        let fill_count_node = self.ast.get_data2(node)
+        var fill_count = elem_count
+        if fill_count_node != 0:
+            if not self.sema.array_fill_counts.contains(node):
+                sema_phase_bug(f"BUG: array fill count was not resolved by Sema: node={node}")
+            fill_count = self.sema.array_fill_counts.get(node).unwrap()
+        for i in 0..fill_count:
+            let elem_node = self.ast.get_extra(elem_start + (if fill_count_node != 0: 0 else: i))
             if elem_ty != 0:
                 self.expected_type = elem_ty
             args.push(self.lower_expr(elem_node))
@@ -6344,7 +6359,15 @@ impl MirBuilder:
         let base_node = self.ast.get_data0(node)
         let start_node = self.ast.get_data1(node)
         let end_node = self.ast.get_data2(node)
-        let base_place = self.lower_expr_place(base_node)
+        var base_place = self.lower_expr_place(base_node)
+        // A range through a reference slices what it names (§3.7): the base
+        // is the pointee, not the pointer local (`a[1..]` on `a: &[4]i32`
+        // failed codegen: "slice base has no bounds metadata"; #1587).
+        let base_ty = self.expr_type(base_node)
+        var base_res = if base_ty != 0: self.sema.resolve_alias(base_ty as TypeId) else: 0
+        if base_res != 0 and self.sema.get_type_kind(base_res) == TypeKind.TY_REF:
+            base_place = self.new_deref_place(base_place)
+            base_res = self.sema.resolve_alias(self.sema.get_type_d0(base_res) as TypeId)
         let start_op = if start_node != 0:
             self.lower_expr(start_node)
         else:
@@ -6361,6 +6384,20 @@ impl MirBuilder:
 
         let slice_rv = self.body.new_rvalue(RvalueKind.RK_SLICE, base_place, start_op, end_op)
         let slice_ty = self.expr_type(node)
+        // D71 (§4.8a, #1587): a str range is a `&str`. A `&str` points at a
+        // string header, so the range's {ptr, len} is built into a hidden
+        // str local of this frame — a header that owns nothing (no drop is
+        // scheduled) — and the view is a reference to it. Sema refuses to
+        // return such a view (its origin syms.str_range_view is frame-local).
+        if base_res != 0 and self.sema.get_type_kind(base_res) == TypeKind.TY_STR:
+            let header_local = self.new_temp(self.sema.ty_str as i32)
+            let header_place = self.place_for_local(header_local)
+            self.body.push_stmt(self.cur_bb, StmtKind.Assign, header_place, slice_rv, self.ast.get_start(node))
+            let ref_rv = self.body.new_rvalue(RvalueKind.RK_REF, BorrowKind.SHARED, header_place, 0)
+            let ref_local = self.new_temp(slice_ty)
+            let ref_place = self.place_for_local(ref_local)
+            self.body.push_stmt(self.cur_bb, StmtKind.Assign, ref_place, ref_rv, self.ast.get_start(node))
+            return self.body.new_operand(OperandKind.OK_COPY, ref_place)
         let slice_local = self.new_temp(slice_ty)
         let slice_place = self.place_for_local(slice_local)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, slice_place, slice_rv, self.ast.get_start(node))
@@ -12835,9 +12872,8 @@ impl MirBuilder:
                 let dyn_next = self.new_block()
                 self.terminate(TermKind.TK_CALL, dyn_fn_op, dyn_args_id, dyn_place, dyn_next)
                 self.switch_to(dyn_next)
-                if self.sema.is_copy_frozen(dyn_ret_ty) != 0:
-                    return self.body.new_operand(OperandKind.OK_COPY, dyn_place)
-                return self.body.new_operand(OperandKind.OK_MOVE, dyn_place)
+                // #1786: a statement temp, as in lower_intrinsic_call.
+                return self.call_result_operand(dyn_result, dyn_place, dyn_ret_ty)
 
         // A bare method symbol is unresolved only when Sema did not record a
         // concrete signature for this call. Inherent impl methods may legitimately
@@ -13151,9 +13187,11 @@ impl MirBuilder:
         if intrinsic == MirIntrinsic.CHAN_SEND or intrinsic == MirIntrinsic.CHAN_RECV:
             self.emit_wait_cancel_check()
 
-        if self.sema.is_copy_frozen(ret_type) != 0:
-            return self.body.new_operand(OperandKind.OK_COPY, result_place)
-        self.body.new_operand(OperandKind.OK_MOVE, result_place)
+        // #1786: the result is a statement temp like every other call's
+        // (lower_call): consumed by a binding or an argument it is cancelled,
+        // discarded (`v.pop()` as a statement) it is dropped at the
+        // statement's end. Unregistered, the popped `Some(payload)` leaked.
+        self.call_result_operand(result_local, result_place, ret_type)
 
     mut fn lower_vtable_call(dyn_expr: i32, _trait_sym: i32, method_sym: i32, args_start: i32, args_count: i32, node: i32) -> i32:
         // Conservative lowering: treat as method call on dynamic receiver.
@@ -15127,9 +15165,8 @@ impl MirBuilder:
             let math_method_name = self.pool.resolve_symbol(method_sym)
             let math_method_id = math_fn_lookup(math_method_name)
             self.body.set_call_math_fn_id(args_id, math_method_id)
-        if self.sema.is_copy_frozen(ret_type) != 0:
-            return self.body.new_operand(OperandKind.OK_COPY, result_place)
-        self.body.new_operand(OperandKind.OK_MOVE, result_place)
+        // #1786: a statement temp, as in lower_intrinsic_call.
+        self.call_result_operand(result_local, result_place, ret_type)
 
     mut fn lower_optional_chain_receiver_operand(payload_place: i32, payload_ty: i32, sig_idx: i32, span: i32) -> i32:
         if sig_idx >= 0 and self.sema.sig_get_param_count(sig_idx) > 0:
@@ -16467,22 +16504,33 @@ impl MirBuilder:
             if collection_op >= 0:
                 return collection_op
             let extra_start = self.ast.get_data0(node)
-            let elem_count = self.ast.get_data1(node)
-            if elem_count > 64:
-                let first_node = self.ast.get_extra(extra_start)
-                var is_fill = true
+            // §4.3a (#1478): a fill with a non-literal count holds its value
+            // once (d1 = 1); Sema evaluated the count (array_fill_counts).
+            let fill_count_node = self.ast.get_data2(node)
+            var elem_count = self.ast.get_data1(node)
+            if fill_count_node != 0:
+                if not self.sema.array_fill_counts.contains(node):
+                    sema_phase_bug(f"BUG: array fill count was not resolved by Sema: node={node}")
+                elem_count = self.sema.array_fill_counts.get(node).unwrap()
+            let first_node = self.ast.get_extra(extra_start)
+            var is_fill = fill_count_node != 0
+            if not is_fill and elem_count > 64:
+                is_fill = true
                 for fi in 1..elem_count:
                     if self.ast.get_extra(extra_start + fi) != first_node:
                         is_fill = false
                         break
-                if is_fill:
-                    let fill_op = self.lower_expr(first_node)
-                    let fill_rv = self.body.new_rvalue(RvalueKind.RK_ARRAY_FILL, fill_op, elem_count, 0)
-                    let fill_ty = self.expr_type(node)
-                    let fill_tmp = self.new_temp(fill_ty)
-                    let fill_place = self.place_for_local(fill_tmp)
-                    self.body.push_stmt(self.cur_bb, StmtKind.Assign, fill_place, fill_rv, self.ast.get_start(node))
-                    return self.body.new_operand(OperandKind.OK_COPY, fill_place)
+            // A Copy fill is one evaluation copied N times; a non-Copy value
+            // is evaluated once per element, as the written form is (over 64
+            // copies the fill rvalue stands, as before).
+            if is_fill and (elem_count > 64 or self.sema.is_copy_frozen(self.expr_type(first_node)) != 0):
+                let fill_op = self.lower_expr(first_node)
+                let fill_rv = self.body.new_rvalue(RvalueKind.RK_ARRAY_FILL, fill_op, elem_count, 0)
+                let fill_ty = self.expr_type(node)
+                let fill_tmp = self.new_temp(fill_ty)
+                let fill_place = self.place_for_local(fill_tmp)
+                self.body.push_stmt(self.cur_bb, StmtKind.Assign, fill_place, fill_rv, self.ast.get_start(node))
+                return self.body.new_operand(OperandKind.OK_COPY, fill_place)
             let arr_fields: Vec[i32] = Vec.new()
             let arr_names: Vec[i32] = Vec.new()
             // #586: elements lower under the ARRAY'S ELEMENT type, not the ambient
@@ -16506,7 +16554,7 @@ impl MirBuilder:
                 if arr_lit_kind == TypeKind.TY_ARRAY or arr_lit_kind == TypeKind.TY_SLICE:
                     arr_elem_expected = self.sema.get_type_d0(arr_lit_resolved)
             for i in 0..elem_count:
-                let elem_node = self.ast.get_extra(extra_start + i)
+                let elem_node = self.ast.get_extra(extra_start + (if fill_count_node != 0: 0 else: i))
                 if arr_elem_expected != 0:
                     self.expected_type = arr_elem_expected
                 let arr_elem_op = self.lower_expr(elem_node)
