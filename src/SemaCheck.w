@@ -2440,9 +2440,11 @@ impl Sema:
         self.infer_tail_node = if body_expected_ret == 0 and self.fn_decl_is_entry_point(node) == 0: body else: 0
         self.infer_tail_is_closure = 0
         let saved_body_tail_block: i32 = self.body_tail_block
+        let saved_body_tail_holder: i32 = self.body_tail_holder
         let saved_body_tail_discards: bool = self.body_tail_discards
         let source_body = self.fn_body_inner(body)
         self.body_tail_block = source_body
+        self.body_tail_holder = self.body_tail_holder_of(source_body)
         // §9.1 / D60: under a declared non-Unit return the body's tail
         // assignment is its value; with no annotation (D43) or `-> Unit` it
         // is a statement.
@@ -2456,6 +2458,7 @@ impl Sema:
         let unit_body_stmt = body_expected_ret == self.ty_void and self.ast.kind(source_body) != NodeKind.NK_BLOCK
         let checked_body_ty = if unit_body_stmt: self.check_expr_statement_context(body) else: self.check_expr(body)
         self.body_tail_block = saved_body_tail_block
+        self.body_tail_holder = saved_body_tail_holder
         self.body_tail_discards = saved_body_tail_discards
         // §9.1: a single-statement assignment body is discarded exactly when
         // check_block discards the body block's assignment tail.
@@ -6166,6 +6169,40 @@ impl Sema:
 
     fn tail_is_discarded(node: i32): node != 0 and self.discarded_tails.contains(node)
 
+    // §9.1 / D73: the node that holds the body's tail. A body block's tail
+    // may be a wrapper that yields its own inner tail — `unsafe:` /
+    // `unsafe { }`, `no_suspend`, a plain block, through groupings: the
+    // wrappers record_tail_reads follows for D60's read. The body's tail is
+    // then the innermost holder's — a block's tail, or the wrapper's child
+    // when its body is one statement (parse_block_or_expr) — so
+    // `fn f: unsafe: x = e` is a statement tail and returns Unit, as
+    // `fn f: x = e` does (#1479: `fn init_once:` with an `unsafe:`
+    // assignment tail inferred `-> i32`). An `if`/`match` tail is not a
+    // wrapper: its written arms keep the place's type (D43). 0 when the
+    // body is its own tail (a single-statement body).
+    fn body_tail_holder_of(body: i32) -> i32:
+        var node = body
+        var holder = 0
+        while node != 0:
+            let kind = self.ast.kind(node)
+            if kind == NodeKind.NK_BLOCK:
+                holder = node
+                node = self.ast.get_data2(node)
+            else if kind == NodeKind.NK_UNSAFE_BLOCK or kind == NodeKind.NK_NO_SUSPEND:
+                holder = node
+                node = self.ast.get_data0(node)
+            else if kind == NodeKind.NK_GROUPED:
+                node = self.ast.get_data0(node)
+            else:
+                break
+        holder
+
+    // The type a tail-holding wrapper (`unsafe:`, `no_suspend`) yields: Unit
+    // when it holds the body's assignment tail and the body discards it
+    // (D73), else its child's type.
+    mut fn wrapper_tail_type(node: i32, body: i32, child_ty: TypeId):
+        if node == self.body_tail_holder and self.discard_body_tail(body, self.body_tail_discards) != 0: self.ty_void else: child_ty
+
     // An `unsafe fn` body is its source body inside the implicit unsafe
     // block the parser wraps it in; §9.1's tail rule reads the source body,
     // as for every other fn (D43: body forms do not change typing).
@@ -7085,13 +7122,14 @@ impl Sema:
                     self.emit_error("unsafe block contains no unsafe operations", node)
             if is_prefix and unsafe_result != 0 and self.unsafe_prefix_has_raw_access(body) == 0:
                 self.emit_error("unsafe prefix requires a raw pointer dereference or raw pointer index; use unsafe { ... } for compound unsafe expressions", node)
-            return unsafe_result
+            return self.wrapper_tail_type(node, body, unsafe_result)
 
         if kind == NodeKind.NK_NO_SUSPEND:
             let body = self.ast.get_data0(node)
             self.no_suspend_scope_depth = self.no_suspend_scope_depth + 1
-            let result = if self.has_expected_type != 0: self.check_expr_with_expected(body, self.expected_expr_type) else: self.check_expr(body)
+            let checked = if self.has_expected_type != 0: self.check_expr_with_expected(body, self.expected_expr_type) else: self.check_expr(body)
             self.no_suspend_scope_depth = self.no_suspend_scope_depth - 1
+            let result = self.wrapper_tail_type(node, body, checked)
             if result != 0:
                 self.typed_expr_types.insert(node, result as i32)
             return result
@@ -10126,11 +10164,13 @@ impl Sema:
             let ret_is_void = self.current_return_type == self.ty_void or self.current_return_type == 0
             if ret_is_void and self.ast.kind(tail) == NodeKind.NK_MATCH:
                 self.match_in_stmt_pos = 1
-            // §9.1: the body block's assignment tail is discarded, so the body
-            // is Unit — unless the body declares a non-Unit return (D60), when
-            // the tail is its value. An arm block's tail keeps the place's
+            // §9.1: the body's assignment tail is discarded, so the body is
+            // Unit — unless the body declares a non-Unit return (D60), when
+            // the tail is its value. The body's tail is the body block's, or
+            // that of the `unsafe:` or plain block it ends in (D73,
+            // body_tail_holder). An arm block's tail keeps the place's
             // type (D43).
-            let tail_discarded = node == self.body_tail_block and self.discard_body_tail(tail, self.body_tail_discards) != 0
+            let tail_discarded = node == self.body_tail_holder and self.discard_body_tail(tail, self.body_tail_discards) != 0
             let tail_is_value = not tail_discarded and (self.current_value_expr_root == node or (self.stmt_pos_depth == 0 and self.current_return_type != 0 and self.current_return_type != self.ty_void) or (self.has_expected_type != 0 and self.expected_expr_type != 0 and self.expected_expr_type != self.ty_void))
             if tail_is_value:
                 self.current_value_expr_root = tail
@@ -15509,19 +15549,20 @@ impl Sema:
             return 0
 
         let extra_start = self.ast.get_data1(td_node)
-        let td_packed = self.ast.get_data2(td_node)
-        if type_decl_sub_kind(td_packed) != TypeDeclKind.Enum:
+        let td_sub_kind = type_decl_sub_kind(self.ast.get_data2(td_node))
+        if not type_decl_is_enum(td_sub_kind):
             return 0
 
         let inferred_args: Vec[i32] = Vec.new()
         for _ in 0..tp_count:
             inferred_args.push(0)
 
-        let variant_count = self.ast.get_extra(extra_start)
-        var pos = extra_start + 1
+        let count_index = enum_decl_count_index(td_sub_kind, extra_start)
+        let variant_count = self.ast.get_extra(count_index)
+        var pos = count_index + 1
         for _ in 0..variant_count:
             let name_sym = self.ast.get_extra(pos)
-            pos = pos + 1
+            pos = pos + enum_decl_variant_head(td_sub_kind)
             let payload_count = self.ast.get_extra(pos)
             pos = pos + 1
             if name_sym == variant_sym:
@@ -15567,27 +15608,19 @@ impl Sema:
         // Walk AST type decl to find variant and re-resolve payload type nodes
         let td_node: i32 = self.type_decl_nodes.get(base_sym).unwrap()
         let td_extra_start = self.ast.get_data1(td_node)
-        let td_packed = self.ast.get_data2(td_node)
-        let td_sub_kind = type_decl_sub_kind(td_packed)
-        if td_sub_kind != TypeDeclKind.Enum:
+        let td_sub_kind = type_decl_sub_kind(self.ast.get_data2(td_node))
+        if not type_decl_is_enum(td_sub_kind):
             self.generic_subst_param_syms = saved_payload_subst_syms
             self.generic_subst_type_ids = saved_payload_subst_tys
             return result
-        // Get type param info for resolve_generic_return_type_node
-        let vc = self.ast.get_extra(td_extra_start)
-        var tp_epos = td_extra_start + 1
-        for tvi in 0..vc:
-            tp_epos = tp_epos + 1
-            let tpc = self.ast.get_extra(tp_epos)
-            tp_epos = tp_epos + 1
-            tp_epos = tp_epos + tpc
-        let tp_start = self.ast.get_extra(tp_epos + 1)
-        let tp_count = self.ast.get_extra(tp_epos + 2)
-        // Now walk variants again to find the matching one
-        var epos = td_extra_start + 1
+        let tp_start = self.type_decl_tp_start(td_node)
+        let tp_count = self.type_decl_tp_count(td_node)
+        let count_index = enum_decl_count_index(td_sub_kind, td_extra_start)
+        let vc = self.ast.get_extra(count_index)
+        var epos = count_index + 1
         for vi in 0..vc:
             let v_name = self.ast.get_extra(epos)
-            epos = epos + 1
+            epos = epos + enum_decl_variant_head(td_sub_kind)
             let pc = self.ast.get_extra(epos)
             epos = epos + 1
             if v_name == variant_name:
@@ -17039,14 +17072,17 @@ impl Sema:
         self.infer_tail_node = if expected_ret_ty == 0: body else: 0
         self.infer_tail_is_closure = 1
         let saved_body_tail_block: i32 = self.body_tail_block
+        let saved_body_tail_holder: i32 = self.body_tail_holder
         let saved_body_tail_discards: bool = self.body_tail_discards
         self.body_tail_block = body
+        self.body_tail_holder = self.body_tail_holder_of(body)
         // §9.1 / D60: the expected function type's result is the closure's
         // declared return; a non-Unit one makes a tail assignment its value.
         let body_tail_discards = expected_ret_ty == 0 or expected_ret_ty == self.ty_void as i32
         self.body_tail_discards = body_tail_discards
         let checked_body_ty = if expected_ret_ty != 0: self.check_expr_with_expected(body, expected_ret_ty as TypeId) else: self.check_expr_value_context(body)
         self.body_tail_block = saved_body_tail_block
+        self.body_tail_holder = saved_body_tail_holder
         self.body_tail_discards = saved_body_tail_discards
         // §9.1: an assignment closure body is discarded exactly as check_block
         // discards one; the recorded type is the verdict MirLower reads for
@@ -24026,29 +24062,8 @@ impl Sema:
         let td_node: i32 = self.type_decl_nodes.get(decl_sym).unwrap()
         let td_extra_start = self.ast.get_data1(td_node)
         let td_packed = self.ast.get_data2(td_node)
-        let td_sub_kind = type_decl_sub_kind(td_packed)
-        var td_tp_start = 0
-        var td_tp_count = 0
-        if td_sub_kind == TypeDeclKind.Struct:
-            let fc = self.ast.get_extra(td_extra_start)
-            let after = td_extra_start + 1 + fc * 4
-            td_tp_start = self.ast.get_extra(after + 1)
-            td_tp_count = self.ast.get_extra(after + 2)
-        else if td_sub_kind == TypeDeclKind.Alias or td_sub_kind == TypeDeclKind.Distinct:
-            td_tp_start = self.ast.get_extra(td_extra_start + 2)
-            td_tp_count = self.ast.get_extra(td_extra_start + 3)
-        else if td_sub_kind == TypeDeclKind.Enum:
-            // For enum: extra=[variant_count, [var_name, payload_count, payload_type...]*, vis, tp_start, tp_count]
-            let vc = self.ast.get_extra(td_extra_start)
-            var epos = td_extra_start + 1
-            for vi in 0..vc:
-                epos = epos + 1  // var_name
-                let pc = self.ast.get_extra(epos)
-                epos = epos + 1  // payload_count
-                epos = epos + pc  // skip payload type nodes
-            // epos now points at vis
-            td_tp_start = self.ast.get_extra(epos + 1)
-            td_tp_count = self.ast.get_extra(epos + 2)
+        let td_tp_start = self.type_decl_tp_start(td_node)
+        let td_tp_count = self.type_decl_tp_count(td_node)
         if td_tp_count == 0:
             return 0
         let gi_arg_count = self.get_generic_inst_arg_count(gi_tid)
@@ -24091,31 +24106,8 @@ impl Sema:
                 if meta >= 0:
                     let ret_node = self.ast.fn_meta_ret(meta)
                     if ret_node != 0:
-                        let td_node = self.type_decl_nodes.get(type_sym).unwrap()
-                        let td_extra_start = self.ast.get_data1(td_node)
-                        let td_packed = self.ast.get_data2(td_node)
-                        let td_sub_kind = type_decl_sub_kind(td_packed)
-                        var td_tp_start = 0
-                        var td_tp_count = 0
-                        if td_sub_kind == TypeDeclKind.Struct:
-                            let fc = self.ast.get_extra(td_extra_start)
-                            let after = td_extra_start + 1 + fc * 4
-                            td_tp_start = self.ast.get_extra(after + 1)
-                            td_tp_count = self.ast.get_extra(after + 2)
-                        else if td_sub_kind == TypeDeclKind.Alias or td_sub_kind == TypeDeclKind.Distinct:
-                            td_tp_start = self.ast.get_extra(td_extra_start + 2)
-                            td_tp_count = self.ast.get_extra(td_extra_start + 3)
-                        else if td_sub_kind == TypeDeclKind.Enum:
-                            let vc = self.ast.get_extra(td_extra_start)
-                            var epos = td_extra_start + 1
-                            for vi in 0..vc:
-                                epos = epos + 1
-                                let pc = self.ast.get_extra(epos)
-                                epos = epos + 1
-                                epos = epos + pc
-                            td_tp_start = self.ast.get_extra(epos + 1)
-                            td_tp_count = self.ast.get_extra(epos + 2)
-                        out = self.resolve_generic_return_type_node(ret_node, td_tp_start, td_tp_count)
+                        let td_node: i32 = self.type_decl_nodes.get(type_sym).unwrap()
+                        out = self.resolve_generic_return_type_node(ret_node, self.type_decl_tp_start(td_node), self.type_decl_tp_count(td_node))
         self.generic_subst_param_syms = saved_subst_syms
         self.generic_subst_type_ids = saved_subst_tys
         out

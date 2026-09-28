@@ -1029,13 +1029,13 @@ impl Sema:
                 for prev in 0..disc_vals.len() as i32:
                     if disc_ok and disc_vals[prev] == disc_value:
                         self.emit_error(f"duplicate discriminant value {disc_text(disc_value, repr_signed)}", node)
-                // Check discriminant fits in repr type range
-                if repr_type_tid == self.ty_i8:
-                    if disc_value < (-128) or disc_value > 127:
-                        self.emit_error(f"discriminant value {disc_value} out of range for i8", node)
-                if repr_type_tid == self.ty_i16:
-                    if disc_value < (-32768) or disc_value > 32767:
-                        self.emit_error(f"discriminant value {disc_value} out of range for i16", node)
+                // §4.4a (#1003): an explicit discriminant fits the repr it is
+                // declared in — every width and signedness (only i8 and i16
+                // were checked; `B = 300` in a u8 became 44 and a match on
+                // it crashed). The auto-incremented ones were checked above.
+                if disc_ok and disc_node != 0 and not disc_fits_repr(disc_value, repr_bits, repr_signed):
+                    self.emit_error(f"discriminant value {disc_value} out of range for {self.type_name(repr_type_tid)}", disc_node)
+                    disc_ok = false
                 disc_vals.push(disc_value)
                 for pi in 0..payload_count:
                     let pt_node = self.ast.get_extra(epos)
@@ -2560,25 +2560,7 @@ impl Sema:
     fn type_decl_type_param_count(type_name: i32) -> i32:
         if not self.type_decl_nodes.contains(type_name):
             return 0
-        let td_node = self.type_decl_nodes.get(type_name).unwrap()
-        let td_extra_start = self.ast.get_data1(td_node)
-        let td_packed = self.ast.get_data2(td_node)
-        let td_sub_kind = type_decl_sub_kind(td_packed)
-        if td_sub_kind == TypeDeclKind.Struct:
-            let field_count = self.ast.get_extra(td_extra_start)
-            let after_fields = td_extra_start + 1 + field_count * 4
-            return self.ast.get_extra(after_fields + 2)
-        if td_sub_kind == TypeDeclKind.Alias or td_sub_kind == TypeDeclKind.Distinct:
-            return self.ast.get_extra(td_extra_start + 3)
-        if td_sub_kind == TypeDeclKind.Enum:
-            let variant_count = self.ast.get_extra(td_extra_start)
-            var epos = td_extra_start + 1
-            for vi in 0..variant_count:
-                epos = epos + 1
-                let payload_count = self.ast.get_extra(epos)
-                epos = epos + 1 + payload_count
-            return self.ast.get_extra(epos + 2)
-        0
+        self.type_decl_tp_count(self.type_decl_nodes.get(type_name).unwrap())
 
     // Check if a new direct impl overlaps with any existing blanket impl
     mut fn check_direct_overlap(type_name: i32, trait_sym: i32, node: i32):
