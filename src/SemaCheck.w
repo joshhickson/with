@@ -5775,7 +5775,9 @@ impl Sema:
             return self.expr_is_ephemeral_task(node)
         // #625 (decisions.md D2): a container/struct literal of an ephemeral type is
         // an ephemeral value — needed so Box.new(View{…}) / heap-escape gates fire.
-        if kind == NodeKind.NK_STRUCT_LIT or kind == NodeKind.NK_ARRAY_LIT or kind == NodeKind.NK_MAP_LIT:
+        // A tuple literal is one too: `Box.new((view, 1))` put the view on the
+        // heap past its origin, as `Box.new(view)` would (§5.1).
+        if kind == NodeKind.NK_STRUCT_LIT or kind == NodeKind.NK_ARRAY_LIT or kind == NodeKind.NK_MAP_LIT or kind == NodeKind.NK_TUPLE:
             if self.type_is_ephemeral_value(self.cached_or_checked_expr_type(node)) != 0:
                 return 1
             // A literal holding an ephemeral VALUE (a non-`move` closure in a
@@ -19218,7 +19220,7 @@ impl Sema:
             else if callable_value_tid != 0:
                 expected_ty = self.fn_type_param_type(callable_value_tid, ai + param_offset)
             if expected_ty == 0 and facade_mi >= 0 and facade_context.userdata_type != 0:
-                if ai == self.facade_callback_methods[facade_mi].callback_param or (facade_context.nullable and facade_context.userdata_node == 0 and ai == self.facade_callback_methods[facade_mi].userdata_param):
+                if ai == self.facade_callback_methods[facade_mi].callback_param or self.facade_callback_method_wraps(facade_mi, ai) or (facade_context.nullable and facade_context.userdata_node == 0 and ai == self.facade_callback_methods[facade_mi].userdata_param):
                     expected_ty = self.facade_callback_fn_param_expected_type(facade_mi, fn_sym, 0, facade_context.userdata_type, ai)
             if expected_ty == 0 and arg_node > 0 and self.ast.kind(arg_node) == NodeKind.NK_NULL_LIT:
                 expected_ty = self.null_arg_expected_type(fn_sym, ai + param_offset, false)
@@ -24493,7 +24495,7 @@ impl Sema:
         // argument is checked against `extern "C" fn(&U, …)` with `U` bound
         // to the userdata argument's type, so the userdata is checked first
         // whatever order C declares them in (SemaFacade.w
-        // facade_callback_expected_type).
+        // facade_callback_param_expected_type).
         let facade_mi = self.facade_callback_method_for_call(obj_type as i32, field)
         let facade_context = self.facade_prepare_callback_call(facade_mi, node, extra_start, mc_resolved_arg_count)
         if not facade_context.valid:
@@ -24557,8 +24559,8 @@ impl Sema:
                 mc_expected = mc_static_variant_payload_tys[ai]
             if mc_expected == 0 and mc_is_closure:
                 mc_expected = self.method_closure_arg_expected_type(obj_type as i32, field, mc_sig_idx_for_effect, ai, mc_param_offset_for_resolution)
-            if mc_expected == 0 and facade_mi >= 0 and facade_ud_ty != 0 and ai == self.facade_callback_methods[facade_mi].callback_param:
-                mc_expected = self.facade_callback_expected_type(facade_mi, obj_type as i32, field, facade_ud_ty)
+            if mc_expected == 0 and facade_mi >= 0 and facade_ud_ty != 0 and (ai == self.facade_callback_methods[facade_mi].callback_param or self.facade_callback_method_wraps(facade_mi, ai)):
+                mc_expected = self.facade_callback_param_expected_type(facade_mi, obj_type as i32, field, facade_ud_ty, ai)
             if mc_expected == 0 and ai == facade_pair_cb_arg:
                 mc_expected = self.facade_pair_callback_expected_type(mc_arg_node)
             if ai == facade_pair_ud_arg:
@@ -27359,6 +27361,24 @@ impl Sema:
             for ii in 0..in_count:
                 if self.expr_uses_symbol(self.ast.get_extra(in_base + 1 + ii), sym) != 0:
                     return 1
+            return 0
+        // A type in expression position — the type argument of a call such
+        // as `transmute[extern "C" fn(…)](p)` or `size_of[T]()`, which the
+        // callee's NK_INDEX carries — names no value, except through a
+        // `typeof(expr)` inside it.
+        if kind == NodeKind.NK_TYPE_TYPEOF or kind == NodeKind.NK_TYPE_REF or kind == NodeKind.NK_TYPE_PTR or kind == NodeKind.NK_TYPE_OPTIONAL or kind == NodeKind.NK_TYPE_ARRAY or kind == NodeKind.NK_TYPE_SLICE:
+            return self.expr_uses_symbol(self.ast.get_data0(node), sym)
+        if kind == NodeKind.NK_TYPE_GENERIC:
+            for ai in 0..self.ast.get_data2(node):
+                if self.expr_uses_symbol(self.ast.get_extra(self.ast.get_data1(node) + ai), sym) != 0:
+                    return 1
+            return 0
+        if kind == NodeKind.NK_TYPE_TUPLE or kind == NodeKind.NK_TYPE_FN or kind == NodeKind.NK_TYPE_EXTERN_FN:
+            for ti in 0..self.ast.get_data1(node):
+                if self.expr_uses_symbol(self.ast.get_extra(self.ast.get_data0(node) + ti), sym) != 0:
+                    return 1
+            return if kind == NodeKind.NK_TYPE_TUPLE: 0 else: self.expr_uses_symbol(self.ast.get_data2(node), sym)
+        if kind == NodeKind.NK_TYPE_NAMED or kind == NodeKind.NK_TYPE_TRAIT_OBJ or kind == NodeKind.NK_TYPE_INFERRED or kind == NodeKind.NK_TYPE_ASSOC:
             return 0
         // Leaves: nothing below them can name a symbol. Every other kind is
         // an expression form this walk has no case for — a capture it would
