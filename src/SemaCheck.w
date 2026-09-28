@@ -1813,6 +1813,25 @@ impl Sema:
             return false
         self.get_type_kind(self.resolve_alias(ret as TypeId)) == TypeKind.TY_REF or self.type_is_ephemeral_value(ret) != 0
 
+    // #1783 (§21.1): a method may store a view of a parameter into its
+    // receiver (EFF_STORE_IN_RECEIVER, note_view_store_into_root), and a
+    // call ties its receiver to that argument from the summary, so such a
+    // method is checked before its callers as a view-returning one is. Only
+    // a parameter that can carry a view — a reference, an ephemeral value, a
+    // callable (§12.4) — can be stored as one.
+    fn decl_may_store_view_into_receiver(decl: i32, di: i32) -> bool:
+        let sig = self.get_sig(self.fn_decl_semantic_symbol_at(decl, self.ast.get_data0(decl), di))
+        if sig < 0 or self.sig_receiver_mode(sig) == ReceiverMode.None:
+            return false
+        for pi in 1..self.sig_get_param_count(sig):
+            let pt = self.sig_param_type(sig, pi)
+            if pt <= 0:
+                continue
+            let tk = self.get_type_kind(self.resolve_alias(pt as TypeId))
+            if tk == TypeKind.TY_REF or tk == TypeKind.TY_FN or self.type_is_ephemeral_value(pt) != 0:
+                return true
+        false
+
     // Nodes are appended children first, so a declaration's subtree is the ids
     // between the nearest declaration node below it and its own.
     mut fn prepare_body_order(count: i32):
@@ -1836,7 +1855,7 @@ impl Sema:
             if self.ast.kind(decl) != NodeKind.NK_FN_DECL: continue
             let meta = self.ast.find_fn_meta(decl)
             if meta < 0 or self.ast.fn_meta_tp_count(meta) != 0 or self.fn_decl_is_entry_point(decl) != 0: continue
-            if self.ast.fn_meta_ret(meta) != 0 and not self.decl_returns_view(decl, di): continue
+            if self.ast.fn_meta_ret(meta) != 0 and not self.decl_returns_view(decl, di) and not self.decl_may_store_view_into_receiver(decl, di): continue
             // A call names it by its bare name: `later(x)`, `self.later()`.
             let parsed = self.ast.get_data0(decl)
             let text: str = with_str_clone_ref(self.pool_resolve(parsed))
@@ -2597,11 +2616,11 @@ impl Sema:
                     if p_tid > 0:
                         let p_tk = self.get_type_kind(self.resolve_alias(p_tid))
                         if p_tk == TypeKind.TY_REF:
-                            eff = eff & (EFF_READ | EFF_ESCAPE_VIEW | EFF_RAW_PTR_VALIDITY)
+                            eff = eff & (EFF_READ | EFF_ESCAPE_VIEW | EFF_RAW_PTR_VALIDITY | EFF_STORE_IN_RECEIVER)
                         else if p_tk == TypeKind.TY_PTR:
                             eff = eff & (EFF_READ | EFF_RAW_PTR_VALIDITY)
-                        if (eff & (EFF_WRITE | EFF_CONSUME | EFF_ESCAPE_VALUE | EFF_ESCAPE_VIEW | EFF_RAW_PTR_VALIDITY)) != 0:
-                            eff = eff & (EFF_WRITE | EFF_CONSUME | EFF_ESCAPE_VALUE | EFF_ESCAPE_VIEW | EFF_RAW_PTR_VALIDITY)
+                        if (eff & (EFF_WRITE | EFF_CONSUME | EFF_ESCAPE_VALUE | EFF_ESCAPE_VIEW | EFF_RAW_PTR_VALIDITY | EFF_STORE_IN_RECEIVER)) != 0:
+                            eff = eff & (EFF_WRITE | EFF_CONSUME | EFF_ESCAPE_VALUE | EFF_ESCAPE_VIEW | EFF_RAW_PTR_VALIDITY | EFF_STORE_IN_RECEIVER)
                         // #D5/P1: NO by-value-returns-a-view error and NO "consider &T"
                         // warning. Under share-place a plain non-Copy value param is
                         // IndirectPlace (a pointer to the caller's place), so returning
@@ -5762,7 +5781,14 @@ impl Sema:
                 return 1
             let tid = self.scope_lookup(sym)
             if tid >= 0:
-                return self.type_is_ephemeral_value(tid)
+                if self.type_is_ephemeral_value(tid) != 0:
+                    return 1
+                // §12.4 / D63: a callable parameter may be a non-`move`
+                // closure — a view of the caller's frame — and the callee
+                // cannot tell, so it is ephemeral here exactly as a `&T`
+                // parameter is (#1698): its origin is the parameter itself.
+                if self.callable_param_is_view(sym, tid):
+                    return 1
             return 0
         if kind == NodeKind.NK_UNARY:
             let op = self.ast.get_data0(node)
@@ -5772,7 +5798,36 @@ impl Sema:
         if kind == NodeKind.NK_SLICE:
             return 1
         if kind == NodeKind.NK_CALL:
+            // A variant constructor call carrying an ephemeral payload
+            // (`Some(f)`, rule 10) recorded its payload's origins on the
+            // call; it is ephemeral as a value whatever its type says.
+            let call_ty = self.typed_expr_types.get(node) ?? 0
+            if call_ty != 0 and self.type_holds_callable(call_ty, 0) and (self.expr_view_dep_count(node) > 0 or self.expr_view_origin_mask(node) != 0):
+                return 1
             return self.expr_is_ephemeral_task(node)
+        // Rule 10 (§21.1): a tuple or variant is transparent to the views it
+        // carries; `Some(f)` of a callable parameter holds that view.
+        if kind == NodeKind.NK_TUPLE:
+            let tuple_start = self.ast.get_data0(node)
+            let tuple_count = self.ast.get_data1(node)
+            for ti in 0..tuple_count:
+                if self.expr_is_ephemeral_value(self.ast.get_extra(tuple_start + ti)) != 0:
+                    return 1
+            return 0
+        if kind == NodeKind.NK_ENUM_VARIANT:
+            let variant_start = self.ast.get_data2(node)
+            let variant_count = self.ast.get_extra(variant_start)
+            for vi in 0..variant_count:
+                if self.expr_is_ephemeral_value(self.ast.get_extra(variant_start + 1 + vi)) != 0:
+                    return 1
+            return 0
+        if kind == NodeKind.NK_VARIANT_SHORTHAND:
+            let shorthand_start = self.ast.get_data1(node)
+            let shorthand_count = self.ast.get_data2(node)
+            for vi in 0..shorthand_count:
+                if self.expr_is_ephemeral_value(self.ast.get_extra(shorthand_start + vi)) != 0:
+                    return 1
+            return 0
         // #625 (decisions.md D2): a container/struct literal of an ephemeral type is
         // an ephemeral value — needed so Box.new(View{…}) / heap-escape gates fire.
         // A tuple literal is one too: `Box.new((view, 1))` put the view on the
@@ -5804,7 +5859,71 @@ impl Sema:
                 if (self.closure_capture_summary_eff(node, ci) & EFF_CAPTURE_BY_PLACE) != 0:
                     return 1
             return 0
+        // A `move ||` closure owns its environment, but a capture that is
+        // itself a view (a callable parameter, a binding holding a non-move
+        // closure) makes the closure a carrier of that view (#1698).
+        if kind == NodeKind.NK_CLOSURE:
+            for ci in 0..self.closure_capture_summary_count(node):
+                let cap_sym = self.closure_capture_summary_sym(node, ci)
+                if self.scope_lookup_is_ephemeral_value(cap_sym) != 0 or self.callable_param_is_view(cap_sym, self.scope_lookup(cap_sym)):
+                    return 1
+            return 0
         0
+
+    // §12.4 / D63 (#1698): a callable parameter of the function being
+    // checked is a view whose origin is the parameter itself — the argument
+    // may be a non-`move` closure holding the caller's places, and the
+    // callee's summary must carry that possibility to every place the
+    // parameter flows. Inside a closure body the parameter frame is the
+    // capture frame, where a captured callable binding carries its own deps.
+    fn callable_param_is_view(sym: i32, tid: i32) -> bool:
+        if tid <= 0 or self.closure_body_depth != 0 or self.param_index_for_sym(sym) < 0:
+            return false
+        self.get_type_kind(self.resolve_alias(tid as TypeId)) == TypeKind.TY_FN
+
+    // Whether a value of this type can hold a view: an ephemeral type
+    // (Rule 1-3, §22.1), or one that can hold a callable (below).
+    mut fn type_can_carry_view(tid: i32) -> bool:
+        tid > 0 and (self.type_is_ephemeral_value(tid) != 0 or self.type_holds_callable(tid, 0))
+
+    // Whether a value of this type can hold a callable — the one place a
+    // view hides behind a type that is not ephemeral (§12.4, D63): `fn(A) ->
+    // R`, or an aggregate, variant or collection with one inside. A binding
+    // of such a type that holds an ephemeral value records its origins
+    // (#1698); any other type's "ephemeral value" (a Copy read through a
+    // reference) owns what it holds.
+    mut fn type_holds_callable(tid: i32, depth: i32) -> bool:
+        if tid <= 0 or depth > 8:
+            return false
+        let resolved = self.resolve_alias(tid as TypeId)
+        let tk = self.get_type_kind(resolved)
+        if tk == TypeKind.TY_FN:
+            return true
+        if tk == TypeKind.TY_REF or tk == TypeKind.TY_PTR:
+            return false
+        if tk == TypeKind.TY_TUPLE:
+            let te_start = self.get_type_d0(resolved)
+            for ei in 0..self.get_type_d1(resolved):
+                if self.type_holds_callable(self.type_extra[(te_start + ei)], depth + 1):
+                    return true
+            return false
+        if tk == TypeKind.TY_ARRAY:
+            return self.type_holds_callable(self.get_type_d0(resolved), depth + 1)
+        if tk == TypeKind.TY_GENERIC_INST:
+            let arg_start = self.get_type_d1(resolved)
+            for ai in 0..self.get_type_d2(resolved):
+                if self.type_holds_callable(self.type_extra[(arg_start + ai)], depth + 1):
+                    return true
+        for fi in 0..self.type_reflection_field_count(resolved as i32):
+            let field_ty = self.type_reflection_field_type(resolved as i32, fi)
+            if self.type_holds_callable(field_ty, depth + 1):
+                return true
+        for vi in 0..self.type_reflection_variant_count(resolved as i32):
+            for pi in 0..self.type_reflection_variant_payload_count(resolved as i32, vi):
+                let payload_ty = self.type_reflection_variant_payload_type(resolved as i32, vi, pi)
+                if self.type_holds_callable(payload_ty, depth + 1):
+                    return true
+        false
 
     fn scope_body_tail_is_method_call(node: i32, scope_sym: i32, method_sym: i32) -> i32:
         if node == 0 or scope_sym == 0 or method_sym == 0:
@@ -10224,6 +10343,13 @@ impl Sema:
                 // (check_returned_ephemeral_value_origins after check_expr) runs post
                 // scope-teardown, so it cannot see a container binding's origins.
                 self.check_returned_ephemeral_value_origins(tail, tail)
+                // The parameter origins a returned binding carries (a local
+                // container a parameter's view was stored into, #1783) are
+                // published here for the same reason: after teardown the
+                // binding's origins are gone and the body-level call below
+                // finds none, so the caller tied nothing.
+                if node == self.body_tail_block:
+                    self.note_returned_transparent_view_effects(tail)
             if node == self.body_tail_block and tail_is_value != 0 and self.stmt_pos_depth == 0:
                 self.check_returned_closure_env(tail, tail)
         self.expire_dead_borrows_in_block(extra_start, stmt_count, stmt_count, 0)
@@ -10642,7 +10768,10 @@ impl Sema:
         let bind_kind = self.get_type_kind(self.resolve_alias(bind_type))
         if bind_kind == TypeKind.TY_REF or self.view_projection_exprs.contains(value) or self.view_projection_exprs.contains(value_core) or field_view_let != 0:
             self.scope_set_is_view_bound(name)
-        if self.scope_is_view_bound(name) != 0 or self.type_has_drop_impl(bind_type as i32) != 0 or self.type_is_ephemeral_value(bind_type as i32) != 0 or self.closure_expr_has_by_place_captures(value) != 0:
+        // An ephemeral VALUE of a non-ephemeral type — a callable parameter,
+        // a variant carrying one, a struct holding a non-move
+        // closure — carries its origins on the binding too (#1698).
+        if self.scope_is_view_bound(name) != 0 or self.type_has_drop_impl(bind_type as i32) != 0 or self.type_is_ephemeral_value(bind_type as i32) != 0 or self.closure_expr_has_by_place_captures(value) != 0 or (is_ephemeral_value != 0 and self.type_holds_callable(bind_type as i32, 0)):
             self.record_view_binding_from_expr(name, value)
         else:
             self.clear_binding_view_deps(name)
@@ -11014,25 +11143,31 @@ impl Sema:
             let ty = self.scope_lookup(sym)
             if ty > 0:
                 let tk = self.get_type_kind(self.resolve_alias(ty as TypeId))
-                if tk == TypeKind.TY_REF:
+                // A callable parameter is a view of itself (§12.4, #1698).
+                if tk == TypeKind.TY_REF or self.callable_param_is_view(sym, ty):
                     out = self.push_unique_i32(move out, sym)
             return out
         if kind == NodeKind.NK_CLOSURE:
             // §12.4: a non-move closure's non-Copy captures are views of their
             // places; a captured view binding contributes its own origins.
-            if self.ast.is_move_closure(node) == 0:
-                for ci in 0..self.closure_capture_summary_count(node):
-                    let cap_sym = self.closure_capture_summary_sym(node, ci)
-                    let cap_dep_count = self.binding_view_dep_count(cap_sym)
-                    for di in 0..cap_dep_count:
-                        out = self.push_unique_i32(move out, self.binding_view_dep_at(cap_sym, di))
-                    var is_view = (self.closure_capture_summary_eff(node, ci) & EFF_CAPTURE_BY_PLACE) != 0
-                    if not is_view:
-                        let cap_ty = self.scope_lookup(cap_sym)
-                        if cap_ty > 0 and self.get_type_kind(self.resolve_alias(cap_ty as TypeId)) == TypeKind.TY_REF:
-                            is_view = true
-                    if is_view:
-                        out = self.push_unique_i32(move out, cap_sym)
+            // A `move` closure carries the origins of a capture that is a
+            // view itself: a callable parameter, or a binding whose deps
+            // name what it views (#1698).
+            let is_move = self.ast.is_move_closure(node) != 0
+            for ci in 0..self.closure_capture_summary_count(node):
+                let cap_sym = self.closure_capture_summary_sym(node, ci)
+                let cap_dep_count = self.binding_view_dep_count(cap_sym)
+                for di in 0..cap_dep_count:
+                    out = self.push_unique_i32(move out, self.binding_view_dep_at(cap_sym, di))
+                var is_view = not is_move and (self.closure_capture_summary_eff(node, ci) & EFF_CAPTURE_BY_PLACE) != 0
+                let cap_ty = self.scope_lookup(cap_sym)
+                if not is_view and cap_ty > 0:
+                    if not is_move and self.get_type_kind(self.resolve_alias(cap_ty as TypeId)) == TypeKind.TY_REF:
+                        is_view = true
+                    else if self.callable_param_is_view(cap_sym, cap_ty):
+                        is_view = true
+                if is_view:
+                    out = self.push_unique_i32(move out, cap_sym)
             return out
         if kind == NodeKind.NK_GROUPED or kind == NodeKind.NK_CAST or kind == NodeKind.NK_COMPTIME or kind == NodeKind.NK_UNSAFE_BLOCK or kind == NodeKind.NK_NO_SUSPEND:
             out = self.collect_expr_view_deps(self.ast.get_data0(node), move out)
@@ -11166,10 +11301,14 @@ impl Sema:
                 // Copy fields (`fn_sym: i32`, counts, offsets) pin their scalar
                 // arguments merely because the enclosing returned struct also
                 // contained a genuine reference.
+                // An owned parameter that had a view stored into it
+                // (note_view_store_into_root) carries that origin on its
+                // binding; a callable parameter is its own origin (§12.4).
                 let param_ty = self.scope_lookup(sym)
-                if param_ty > 0 and self.type_is_ephemeral_value(param_ty) != 0:
-                    return sema_param_origin_bit(direct_pi)
-                return 0
+                var param_mask = self.binding_view_origin_mask(sym)
+                if param_ty > 0 and (self.type_is_ephemeral_value(param_ty) != 0 or self.callable_param_is_view(sym, param_ty)):
+                    param_mask = param_mask | sema_param_origin_bit(direct_pi)
+                return param_mask
             let binding_mask = self.binding_view_origin_mask(sym)
             if binding_mask != 0:
                 return binding_mask
@@ -11246,6 +11385,14 @@ impl Sema:
         let temp_name = self.type_name(temp_ty)
         self.emit_error(what ++ " a view into a temporary `" ++ temp_name ++ "` that is freed when this statement ends (§21.1); bind the `" ++ temp_name ++ "` first, or take an owned value (`.clone()`)", node)
         1
+
+    // Rule 10: a variant whose type says nothing (`Option[fn() -> i32]`)
+    // still carries a payload that is a view as a value (#1698).
+    mut fn nodes_hold_ephemeral_value(nodes: &Vec[i32]) -> bool:
+        for i in 0..nodes.len() as i32:
+            if nodes[i] > 0 and self.expr_is_ephemeral_value(nodes[i]) != 0:
+                return true
+        false
 
     fn record_transparent_view_origins_from_nodes(result_node: i32, source_nodes: &Vec[i32]):
         if result_node == 0 or self.has_contextual_copy_adjustment(result_node) != 0:
@@ -11429,6 +11576,12 @@ impl Sema:
             if p_ty != 0:
                 let p_tk = self.get_type_kind(self.resolve_alias(p_ty as TypeId))
                 if p_tk == TypeKind.TY_REF or p_tk == TypeKind.TY_PTR:
+                    return 0
+                // §12.4 (#1698): a callable parameter as a view is a view
+                // of what the caller's argument views, never of this frame;
+                // the call site refuses a non-move closure argument to a
+                // parameter that escapes (finalize_closure_arg_checks).
+                if self.callable_param_is_view(sym, p_ty):
                     return 0
                 return 1
             return 0
@@ -11967,6 +12120,11 @@ impl Sema:
         if recv_node != 0 and param_offset == 1 and param_count > 0:
             self.propagate_call_param_effect(self.sig_param_effect(sig_idx, 0), recv_node)
             self.record_effect_edge(sig_idx, 0, recv_node)
+        // #1783 (§21.1): the receiver's storage — `h` in `h.keep(x)`, the
+        // first argument of the static spelling `T.keep(h, x)`.
+        var store_target = if param_offset == 1: recv_node else: 0
+        if store_target == 0 and param_offset == 0 and arg_count > 0 and self.sig_receiver_mode(sig_idx) != ReceiverMode.None:
+            store_target = if has_resolved != 0: self.get_resolved_call_arg(call_node, 0) else: self.ast.get_extra(extra_start)
         for ai in 0..arg_count:
             let param_i = ai + param_offset
             if param_i >= param_count:
@@ -11974,6 +12132,12 @@ impl Sema:
             let arg_node = if has_resolved != 0: self.get_resolved_call_arg(call_node, ai) else: self.ast.get_extra(extra_start + ai)
             if arg_node > 0:
                 self.propagate_call_param_effect(self.sig_param_effect(sig_idx, param_i), arg_node)
+                // The callee stores a view of this argument into its
+                // receiver: the receiver's storage now views what the
+                // argument views (D65: the callee's summary decides).
+                if param_i > 0 and store_target > 0 and (self.sig_param_effect(sig_idx, param_i) & EFF_STORE_IN_RECEIVER) != 0:
+                    let stored_ty = self.typed_expr_types.get(arg_node) ?? 0
+                    self.note_view_store(store_target, arg_node, stored_ty, self.sig_param_type(sig_idx, param_i), call_node, "this call")
                 // #D5/P0: record caller-param → callee-param edge (method path).
                 self.record_effect_edge(sig_idx, param_i, arg_node)
                 // D5/P1 §3.8: method arguments use the same deferred ownership
@@ -12291,12 +12455,17 @@ impl Sema:
             else:
                 self.binding_closure_nodes.remove(target_sym)
             let tgt_kind = self.get_type_kind(self.resolve_alias(target_type as TypeId))
-            if tgt_kind == TypeKind.TY_REF or self.type_has_drop_impl(target_type as i32) != 0 or self.type_is_ephemeral_value(target_type as i32) != 0:
+            if tgt_kind == TypeKind.TY_REF or self.type_has_drop_impl(target_type as i32) != 0 or self.type_is_ephemeral_value(target_type as i32) != 0 or (assigned_ephemeral_value != 0 and self.type_holds_callable(target_type as i32, 0)):
                 self.record_view_binding_from_expr(target_sym, value)
             else:
                 self.clear_binding_view_deps(target_sym)
         else if self.ast.kind(target) == NodeKind.NK_FIELD_ACCESS:
             self.clear_moved_fields_for_place_expr(target)
+        // #1783 (§21.1): a view written into a field or element (`h.r = x`,
+        // `h.v[i] = x`) is stored into what the target's root reaches — the
+        // same store as `h.v.push(x)`.
+        if self.ast.kind(target) != NodeKind.NK_IDENT and value_type != 0:
+            self.note_view_store(target, value, value_type as i32, target_type as i32, node, "this assignment")
 
         // §9.1 / D73: in a value position the assignment yields a read of
         // `place` after the store, a view (assign_reads_view). A non-Copy
@@ -17010,6 +17179,16 @@ impl Sema:
                 else if bodiless != 0:
                     self.emit_error("this closure consumes its capture and may be invoked once, but `" ++ callee_name ++ "` has no body in this compilation (a bundle boundary), so it may invoke its parameter any number of times (§12.4; a `once` parameter annotation is #1604)", closure_node)
 
+    // Whether a binding's recorded origins name a stack local of this frame
+    // (a non-move closure over `xs`, a value holding one).
+    fn binding_views_stack_local(sym: i32) -> bool:
+        if self.scope_lookup_is_ephemeral_value(sym) == 0:
+            return false
+        for di in 0..self.binding_view_dep_count(sym):
+            if self.view_origin_is_stack_local(self.binding_view_dep_at(sym, di)) != 0:
+                return true
+        false
+
     // A non-move closure that captures a non-Copy local holds a view of that
     // local's place (§12.4); the binding that holds the closure carries those
     // origins like any view binding, so the container and return escape
@@ -17198,7 +17377,9 @@ impl Sema:
         // declared return; a non-Unit one makes a tail assignment its value.
         let body_tail_discards = expected_ret_ty == 0 or expected_ret_ty == self.ty_void as i32
         self.body_tail_discards = body_tail_discards
+        self.closure_body_depth = self.closure_body_depth + 1
         let checked_body_ty = if expected_ret_ty != 0: self.check_expr_with_expected(body, expected_ret_ty as TypeId) else: self.check_expr_value_context(body)
+        self.closure_body_depth = self.closure_body_depth - 1
         self.body_tail_block = saved_body_tail_block
         self.body_tail_holder = saved_body_tail_holder
         self.body_tail_discards = saved_body_tail_discards
@@ -17375,6 +17556,14 @@ impl Sema:
                     let cap_ty = self.bind_types[ebi]
                     if self.type_is_ephemeral_value(cap_ty) != 0:
                         self.emit_error("escaping closure cannot capture ephemeral references", node)
+                        break
+                    // §12.4 (#1698): a `move ||` closure may not capture a
+                    // non-move closure of this frame, nor any binding that
+                    // views a local of it — the environment it would own
+                    // holds a pointer into the frame it leaves.
+                    if self.ast.is_move_closure(node) != 0 and self.binding_views_stack_local(cap_sym):
+                        let cap_name: str = with_str_clone_ref(self.pool_resolve(cap_sym))
+                        self.emit_error("escaping `move` closure captures `" ++ cap_name ++ "`, which views a local of this frame (a non-move closure or a value holding one) and cannot leave it (§12.4)", node)
                         break
                 ebi = ebi + 1
             var emitted_capability_escape = 0
@@ -17926,7 +18115,7 @@ impl Sema:
                     let written_deps: Vec[i32] = Vec.new()
                     for wi in 0..self.binding_view_dep_count(name):
                         written_deps.push(self.binding_view_dep_at(name, wi))
-                    self.check_view_store_into_root(guard_root, written_deps, self.binding_view_origin_mask(name), payload_ty, node)
+                    self.note_view_store_into_root(guard_root, written_deps, self.binding_view_origin_mask(name), payload_ty, node, "this call")
             self.pop_scope()
             if body_ty != 0 and self.type_is_ephemeral_value(body_ty as i32) != 0:
                 self.emit_error("guarded with result cannot be ephemeral; clone or copy the value before it leaves the block", body)
@@ -19605,7 +19794,7 @@ impl Sema:
             let resolved_variant_sym = self.qualified_enum_variant_sym(final_variant_ty as i32, fn_sym)
             self.comp_resolved.insert(node, resolved_variant_sym)
             self.typed_expr_types.insert(node, final_variant_ty as i32)
-            if self.type_is_ephemeral_value(final_variant_ty as i32) != 0:
+            if self.type_is_ephemeral_value(final_variant_ty as i32) != 0 or self.nodes_hold_ephemeral_value(&checked_arg_nodes):
                 self.record_transparent_view_origins_from_nodes(node, &checked_arg_nodes)
             return final_variant_ty as i32
 
@@ -23716,40 +23905,90 @@ impl Sema:
         let method_name: str = self.pool_resolve(field)
         (owner == "Mutex" and method_name == "set") or (owner == "RwLock" and method_name == "write")
 
-    // #1778 (§21.1, D22): a view stored through a `&self` receiver lands in
-    // the storage the receiver reaches — the root binding when it owns it,
-    // and every place the root views — and must not outlive its origins
-    // there. Storage a local owns carries the view's origins, so a use of it
-    // after an origin dies is refused as for any view. Storage the caller
-    // owns (the receiver is, or views, a parameter) outlives this call: an
-    // origin that is a local, or a parameter other than the receiver's own,
-    // is refused here, since nothing states that it lives as long.
-    mut fn check_view_store_through_shared_receiver(recv: i32, value: i32, value_ty: i32, call: i32):
-        let root = self.place_root_sym(recv)
-        if root == 0:
+    // §21.1 (D22; #1778, #1783): a view stored into the storage a place
+    // reaches — a container's element (`h.v.push(x)`), a field (`h.r = x`),
+    // a mutex's slot (`h.slot.set(x)`), the argument a method stores into
+    // its receiver (`h.keep(x)`). The storage is what the place's ROOT owns
+    // or views, whatever the path's spelling (D65: the fact is the store,
+    // not the receiver's syntax); `how` names the statement for the
+    // diagnostic ("this call", "this assignment"). `slot_ty` is the type of
+    // the storage slot the value lands in (the element, the field, the
+    // parameter) — 0 when no slot type is known.
+    // Only a value that can hold a view stores one: its type, or the
+    // slot's, is a view or contains one, or can hold a callable (a
+    // non-`move` closure is a view behind `fn(A) -> R`, §12.4), or it is
+    // an ephemeral task. A Copy read through a reference (`seen[i] = *v`,
+    // `xs.push(*r)`) stores an independent value, whatever its expression
+    // was derived from.
+    mut fn note_view_store(target: i32, value: i32, value_ty: i32, slot_ty: i32, node: i32, how: &str):
+        let root = self.place_root_sym(target)
+        if root == 0 or self.scope_has(root) == 0:
+            return
+        let value_carries = value_ty <= 0 or self.type_can_carry_view(value_ty) or self.expr_is_ephemeral_task(value) != 0
+        if not value_carries and not self.type_can_carry_view(slot_ty):
             return
         var value_deps: Vec[i32] = Vec.new()
         value_deps = self.collect_expr_view_deps(value, move value_deps)
-        self.check_view_store_into_root(root, value_deps, self.compute_expr_view_origin_mask(value), value_ty, call)
+        // §3.8 auto-referencing: a plain place reaching a `&T` slot
+        // (`h.keep(n)`, `h.v.push(n)` into `Vec[&i32]`) stores `&n`, so the
+        // place's storage is an origin, as `&n` spelled out would be.
+        if not value_carries and slot_ty > 0 and self.get_type_kind(self.resolve_alias(slot_ty as TypeId)) == TypeKind.TY_REF:
+            let place_root = self.ref_storage_root_sym(value)
+            if place_root != 0:
+                value_deps = self.push_unique_i32(move value_deps, place_root)
+        self.note_view_store_into_root(root, value_deps, self.compute_expr_view_origin_mask(value), value_ty, node, how)
 
     // The store itself: a value with view origins `value_deps` (bindings)
     // and `value_mask` (parameters) put into the storage `root` reaches.
-    mut fn check_view_store_into_root(root: i32, value_deps: Vec[i32], value_mask: i32, value_ty: i32, call: i32):
+    // Three kinds of root:
+    // - the receiver of a `fn`/`mut fn` method is the caller's place (D21),
+    //   which outlives this call: a parameter's view stored there is
+    //   published as EFF_STORE_IN_RECEIVER, and every caller ties its
+    //   receiver to that argument's origins (propagate_method_call_param_
+    //   effects); a local's view cannot live past the call and is refused;
+    // - another reference parameter (interior mutability through `&H`) is
+    //   the caller's storage too, and nothing at the call site ties it:
+    //   only the root's own origins may be stored there;
+    // - storage this body owns (a local, an owned parameter, `move self`)
+    //   carries the origins on its binding, so a use after an origin dies,
+    //   an implicit drop (rule 7) or a return of it is checked as for any
+    //   view. Through a reference-typed local the storage is the pointee,
+    //   whose bindings the reference's own deps name.
+    // Inside a closure body the parameter frame is the capture frame, so a
+    // captured root is storage the body reaches, never a receiver.
+    mut fn note_view_store_into_root(root: i32, value_deps: Vec[i32], value_mask: i32, value_ty: i32, node: i32, how: &str):
         if value_deps.len() == 0 and value_mask == 0:
             return
-        var storage_mask = self.binding_view_origin_mask(root)
-        let storage_locals: Vec[i32] = Vec.new()
-        let root_pi = self.param_index_for_sym(root)
-        if root_pi >= 0:
-            storage_mask = storage_mask | sema_param_origin_bit(root_pi)
-        else:
-            storage_locals.push(root)
-        for di in 0..self.binding_view_dep_count(root):
-            let d = self.binding_view_dep_at(root, di)
-            let dpi = self.param_index_for_sym(d)
-            if dpi >= 0: storage_mask = storage_mask | sema_param_origin_bit(dpi)
-            else if d != 0: storage_locals.push(d)
-        if storage_mask != 0:
+        let root_pi = if self.closure_body_depth == 0: self.param_index_for_sym(root) else: -1
+        let root_ty = self.scope_lookup(root)
+        var root_is_ref = false
+        if root_ty > 0:
+            let root_tk = self.get_type_kind(self.resolve_alias(root_ty as TypeId))
+            root_is_ref = root_tk == TypeKind.TY_REF or root_tk == TypeKind.TY_PTR
+        let recv_mode = self.sig_receiver_mode(self.current_fn_sig_idx)
+        if root_pi == 0 and (recv_mode == ReceiverMode.Read or recv_mode == ReceiverMode.Mut):
+            for vi in 0..value_deps.len() as i32:
+                let d = value_deps[vi]
+                if d == 0 or d == root:
+                    continue
+                if self.param_index_for_sym(d) >= 0:
+                    self.effect_note_origin_node = node
+                    self.note_param_effect(d, EFF_STORE_IN_RECEIVER)
+                    self.effect_note_origin_node = 0
+                else:
+                    self.emit_view_store_escape(root, d, value_ty, node, how, false)
+                    return
+            for pi in 0..self.current_fn_param_syms.len() as i32:
+                if pi != 0 and sema_param_origin_mask_contains(value_mask, pi) != 0:
+                    self.effect_note_origin_node = node
+                    self.note_param_effect(self.current_fn_param_syms[pi], EFF_STORE_IN_RECEIVER)
+                    self.effect_note_origin_node = 0
+            return
+        if root_pi >= 0 and root_is_ref:
+            var storage_mask = self.binding_view_origin_mask(root) | sema_param_origin_bit(root_pi)
+            for di in 0..self.binding_view_dep_count(root):
+                let dpi = self.param_index_for_sym(self.binding_view_dep_at(root, di))
+                if dpi >= 0: storage_mask = storage_mask | sema_param_origin_bit(dpi)
             var escaping = 0
             for vi in 0..value_deps.len() as i32:
                 let d = value_deps[vi]
@@ -23765,24 +24004,39 @@ impl Sema:
                         escaping = self.current_fn_param_syms[pi]
                         break
             if escaping != 0:
-                let rname: str = self.pool_resolve(root)
-                let oname: str = self.pool_resolve(escaping)
-                let why = if self.param_index_for_sym(escaping) >= 0: f"nothing states that `{oname}` lives as long as `{rname}`" else: f"`{oname}` does not live past this call"
-                let hi = self.facade_handle_in(value_ty, 0)
-                var diag = Diagnostic.err(f"this call stores a view of `{oname}` into `{rname}` through its shared receiver, and `{rname}` outlives this call: {why} (§21.1)", Span { file: self.local_file_id, start: self.ast.get_start(call), end: self.ast.get_end(call) })
-                if hi >= 0:
-                    let hname: str = self.pool_resolve(self.facade_resources[hi].name)
-                    diag.add_note(f"'{hname}' is a callback-scope handle, borrowed for the callback's invocation, and cannot outlive it (§16.2b.9)")
-                diag.add_help("store an owned value, or keep the view in storage that lives no longer than its origin")
-                self.diags.emit(move diag)
-                return
-        for si in 0..storage_locals.len() as i32:
+                self.emit_view_store_escape(root, escaping, value_ty, node, how, true)
+            return
+        var storage: Vec[i32] = Vec.new()
+        storage.push(root)
+        if root_is_ref:
+            for di in 0..self.binding_view_dep_count(root):
+                let d = self.binding_view_dep_at(root, di)
+                if d != 0 and d != root and self.param_index_for_sym(d) < 0 and self.scope_has(d) != 0:
+                    storage = self.push_unique_i32(move storage, d)
+        for si in 0..storage.len() as i32:
             // A view of the storage's own binding adds nothing to it.
             let others: Vec[i32] = Vec.new()
             for vi in 0..value_deps.len() as i32:
-                if value_deps[vi] != storage_locals[si]: others.push(value_deps[vi])
+                if value_deps[vi] != storage[si]: others.push(value_deps[vi])
             if others.len() > 0 or value_mask != 0:
-                self.add_binding_view_deps(storage_locals[si], value_mask, others)
+                self.add_binding_view_deps(storage[si], value_mask, others)
+                // Rule 7 (§22.1): storage holding a view is ephemeral as a
+                // value, whatever its type says (`Vec[fn() -> i32]`
+                // holding a non-move closure), so its escapes are checked.
+                self.scope_set_is_ephemeral_value(storage[si], 1)
+
+    mut fn emit_view_store_escape(root: i32, origin: i32, value_ty: i32, node: i32, how: &str, shared: bool):
+        let rname: str = self.pool_resolve(root)
+        let oname: str = self.pool_resolve(origin)
+        let why = if self.param_index_for_sym(origin) >= 0: f"nothing states that `{oname}` lives as long as `{rname}`" else: f"`{oname}` does not live past this call"
+        let hi = self.facade_handle_in(value_ty, 0)
+        let via = if shared: " through its shared receiver" else: ""
+        var diag = Diagnostic.err(f"{how} stores a view of `{oname}` into `{rname}`{via}, and `{rname}` outlives this call: {why} (§21.1)", Span { file: self.local_file_id, start: self.ast.get_start(node), end: self.ast.get_end(node) })
+        if hi >= 0:
+            let hname: str = self.pool_resolve(self.facade_resources[hi].name)
+            diag.add_note(f"'{hname}' is a callback-scope handle, borrowed for the callback's invocation, and cannot outlive it (§16.2b.9)")
+        diag.add_help("store an owned value, or keep the view in storage that lives no longer than its origin")
+        self.diags.emit(move diag)
 
     fn sender_send_element_type(recv_type: i32, field: i32, arg_index: i32) -> i32:
         if recv_type == 0 or arg_index != 0:
@@ -24631,15 +24885,11 @@ impl Sema:
                 // container is caught by the existing ephemeral-escape checks.
                 // Owned-field "linear" ephemerals (e.g. Workspace{token: str})
                 // carry no view origin, so they stay freely containerizable.
-                if mc_arg_ty as i32 != 0 and (self.type_is_ephemeral_value(mc_arg_ty as i32) != 0 or self.expr_is_ephemeral_value(mc_arg_node) != 0):
-                    if self.method_arg_stores_through_shared_receiver(obj_type as i32, field, ai):
-                        self.check_view_store_through_shared_receiver(expr, mc_arg_node, mc_arg_ty as i32, node)
-                    else if self.ast.kind(expr) == NodeKind.NK_IDENT:
-                        let mc_recv_sym = self.ast.get_data0(expr)
-                        var mc_store_deps: Vec[i32] = Vec.new()
-                        mc_store_deps = self.collect_expr_view_deps(mc_arg_node, move mc_store_deps)
-                        let mc_store_mask = self.compute_expr_view_origin_mask(mc_arg_node)
-                        self.add_binding_view_deps(mc_recv_sym, mc_store_mask, mc_store_deps)
+                // #1783: the storage is what the receiver's ROOT reaches,
+                // whatever the path (`h.v.push(x)` stores into `h`; inside
+                // a method, `self.v.push(x)` into the caller's place).
+                if mc_arg_ty as i32 != 0:
+                    self.note_view_store(expr, mc_arg_node, mc_arg_ty as i32, mc_expected as i32, node, "this call")
             let mc_sender_elem_ty = self.sender_send_element_type(obj_type as i32, field, ai)
             if mc_sender_elem_ty != 0:
                 if mc_arg_ty as i32 != 0 and self.types_compatible(mc_sender_elem_ty, mc_arg_ty as i32) == 0 and self.arithmetic_result_type(mc_sender_elem_ty, mc_arg_ty as i32) == 0:
@@ -24940,7 +25190,7 @@ impl Sema:
                             let owner_name = self.type_name(obj_type)
                             let variant_name: str = with_str_clone_ref(self.pool_resolve(field))
                             self.emit_argument_type_mismatch(owner_name ++ "." ++ variant_name, field, ai, ai, expected_ty, arg_ty, if static_payload_arg_node > 0: static_payload_arg_node else: node)
-            if self.type_is_ephemeral_value(mc_static_variant_ty) != 0:
+            if self.type_is_ephemeral_value(mc_static_variant_ty) != 0 or self.nodes_hold_ephemeral_value(&static_payload_nodes):
                 self.record_transparent_view_origins_from_nodes(node, &static_payload_nodes)
             return mc_static_variant_ty
 
