@@ -1015,6 +1015,14 @@ fn run_cli(argc: i32) -> i32:
             with_write(compiler_abi_sha())
             with_write("\n")
             return 0
+        if cli_has_flag(argc, "--self-id"):
+            // The sha256 of this compiler's unstamped image (compiler.AbiStamp);
+            // empty for an unstamped binary. The build cache asks another
+            // compiler binary for it instead of hashing the file.
+            if compiler_self_id_is_stamped():
+                with_write(compiler_self_id())
+            with_write("\n")
+            return 0
         with_write("with ")
         with_write(with_str_from_cstr(c"WITHVERSIONSTAMPv1XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX".ptr))
         with_write("\n")
@@ -1864,6 +1872,35 @@ impl PoolState:
 
     fn live_len(): self.names.len() as i32 - self.oldest
 
+    // Children still running: spawned and not yet reaped by a sweep.
+    fn running_len() -> i32:
+        var n = 0
+        for i in self.oldest..self.names.len() as i32:
+            if self.done[i] == 0: n += 1
+        n
+
+    fn head_done(): self.has_live() and self.done[self.oldest] != 0
+
+    // Admission counts running children, not unretired ones: a lane that
+    // finishes behind a slower, older sibling frees its slot at once instead
+    // of when FIFO retire order reaches it (2026-09-29 battery: behavior-tests
+    // held the head for 555 s while its finished siblings' slots sat idle).
+    // Blocks until fewer than `width` children run. A child waiting here is
+    // not being retired, so its budget runs from spawn: one past it is killed
+    // (with_exec_wait's timeout path) and reads as a timeout at retire.
+    mut fn wait_for_slot(width: i32):
+        self.sweep()
+        while self.running_len() >= width:
+            build_graph_rt_usleep(10000)
+            self.sweep()
+            let now = with_clock_nanos()
+            for i in self.oldest..self.names.len() as i32:
+                if self.done[i] != 0 or now - self.t0s[i] < self.timeouts[i] as i64 * 1000000: continue
+                self.done_rcs[i] = build_graph_rt_exec_wait(self.pids[i], 1)
+                self.done[i] = 1
+                self.done_ats[i] = with_clock_nanos()
+                self.done_rsss[i] = build_graph_rt_child_maxrss()
+
     fn dep_inflight(dep_name: &str) -> bool:
         for pi in self.oldest..self.names.len() as i32:
             if self.names[pi] == dep_name:
@@ -2441,7 +2478,10 @@ unsafe fn run_build_graph(root: &str, cfg: &ProjectConfig, graph: &BuildGraph, a
             if pool_failed_rc != 0:
                 return pool_failed_rc
         if will_pool:
-            if pool.live_len() >= pool_width:
+            pool.wait_for_slot(pool_width)
+            // Retire, in order, every finished lane at the head: its output
+            // replays and a failure stops the run as soon as order allows.
+            while pool.head_done():
                 var retire = pool.retire_oldest()
                 let retire_rc = build_pool_finalize_retire(root, graph, options, &retire)
                 timed_names.push(with_str_clone_ref(retire.name))

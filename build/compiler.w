@@ -24,6 +24,12 @@ const COMPILER_VERSION_SOURCE_SLOT: str = "WITHVERSIONSTAMPv1XXXXXXXXXXXXXXXXXXX
 const COMPILER_ABI_SHA_SENTINEL: str = "WITHABISHASTAMPv1"
 const COMPILER_ABI_SHA_SLOT_WIDTH: i32 = 82
 const COMPILER_ABI_SHA_RECORD: str = "docs/with-abi.sha256"
+// The compiler's own identity (src/compiler/AbiStamp.w compiler_self_id): the
+// sha256 of the unstamped image, patched in the same way, so the build cache
+// never re-hashes the running binary. Taken before the version and ABI
+// stamps, which are provenance (D13).
+const COMPILER_SELF_ID_SENTINEL: str = "WITHSELFIDSTAMPv1"
+const COMPILER_SELF_ID_SLOT_WIDTH: i32 = 82
 
 type StackBudgetReport {
     path: str,
@@ -1099,7 +1105,7 @@ fn comp_spec_cli_commands(spec: &str) -> Vec[str]:
 
 fn comp_spec_cli_flags():
     var flags: Vec[str] = Vec.new()
-    let defaults = "--release --target --emit-c --emit-obj --overflow --no-std --strict-effects --debug-alloc --trace-alloc --dump-drop-state -O0 -O1 -O2 -O3 --open -e -n -p --fail-fast --abi-sha"
+    let defaults = "--release --target --emit-c --emit-obj --overflow --no-std --strict-effects --debug-alloc --trace-alloc --dump-drop-state -O0 -O1 -O2 -O3 --open -e -n -p --fail-fast --abi-sha --self-id"
     comp_add_words(move flags, defaults)
 
 fn comp_impl_commands(fs: &ToolFs) -> Vec[str]:
@@ -2225,6 +2231,24 @@ pub fn comp_patch_version_binary(ctx: &ActionCtx, input_path: &str, output_path:
         abi_patched = abi_patched + 1
     if abi_patched == 0:
         return comp_fail(ctx, "ABI stamp sentinel not found in " ++ input_path)
+    // The compiler's own identity (compiler_self_id): the unstamped image, so
+    // two builds differing only in their stamps are one compiler (D13). Hashed
+    // once here, so no invocation of the compiler re-hashes itself.
+    let self_id = fs.sha256_file(input_path)
+    if self_id.len() != 64:
+        return comp_fail(ctx, "could not hash " ++ input_path ++ " for the self-id stamp")
+    let self_slot: i64 = COMPILER_SELF_ID_SLOT_WIDTH as i64
+    var self_patched = 0
+    loop:
+        let soff = data.find(COMPILER_SELF_ID_SENTINEL) as i64
+        if soff < 0:
+            break
+        if soff + self_slot > data.len():
+            return comp_fail(ctx, "self-id stamp slot truncated at end of binary")
+        data = data.slice(0, soff) ++ self_id ++ nul ++ data.slice(soff + self_id.len() + 1, data.len())
+        self_patched = self_patched + 1
+    if self_patched == 0:
+        return comp_fail(ctx, "self-id stamp sentinel not found in " ++ input_path)
     let output_dir = comp_dirname(output_path)
     if fs.mkdir_all(output_dir) != 0:
         return comp_fail(ctx, "could not create output directory: " ++ output_dir)
