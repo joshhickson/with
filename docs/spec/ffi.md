@@ -155,6 +155,14 @@ target.define("DEBUG=1")
 target.link_system_lib("sqlite3")
 ```
 
+**C vector types.** A `vector_size` or `ext_vector_type` type, and the
+platform typedefs over them (`__m128`, `__m256i`, `float32x4_t`,
+`_tile1024i`, …), import as `Vector[N, T]` (§4.3d) and print as the
+alias — `__m128` as `f32x4`; `__m128i` by its definition's element type
+(`i64x2` from `long long`). `ext_vector_type(3)` imports as
+`Vector[3, T]`. A C mask typedef (`__mmask16`) is an integer in C and
+imports as one.
+
 ### 16.2 Macro Handling
 
 C macros that are simple constants are translated automatically:
@@ -1375,6 +1383,12 @@ The operations that require an unsafe context are:
   uniquely writable, carrying the required permissions, or carrying the
   required provenance
 - Other operations explicitly marked as unsafe in their definition
+
+An unsafe callable's type is spelled `unsafe fn(A) -> R`, or
+`unsafe extern "C" fn(A) -> R` for a C contract; a value of that type is
+called only in an unsafe context, and it never coerces to the safe `fn` /
+`extern "C" fn` type of the same signature. The variadic type (§16.2b.5)
+is the one spelling where `unsafe` is implied.
 
 For the common raw-memory access case, `unsafe` may be used as a
 narrow prefix over one contiguous raw access chain:
