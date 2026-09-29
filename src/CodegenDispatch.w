@@ -1210,6 +1210,16 @@ impl Codegen:
                     self.mir_project_field_sema_type(cur_sema_ty, pd)
                 if field_sema_ty > 0:
                     cur_sema_ty = field_sema_ty
+                // §4.5 (#1846): a distinct type is represented as its
+                // underlying type (mir_sema_type_to_llvm), so its one field,
+                // `.value`, is the value itself: the same address, the
+                // underlying type. Indexed as a struct, the underlying str's
+                // data pointer was read as the whole str.
+                let distinct_inner = if active_variant_idx < 0: self.mir_distinct_underlying_sema_type(variant_owner_sema_ty) else: 0
+                if distinct_inner > 0:
+                    cur_sema_ty = distinct_inner
+                    cur_ty = self.mir_sema_type_to_llvm(distinct_inner)
+                    continue
                 if active_variant_idx >= 0 and pd == 0 and self.mir_enum_variant_payload_count(variant_owner_sema_ty, active_variant_idx) == 1:
                     let payload_ty = self.mir_sema_type_to_llvm(field_sema_ty)
                     if payload_ty != 0:
@@ -1408,6 +1418,16 @@ impl Codegen:
                     self.mir_project_field_sema_type(cur_sema_ty, pd)
                 if field_sema_ty > 0:
                     cur_sema_ty = field_sema_ty
+                // §4.5 (#1846): a distinct type is represented as its
+                // underlying type (mir_sema_type_to_llvm), so its one field,
+                // `.value`, is the value itself: the same address, the
+                // underlying type. Indexed as a struct, the underlying str's
+                // data pointer was read as the whole str.
+                let distinct_inner = if active_variant_idx < 0: self.mir_distinct_underlying_sema_type(variant_owner_sema_ty) else: 0
+                if distinct_inner > 0:
+                    cur_sema_ty = distinct_inner
+                    cur_ty = self.mir_sema_type_to_llvm(distinct_inner)
+                    continue
                 if active_variant_idx >= 0 and pd == 0 and self.mir_enum_variant_payload_count(variant_owner_sema_ty, active_variant_idx) == 1:
                     let payload_ty = self.mir_sema_type_to_llvm(field_sema_ty)
                     if payload_ty != 0:
@@ -1969,6 +1989,20 @@ impl Codegen:
             return self.coerce_int_ext(val, target_ty, src_unsigned or self.mir_sema_type_is_unsigned(target_sema_ty))
         self.coerce_value_to_type(val, target_ty)
 
+    // A `Box[C]` operand as a `Box[dyn T]`: the box's pointer is the data
+    // word, C's vtable for `trait_sym` the other. 0 when the operand is not a
+    // box of a concrete type.
+    mut fn mir_box_to_dyn_value(body: &MirBody, operand_id: i32, val: i64, trait_sym: i32) -> i64:
+        let source_resolved = self.mir_resolve_alias_at(self.mir_operand_sema_type(body, operand_id))
+        if self.mir_type_kind_at(source_resolved) != TypeKind.TY_GENERIC_INST or self.mir_type_d2_at(source_resolved) != 1:
+            return 0
+        if self.sema.type_symbol_is_std_box(self.mir_type_d0_at(source_resolved)) == 0:
+            return 0
+        let payload_info = self.mir_dyn_arg_info_from_sema_type(self.mir_type_extra_at(self.mir_type_d1_at(source_resolved)), 1)
+        if payload_info.type_sym == 0 or wl_get_type_kind(wl_type_of(val)) != wl_pointer_type_kind():
+            return 0
+        self.build_dyn_trait_value_from_ptr(val, payload_info.type_sym, trait_sym)
+
     mut fn mir_coerce_operand_to_dyn_trait_target(body: &MirBody, operand_id: i32, val: i64, target_ty: i64, target_sema_ty: i32) -> i64:
         if val == 0 or target_ty == 0:
             return val
@@ -1979,16 +2013,10 @@ impl Codegen:
         let trait_sym = self.mir_dyn_trait_symbol_from_sema_type(target_sema_ty)
         if trait_sym == 0:
             return val
+        let boxed = self.mir_box_to_dyn_value(body, operand_id, val, trait_sym)
+        if boxed != 0:
+            return boxed
         let source_sema_ty = self.mir_operand_sema_type(body, operand_id)
-        let source_resolved = self.mir_resolve_alias_at(source_sema_ty)
-        if self.mir_type_kind_at(source_resolved) == TypeKind.TY_GENERIC_INST:
-            let source_base = self.mir_type_d0_at(source_resolved)
-            if self.sema.type_symbol_is_std_box(source_base) != 0 and self.mir_type_d2_at(source_resolved) == 1:
-                let source_arg_start = self.mir_type_d1_at(source_resolved)
-                let payload_sema_ty = self.mir_type_extra_at(source_arg_start)
-                let payload_info = self.mir_dyn_arg_info_from_sema_type(payload_sema_ty, 1)
-                if payload_info.type_sym != 0 and wl_get_type_kind(wl_type_of(val)) == wl_pointer_type_kind():
-                    return self.build_dyn_trait_value_from_ptr(val, payload_info.type_sym, trait_sym)
         var info = self.mir_dyn_arg_info_from_operand(body, operand_id, val)
         if info.type_sym == 0:
             info = self.mir_dyn_arg_info_from_sema_type(source_sema_ty, 0)
@@ -3805,8 +3833,18 @@ impl Codegen:
                         if llvm_fi >= struct_field_count:
                             continue
                         let field_ty = wl_struct_get_type_at(struct_ty, llvm_fi)
-                        let val = self.mir_eval_operand(body, op_id, field_ty)
-                        let coerced_val = self.coerce_value_to_type(val, field_ty)
+                        // #1847: a `Box[dyn T]` / `&dyn T` field (Sema's field
+                        // type names a dyn trait) built from a concrete value
+                        // takes the fat pointer (data, vtable), as a `let` of
+                        // that type does (RK_USE). The operand is read as
+                        // itself first: coerced to the pair by LLVM shape
+                        // alone, the bare pointer was taken for a function
+                        // value and aborted codegen (#1818's class).
+                        let field_sema = self.mir_struct_field_sema_type(dest_sema_ty, fi)
+                        let field_is_dyn = self.mir_dyn_trait_symbol_from_sema_type(field_sema) != 0
+                        let val = self.mir_eval_operand(body, op_id, if field_is_dyn: 0 else: field_ty)
+                        let dyn_field_val = if field_is_dyn: self.mir_coerce_operand_to_dyn_trait_target(body, op_id, val, field_ty, field_sema) else: val
+                        let coerced_val = self.coerce_value_to_type(dyn_field_val, field_ty)
                         let gep = wl_build_struct_gep(self.builder, struct_ty, alloca, llvm_fi)
                         wl_build_store(self.builder, coerced_val, gep)
                 self.mir_store_liveness_byte(struct_ty, alloca)
@@ -5013,6 +5051,8 @@ impl Codegen:
             return
         // #606 (A5 narrow): a std Vec[T] with a Drop element drops each element then
         // frees the buffer. POD-element Vecs return false here and fall through.
+        if tk == TypeKind.TY_GENERIC_INST and self.mir_emit_boxed_dyn_drop_ptr(ptr, ty, sema_ty):
+            return
         if tk == TypeKind.TY_GENERIC_INST and self.mir_emit_drop_vec_ptr(ptr, drop_sema_ty):
             return
         if tk == TypeKind.TY_GENERIC_INST and self.mir_emit_drop_hash_collection_ptr(ptr, ty, drop_sema_ty):
@@ -5415,6 +5455,59 @@ impl Codegen:
             wl_position_at_end(self.builder, rc_skip_bb)
         true
 
+    // #1847: a `Box[dyn Trait]` owns the concrete value its fat pointer's
+    // data word addresses; the type is known only to the vtable, whose last
+    // slot drops it in place (dyn_drop_slot; null for a type with no drop).
+    // `fat` is the box's {data, vtable} value; the caller frees the cell.
+    mut fn mir_emit_dyn_payload_drop(fat: i64, payload_sema_ty: i32):
+        let trait_sym = self.mir_dyn_trait_symbol_from_sema_type(payload_sema_ty)
+        let trait_idx_opt = self.trait_map.get(trait_sym)
+        if trait_sym == 0 or not trait_idx_opt.is_some():
+            with_eprint("error: a boxed dyn value's trait has no vtable metadata; its drop cannot run")
+            self.had_error = 1
+            return
+        let trait_idx: i32 = trait_idx_opt.unwrap()
+        let ptr_ty = wl_ptr_type(self.context)
+        let data_ptr = wl_build_extract_value(self.builder, fat, 0)
+        let vtable_ptr = wl_build_extract_value(self.builder, fat, 1)
+        let slot_ptr = wl_build_struct_gep(self.builder, self.trait_vtable_types[trait_idx], vtable_ptr, self.trait_method_counts[trait_idx])
+        let drop_fn = wl_build_load(self.builder, ptr_ty, slot_ptr)
+        let has_drop = wl_build_icmp(self.builder, wl_int_ne(), drop_fn, wl_const_null(ptr_ty))
+        let call_bb = wl_append_bb(self.context, self.current_function, "drop.dyn.call")
+        let done_bb = wl_append_bb(self.context, self.current_function, "drop.dyn.done")
+        wl_build_cond_br(self.builder, has_drop, call_bb, done_bb)
+        wl_position_at_end(self.builder, call_bb)
+        let params: Vec[i64] = Vec.new()
+        params.push(ptr_ty)
+        let fn_ty = wl_function_type(wl_void_type(self.context), vec_data_i64(&params), 1, 0)
+        let args: Vec[i64] = Vec.new()
+        args.push(data_ptr)
+        let _ = wl_build_call(self.builder, fn_ty, drop_fn, vec_data_i64(&args), 1)
+        wl_build_br(self.builder, done_bb)
+        wl_position_at_end(self.builder, done_bb)
+
+    // #1847: a `Box[dyn Trait]` stored in a field, an element or a payload:
+    // its value's drop (mir_emit_dyn_payload_drop), then the cell's free —
+    // Box's own Drop impl would drop a `dyn` value, which names no type.
+    mut fn mir_emit_boxed_dyn_drop_ptr(ptr: i64, ty: i64, sema_ty: i32) -> bool:
+        if not self.mir_sema_type_is_box(sema_ty) or self.llvm_type_is_dyn_fat_ptr(ty) == 0:
+            return false
+        let resolved = self.mir_resolve_alias_at(sema_ty)
+        let payload_sema_ty = self.mir_type_extra_at(self.mir_type_d1_at(resolved))
+        let fat = wl_build_load(self.builder, ty, ptr)
+        let heap_ptr = wl_build_extract_value(self.builder, fat, 0)
+        // A moved-out member is the reset sentinel (#697, §2.5.1).
+        let live = wl_build_icmp(self.builder, wl_int_ne(), heap_ptr, wl_const_null(wl_type_of(heap_ptr)))
+        let live_bb = wl_append_bb(self.context, self.current_function, "drop.box.dyn.live")
+        let done_bb = wl_append_bb(self.context, self.current_function, "drop.box.dyn.done")
+        wl_build_cond_br(self.builder, live, live_bb, done_bb)
+        wl_position_at_end(self.builder, live_bb)
+        self.mir_emit_dyn_payload_drop(fat, payload_sema_ty)
+        self.mir_emit_with_free_ptr(heap_ptr)
+        wl_build_br(self.builder, done_bb)
+        wl_position_at_end(self.builder, done_bb)
+        true
+
     mut fn mir_emit_box_drop_place(body: &MirBody, place_id: i32, sema_ty: i32) -> bool:
         if not self.mir_sema_type_is_box(sema_ty):
             return false
@@ -5458,6 +5551,8 @@ impl Codegen:
                 self.mir_emit_drop_ptr_for_sema_type(heap_ptr, payload_ty, payload_sema_ty)
             else:
                 self.mir_emit_drop_ptr(heap_ptr, payload_ty)
+        else:
+            self.mir_emit_dyn_payload_drop(value, payload_sema_ty)
         self.mir_emit_with_free_ptr(heap_ptr)
         if needs_null_guard:
             wl_build_br(self.builder, box_done_bb)
@@ -6857,6 +6952,19 @@ impl Codegen:
                     return 0
                 pos = pos + 2 + payload_count
         0
+
+    // §4.5: the underlying Sema type of a distinct type (through a reference
+    // to one), else 0: the type mir_sema_type_to_llvm represents it as.
+    fn mir_distinct_underlying_sema_type(sema_ty: i32) -> i32:
+        if sema_ty <= 0:
+            return 0
+        let resolved = self.mir_resolve_alias_at(sema_ty)
+        let tk = self.mir_type_kind_at(resolved)
+        if tk == TypeKind.TY_PTR or tk == TypeKind.TY_REF:
+            return self.mir_distinct_underlying_sema_type(self.mir_type_d0_at(resolved))
+        if tk != TypeKind.TY_STRUCT or not self.sema.distinct_type_names.contains(self.mir_type_d0_at(resolved)):
+            return 0
+        self.mir_type_extra_at(self.mir_type_d1_at(resolved) + 1)
 
     mut fn mir_project_field_sema_type(agg_ty: i32, field_token: i32) -> i32:
         if agg_ty <= 0:
@@ -8515,7 +8623,13 @@ impl Codegen:
             let push_recv_op = body.call_arg_operands[push_arg_start]
             let push_elem_ty = self.mir_vec_elem_type(body, push_recv_op)
             if push_elem_ty != 0 and wl_type_of(elem_raw) != push_elem_ty:
-                elem = self.coerce_value_to_type(elem_raw, push_elem_ty)
+                // #1847: a concrete value pushed onto a Vec[Box[dyn T]] takes
+                // the fat pointer (data, vtable), as a `let` of that type does.
+                let push_vec_ty = self.mir_unwrap_ref_like_sema_type(self.mir_operand_sema_type(body, push_recv_op))
+                let push_elem_sema = if push_vec_ty > 0 and self.mir_type_kind_at(push_vec_ty) == TypeKind.TY_GENERIC_INST and self.mir_type_d2_at(push_vec_ty) > 0: self.mir_type_extra_at(self.mir_type_d1_at(push_vec_ty)) else: 0
+                let push_elem_op = body.call_arg_operands[(push_arg_start + 1)]
+                let dyn_elem = self.mir_coerce_operand_to_dyn_trait_target(body, push_elem_op, elem_raw, push_elem_ty, push_elem_sema)
+                elem = self.coerce_value_to_type(dyn_elem, push_elem_ty)
             self.mir_emit_vec_push(recv_ptr, elem, wl_type_of(elem))
 
         else if intrinsic == MirIntrinsic.VEC_GET:
@@ -11586,23 +11700,11 @@ impl Codegen:
         if intrinsic == MirIntrinsic.DYN_DOWNCAST:
             // Extract concrete value from dyn trait object.
             // Args: (fat_ptr, type_sym_as_int)
+            // The binding is a view `&Type` of the object (#1860): its value
+            // is the fat pointer's data word. Loading the object made a byte
+            // copy, a second owner of what it holds (§2.3).
             let dd_recv = self.mir_intrinsic_arg(body, args_id, 0)
-            let dd_type_sym_val = self.mir_intrinsic_arg(body, args_id, 1)
-            let dd_type_sym = wl_const_int_sext_val(dd_type_sym_val) as i32
-            // Translate AST pool sym to codegen intern pool sym
-            var dd_cg_type_sym = dd_type_sym
-            let dd_text = self.sema_symbol_text(dd_type_sym)
-            if dd_text.len() > 0:
-                dd_cg_type_sym = self.intern.intern(dd_text)
-            // Extract data_ptr from fat pointer (field 0)
-            let dd_data_ptr = wl_build_extract_value(self.builder, dd_recv, 0)
-            // Load concrete struct from data_ptr
-            let dd_st = self.struct_type_map.get(dd_cg_type_sym)
-            if dd_st.is_some():
-                let dd_concrete_ty = self.struct_llvm_types[dd_st.unwrap()]
-                result = wl_build_load(self.builder, dd_concrete_ty, dd_data_ptr)
-            else:
-                result = wl_build_load(self.builder, wl_i32_type(self.context), dd_data_ptr)
+            result = wl_build_extract_value(self.builder, dd_recv, 0)
 
         else if intrinsic == MirIntrinsic.DYN_VTABLE_CMP:
             // Compare vtable pointer of dyn trait object against expected vtable.
@@ -14405,6 +14507,16 @@ impl Codegen:
         let arg_val = self.mir_eval_operand(body, operand_id, 0)
         if self.llvm_type_is_dyn_fat_ptr(wl_type_of(arg_val)) != 0:
             return arg_val
+        self.mir_dyn_arg_fat_from_value(body, args_id, operand_id, ai, dyn_trait_sym, arg_val)
+
+    // The fat pointer a dyn-trait parameter receives, built from the
+    // evaluated argument `arg_val` (not already fat). A `Box[C]` for a
+    // `Box[dyn T]` parameter is the box with C's vtable (#1854; it was
+    // "cannot lower argument").
+    mut fn mir_dyn_arg_fat_from_value(body: &MirBody, args_id: i32, operand_id: i32, ai: i32, dyn_trait_sym: i32, arg_val: i64) -> i64:
+        let boxed = self.mir_box_to_dyn_value(body, operand_id, arg_val, dyn_trait_sym)
+        if boxed != 0:
+            return boxed
         var dyn_info = self.mir_dyn_arg_info_from_operand(body, operand_id, arg_val)
         if dyn_info.type_sym == 0:
             let dyn_call_node = body.call_ast_node(args_id)
@@ -15897,24 +16009,7 @@ impl Codegen:
                     self.record_codegen_call_argument(body, args_id, operand_id, ai, AnalysisMarshalStrategy.DirectValue, arg_val, arg_val)
                     args.push(arg_val)
                     continue
-                var dyn_info = self.mir_dyn_arg_info_from_operand(body, operand_id, arg_val)
-                if dyn_info.type_sym == 0:
-                    let dyn_call_node = body.call_ast_node(args_id)
-                    if dyn_call_node > 0 and self.pool.kind(dyn_call_node) == NodeKind.NK_CALL:
-                        let dyn_ast_arg_start = self.pool.get_data1(dyn_call_node)
-                        let dyn_ast_arg_count = self.pool.get_data2(dyn_call_node)
-                        if ai < dyn_ast_arg_count:
-                            let dyn_arg_node = self.pool.get_extra(dyn_ast_arg_start + ai)
-                            dyn_info = self.mir_dyn_arg_info_from_ast_node(dyn_arg_node, arg_val)
-                if dyn_info.type_sym != 0:
-                    if dyn_info.use_ptr != 0:
-                        arg_val = self.build_dyn_trait_value_from_ptr(arg_val, dyn_info.type_sym, dyn_trait_sym)
-                    else:
-                        arg_val = self.build_dyn_trait_value(arg_val, dyn_info.type_sym, dyn_trait_sym)
-                else:
-                    with_eprint(f"error: cannot lower argument {ai + 1} to dyn trait '{self.intern.resolve(dyn_trait_sym)}'")
-                    self.had_error = 1
-                    arg_val = wl_get_undef(self.get_dyn_fat_ptr_type())
+                arg_val = self.mir_dyn_arg_fat_from_value(body, args_id, operand_id, ai, dyn_trait_sym, arg_val)
                 self.record_codegen_call_argument(body, args_id, operand_id, ai, AnalysisMarshalStrategy.DirectValue, arg_val, arg_val)
             else:
                 let arg_info = self.mir_eval_call_operand_info(body, operand_id, expected_ty, expected_sema_ty, lends_c_strings, call_context, ai)

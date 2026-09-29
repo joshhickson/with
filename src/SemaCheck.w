@@ -352,6 +352,13 @@ impl Sema:
             return if self.get_type_d0(pointee_resolved) == self.get_type_d0(actual_resolved): 1 else: 0
         if pointee_kind == TypeKind.TY_ENUM and actual_kind == TypeKind.TY_ENUM:
             return if self.get_type_d0(pointee_resolved) == self.get_type_d0(actual_resolved): 1 else: 0
+        // §3.9: a value whose type implements the trait auto-references
+        // into a `&dyn T` parameter as it would into a `&T` one. Without
+        // this the argument went by value: codegen built the fat pointer
+        // from the moved value's address and nothing ever dropped it.
+        if pointee_kind == TypeKind.TY_TRAIT_OBJ and actual_kind != TypeKind.TY_REF and actual_kind != TypeKind.TY_PTR and actual_kind != TypeKind.TY_TRAIT_OBJ:
+            let impl_sym = self.type_symbol_for_bounds(actual_resolved as i32)
+            return if impl_sym != 0 and self.select_trait_impl(impl_sym, self.get_type_d0(pointee_resolved)) != 0: 1 else: 0
         if pointee_kind == TypeKind.TY_GENERIC_INST and actual_kind == TypeKind.TY_GENERIC_INST:
             return self.types_compatible(pointee, actual)
         0
@@ -377,6 +384,13 @@ impl Sema:
             return if self.get_type_d0(pointee_resolved) == self.get_type_d0(actual_resolved): 1 else: 0
         if pointee_kind == TypeKind.TY_ENUM and actual_kind == TypeKind.TY_ENUM:
             return if self.get_type_d0(pointee_resolved) == self.get_type_d0(actual_resolved): 1 else: 0
+        // §3.9: a value whose type implements the trait auto-references
+        // into a `&dyn T` parameter as it would into a `&T` one. Without
+        // this the argument went by value: codegen built the fat pointer
+        // from the moved value's address and nothing ever dropped it.
+        if pointee_kind == TypeKind.TY_TRAIT_OBJ and actual_kind != TypeKind.TY_REF and actual_kind != TypeKind.TY_PTR and actual_kind != TypeKind.TY_TRAIT_OBJ:
+            let impl_sym = self.type_symbol_for_bounds(actual_resolved as i32)
+            return if impl_sym != 0 and self.select_trait_impl(impl_sym, self.get_type_d0(pointee_resolved)) != 0: 1 else: 0
         if pointee_kind == TypeKind.TY_GENERIC_INST and actual_kind == TypeKind.TY_GENERIC_INST:
             return self.types_compatible_frozen(pointee, actual)
         0
@@ -1886,6 +1900,7 @@ impl Sema:
             ci = ci + 4
         self.local_file_id = saved_file_id
         self.validate_global_data_race_accesses()
+        self.check_calls_against_live_global_views()
 
     // #1473 (§21.1 Rule 6): a function whose declared return is a view — a
     // reference, or a value carrying one (`Option[&T]`, an ephemeral value) —
@@ -2001,6 +2016,10 @@ impl Sema:
                     if self.ast.fn_decl_body_is_interface(decl):
                         self.update_module_context(di)
                         self.apply_interface_declared_effects(decl, fn_name)
+                        self.resolve_declared_global_writes(decl, true)
+                        let interface_sig = self.get_sig(fn_name)
+                        if interface_sig >= 0:
+                            self.apply_interface_global_effects(decl, interface_sig)
                         continue
                     // Skip generic functions
                     let meta = self.ast.find_fn_meta(decl)
@@ -2030,6 +2049,7 @@ impl Sema:
                                 break
                         if not is_generic_struct_method:
                             self.update_module_context(di)
+                            self.resolve_declared_global_writes(decl, false)
                             self.check_fn_body_at(decl, di)
 
     mut fn record_global_concurrency_evidence(node: i32, reason: &str):
@@ -2057,11 +2077,22 @@ impl Sema:
     mut fn record_global_data_race_access(sym: i32, node: i32, kind: i32):
         if sym == 0 or node == 0:
             return
-        if sema_path_is_std_implementation(self.current_module_path) != 0 or sema_path_is_runtime_implementation(self.current_module_path) != 0:
-            return
         if self.global_value_decl_kind(sym) == 0:
             return
+        // A local that took the name of a global its module cannot see
+        // (shadow_unseen_global) is that local: an access to it is no access
+        // to the global. It was counted as one, so a concurrent program's
+        // own local failed the race proof at its own lines (E0921).
+        let bound = self.scope_name_map.get(sym)
+        if bound.is_some() and not self.binding_index_is_global(bound.unwrap(), sym):
+            return
         if self.global_symbol_is_synchronized(sym) != 0:
+            return
+        // #1819: the write is a write of the body it is in — in std and the
+        // runtime too, whose bodies hold views of their own globals.
+        if kind == GLOBAL_RACE_ACCESS_WRITE:
+            self.record_body_global_write(sym, node)
+        if sema_path_is_std_implementation(self.current_module_path) != 0 or sema_path_is_runtime_implementation(self.current_module_path) != 0:
             return
         self.global_race_access_syms.push(sym)
         self.global_race_access_nodes.push(node)
@@ -2082,6 +2113,978 @@ impl Sema:
         if root == 0:
             return
         self.record_global_data_race_access(root, report_node, GLOBAL_RACE_ACCESS_WRITE)
+
+    // #1819 (§9.1c, §21.1 rule 1): the body a write or a call is in — the
+    // closure being checked (-2 - its node) or a trait's default method
+    // checked for an impl (the impl's signature, current_effect_body), else
+    // the function (its signature index); -1 outside all (a global's
+    // initializer).
+    fn global_effect_body() -> i32:
+        if self.current_effect_body != -1: self.current_effect_body else: self.current_fn_sig_idx
+
+    mut fn record_body_global_write(sym: i32, node: i32):
+        let body = self.global_effect_body()
+        if body == -1:
+            return
+        self.push_global_write_record(body, sym, node, self.local_file_id, GLOBAL_WRITE_PLACE)
+
+    mut fn push_global_write_record(body: i32, sym: i32, node: i32, file: i32, kind: i32):
+        self.global_write_records.push(body)
+        self.global_write_records.push(sym)
+        self.global_write_records.push(node)
+        self.global_write_records.push(file)
+        self.global_write_records.push(kind)
+
+    // §21.1 rule 1 (D39, Eric 2026-09-29): a bundle function's body is not
+    // in this compilation, and its global writes are its declared contract:
+    // the set its write clause declares, which the bundle build checked
+    // against the body (compiler.BundleInterfaceEmit
+    // check_declared_global_writes). A call of it writes exactly that set —
+    // no clause, none. A callable it is handed counts as run by the call, as
+    // for any callee (note_call_global_effects).
+    mut fn apply_interface_global_effects(node: i32, sig: i32):
+        let declared = self.declared_global_write_syms(node)
+        for wi in 0..declared.len() as i32:
+            self.push_global_write_record(sig, declared[wi], node, self.local_file_id, GLOBAL_WRITE_BUNDLE)
+
+    // §21.1 rule 1 (Eric 2026-09-29): the globals a `writes` clause names,
+    // resolved in the declaring module (update_module_context) and kept by
+    // declaration node for the bundle emitter and
+    // apply_interface_global_effects. An entry is a whole global: a module
+    // `var`/`let` or a bundle interface global, by name or through a
+    // namespace (`other.TOTAL`). A const is a value, not a place (§9.1c); a
+    // field path (`CONFIG.limit`) is refused — a clause names whole globals.
+    // `interface_decl`: a `.wi` is read on demand, so a name whose line this
+    // program never read is no place here and no view of it can be live —
+    // it is skipped (the bundle's own build reads the whole `.wi`).
+    mut fn resolve_declared_global_writes(node: i32, interface_decl: bool):
+        let count = self.ast.fn_global_write_count(node)
+        if count == 0 or self.declared_write_starts.contains(node):
+            return
+        self.declared_write_starts.insert(node, self.declared_write_syms_flat.len() as i32)
+        self.declared_write_syms_flat.push(0)
+        let start = self.declared_write_syms_flat.len() as i32 - 1
+        for wi in 0..count:
+            let qualifier = self.ast.fn_global_write_path(node, wi)
+            let name = self.ast.fn_global_write_name(node, wi)
+            let name_text: str = with_str_clone_ref(self.pool_resolve(name))
+            var sym = 0
+            if qualifier == 0:
+                sym = name
+            else:
+                let qtext: str = with_str_clone_ref(self.pool_resolve(qualifier))
+                let dot = qtext.find(".")
+                let root_text = if dot > 0: qtext.slice(0, dot) else: qtext.clone()
+                let root = self.pool_lookup_symbol(root_text)
+                if root != 0 and self.is_clause_global(root):
+                    self.emit_error_with_help(f"`writes {qtext}.{name_text}` names part of the global `{root_text}`: a `writes` clause names whole globals", node, f"write `writes {root_text}`")
+                    continue
+                let ni = self.clause_namespace(qtext)
+                if ni < 0:
+                    if not interface_decl:
+                        self.emit_error(f"`writes {qtext}.{name_text}`: `{qtext}` is no namespace this module imports", node)
+                    continue
+                sym = self.namespace_member(ni, name, node)
+                if sym <= 0:
+                    if sym == 0 and not interface_decl:
+                        self.emit_error(f"`writes {qtext}.{name_text}`: `{qtext}` declares no `{name_text}`", node)
+                    continue
+            if self.const_global_syms.contains(sym):
+                self.emit_error(f"`writes {name_text}`: `{name_text}` is a const, a value and not a place (§9.1c); only a global `var` or `let` is written", node)
+                continue
+            if not self.is_clause_global(sym):
+                if not interface_decl:
+                    self.emit_error(f"`writes {name_text}`: `{name_text}` is no global", node)
+                continue
+            var seen = false
+            for si in start + 1..self.declared_write_syms_flat.len() as i32:
+                if self.declared_write_syms_flat[si] == sym:
+                    seen = true
+            if not seen:
+                self.declared_write_syms_flat.push(sym)
+        self.declared_write_syms_flat[start] = self.declared_write_syms_flat.len() as i32 - start - 1
+
+    // A global a `writes` clause may name: a module `var`/`let` (not a
+    // const) or a bundle interface global this program read.
+    fn is_clause_global(sym: i32) -> bool:
+        sym != 0 and not self.const_global_syms.contains(sym) and (self.global_value_decl_kind(sym) != 0 or self.interface_global_index.contains(sym))
+
+    // The import a clause's qualifier names in the current module (its
+    // `as` name or full path), as namespace_resolve finds one; -1 for none.
+    fn clause_namespace(text: &str) -> i32:
+        let cur_opt = self.module_index_by_path.get(with_str_clone_ref(self.current_module_path))
+        if not cur_opt.is_some():
+            return -1
+        let cur: i32 = cur_opt.unwrap()
+        for ni in 0..self.ns_names.len() as i32:
+            if self.ns_modules[ni] == cur and (self.ns_names[ni] == text or self.ns_fulls[ni] == text):
+                return ni
+        -1
+
+    // The globals declaration `node`'s `writes` clause names, resolved
+    // (resolve_declared_global_writes); empty for no clause.
+    fn declared_global_write_syms(node: i32) -> Vec[i32]:
+        var out: Vec[i32] = Vec.new()
+        let start_opt = self.declared_write_starts.get(node)
+        if start_opt.is_none():
+            return out
+        let start: i32 = start_opt.unwrap()
+        for si in start + 1..start + 1 + self.declared_write_syms_flat[start]:
+            out.push(self.declared_write_syms_flat[si])
+        out
+
+    // The calls each body makes, chained by caller (global_calls), for
+    // fn_global_effects.
+    fn global_call_index() -> SemaGlobalCallIndex:
+        var head: HashMap[i32, i32] = sema_new_map_i32_i32()
+        let next: Vec[i32] = Vec.new()
+        for ci in 0..self.global_calls.len() as i32 / GLOBAL_CALL_STRIDE:
+            let caller: i32 = self.global_calls[ci * GLOBAL_CALL_STRIDE]
+            next.push(head.get(caller) ?? -1)
+            head.insert(caller, ci)
+        SemaGlobalCallIndex { head, next }
+
+    // §21.1 rule 1 (D39): the globals a call of `sig` writes, as their
+    // symbols — from its body and every body its calls run, transitively: a
+    // callee, a callable it hands along, a drop's Drop impls
+    // (expand_global_dispatchers, run first). A bundle function reached here
+    // contributes its declared set (apply_interface_global_effects). The
+    // bundle build checks an exported function's declared write contract
+    // against this set (compiler.BundleInterfaceEmit
+    // check_declared_global_writes); it is never written into an interface.
+    fn fn_global_effects(sig: i32, index: &SemaGlobalCallIndex) -> Vec[i32]:
+        var seen: HashMap[i32, i32] = sema_new_map_i32_i32()
+        let work: Vec[i32] = Vec.new()
+        seen.insert(sig, 1)
+        work.push(sig)
+        var k = 0
+        while k < work.len() as i32:
+            var ci: i32 = index.head.get(work[k]) ?? -1
+            k = k + 1
+            while ci >= 0:
+                let target_start: i32 = self.global_calls[ci * GLOBAL_CALL_STRIDE + 3]
+                let target_count: i32 = self.global_calls[ci * GLOBAL_CALL_STRIDE + 4]
+                for ti in target_start..target_start + target_count:
+                    let target: i32 = self.global_call_targets[ti * GLOBAL_TARGET_STRIDE]
+                    if not seen.contains(target):
+                        seen.insert(target, 1)
+                        work.push(target)
+                ci = index.next[ci]
+        var out: Vec[i32] = Vec.new()
+        for wi in 0..self.global_write_records.len() as i32 / GLOBAL_WRITE_STRIDE:
+            if seen.contains(self.global_write_records[wi * GLOBAL_WRITE_STRIDE]):
+                out = self.push_unique_i32(move out, self.global_write_records[wi * GLOBAL_WRITE_STRIDE + 1])
+        out
+
+    // The call path from `sig` to a body that writes `sym`, for a bundle
+    // build's refusal: "`f`, which calls `g`, which writes it" (the
+    // shortest, in call order). fn_global_effects's walk, keeping each
+    // body's caller.
+    fn fn_global_write_chain(sig: i32, sym: i32, index: &SemaGlobalCallIndex) -> str:
+        var parent: HashMap[i32, i32] = sema_new_map_i32_i32()
+        let work: Vec[i32] = Vec.new()
+        parent.insert(sig, sig)
+        work.push(sig)
+        var writers: HashMap[i32, i32] = sema_new_map_i32_i32()
+        for wi in 0..self.global_write_records.len() as i32 / GLOBAL_WRITE_STRIDE:
+            if self.global_write_records[wi * GLOBAL_WRITE_STRIDE + 1] == sym:
+                writers.insert(self.global_write_records[wi * GLOBAL_WRITE_STRIDE], 1)
+        var found = -1
+        var k = 0
+        while k < work.len() as i32 and found == -1:
+            let body: i32 = work[k]
+            k = k + 1
+            if writers.contains(body):
+                found = body
+                break
+            var ci: i32 = index.head.get(body) ?? -1
+            while ci >= 0:
+                let target_start: i32 = self.global_calls[ci * GLOBAL_CALL_STRIDE + 3]
+                let target_count: i32 = self.global_calls[ci * GLOBAL_CALL_STRIDE + 4]
+                for ti in target_start..target_start + target_count:
+                    let target: i32 = self.global_call_targets[ti * GLOBAL_TARGET_STRIDE]
+                    if not parent.contains(target):
+                        parent.insert(target, body)
+                        work.push(target)
+                ci = index.next[ci]
+        if found == -1:
+            return self.global_effect_body_name(sig) ++ ", which writes it"
+        var names: Vec[str] = Vec.new()
+        var cur = found
+        while true:
+            names.push(self.global_effect_body_name(cur))
+            let up: i32 = parent.get(cur).unwrap()
+            if up == cur:
+                break
+            cur = up
+        var chain = ""
+        var ni = names.len() as i32 - 1
+        while ni >= 0:
+            chain = chain ++ (if chain.len() == 0: "" else: ", which calls ") ++ names[ni]
+            ni = ni - 1
+        chain ++ ", which writes it"
+
+    // A name that denotes a global's place here: a module `let` or `var`,
+    // not a `const` (a value, §9.1c), and not a local that took its name.
+    fn names_global_place(sym: i32) -> bool:
+        if sym == 0 or self.global_value_decl_kind(sym) == 0 or self.const_global_syms.contains(sym):
+            return false
+        let bound = self.scope_name_map.get(sym)
+        bound.is_none() or self.binding_index_is_global(bound.unwrap(), sym)
+
+    // The callable an argument hands its callee, which may run it: a
+    // closure literal or a local bound to one (-2 - its node), a function
+    // named as a value (its signature), or a callable parameter of the
+    // function being checked (callable_param_body) — also as `f.clone()`
+    // (D63); any other callable value runs whatever its type admits
+    // (callable_type_body, #1827). -1 for a value that is not callable.
+    mut fn arg_callable_body(arg: i32) -> i32:
+        var node = arg
+        while node > 0 and (self.ast.kind(node) == NodeKind.NK_GROUPED or self.ast.kind(node) == NodeKind.NK_MOVE_ARG or self.ast.kind(node) == NodeKind.NK_COPY_ARG):
+            node = self.ast.get_data0(node)
+        if node <= 0:
+            return -1
+        if self.ast.kind(node) == NodeKind.NK_CLOSURE:
+            return -2 - node
+        let value_node = node
+        if self.ast.kind(node) == NodeKind.NK_CALL and self.ast.get_data2(node) == 0:
+            let callee = self.ast.get_data0(node)
+            if self.ast.kind(callee) == NodeKind.NK_FIELD_ACCESS and self.pool_resolve(self.ast.get_data1(callee)) == "clone":
+                node = self.ast.get_data0(callee)
+        if self.ast.kind(node) == NodeKind.NK_IDENT:
+            let sym = self.ast.get_data0(node)
+            if self.scope_binding_is_local(sym) and self.binding_closure_nodes.contains(sym):
+                let closure: i32 = self.binding_closure_nodes.get(sym).unwrap()
+                return -2 - closure
+            if self.fn_value_ident_sigs.contains(node):
+                let sig: i32 = self.fn_value_ident_sigs.get(node).unwrap()
+                return sig
+            let param = self.callable_param_body(sym)
+            if param != -1:
+                return param
+        let value_ty: i32 = self.typed_expr_types.get(value_node) ?? 0
+        self.callable_type_body(value_ty)
+
+    // The body a callable parameter of the function being checked stands
+    // for: whatever closure a call of the function binds to it (§12.4: a
+    // closure literal that reaches a parameter within one compilation makes
+    // the call through it direct). -1 when `sym` names no such parameter; a
+    // closure's own parameters are not the function's.
+    fn callable_param_body(sym: i32) -> i32:
+        let sig = self.current_fn_sig_idx
+        if self.current_effect_body != -1 or sig < 0:
+            return -1
+        let pi = self.param_index_for_sym(sym)
+        if pi < 0 or pi >= 32 or pi >= self.sig_get_param_count(sig):
+            return -1
+        if self.callable_any_fn_type(self.sig_param_type(sig, pi) as TypeId) == 0:
+            return -1
+        GLOBAL_PARAM_BODY + sig * 32 + pi
+
+    fn type_takes_place(tid: i32) -> bool:
+        if tid <= 0:
+            return false
+        let kind = self.get_type_kind(self.resolve_alias(tid as TypeId))
+        kind == TypeKind.TY_REF or kind == TypeKind.TY_SLICE
+
+    // The globals an argument views for the whole call, onto `out` as
+    // [argument, global] pairs: its view origins (collect_expr_view_deps),
+    // and the place's own root when its parameter takes it by place (`&T`,
+    // `[]T`, a reading or mutating receiver). A `copy`/`move` argument is
+    // an independent value.
+    fn push_arg_global_views(out0: Vec[i32], arg: i32, by_place: bool) -> Vec[i32]:
+        var out = out0
+        if arg <= 0 or self.ast.kind(arg) == NodeKind.NK_MOVE_ARG or self.ast.kind(arg) == NodeKind.NK_COPY_ARG:
+            return out
+        var roots: Vec[i32] = Vec.new()
+        roots = self.collect_expr_view_deps(arg, move roots)
+        if by_place:
+            roots = self.push_unique_i32(move roots, self.borrow_root_place(arg))
+        for ri in 0..roots.len() as i32:
+            if self.names_global_place(roots[ri]):
+                out.push(arg)
+                out.push(roots[ri])
+        out
+
+    // A callable `bound` handed to parameter `param` of the body `callee`
+    // by call `call` (callable_param_body).
+    mut fn push_global_call_binding(callee: i32, param: i32, bound: i32, call: i32):
+        self.global_call_bindings.push(callee)
+        self.global_call_bindings.push(param)
+        self.global_call_bindings.push(bound)
+        self.global_call_bindings.push(call)
+
+    fn is_param_body(body: i32) -> bool: body >= GLOBAL_PARAM_BODY and body < GLOBAL_DISPATCH_BODY
+
+    fn is_dispatch_body(body: i32) -> bool: body >= GLOBAL_DISPATCH_BODY
+
+    // #1827: the dispatcher body for (kind, a, b), made on first use.
+    mut fn global_dispatcher(kind: i32, a: i32, b: i32) -> i32:
+        var di: i32 = self.global_dispatcher_heads.get(a) ?? -1
+        while di >= 0:
+            if self.global_dispatchers[di * GLOBAL_DISPATCH_STRIDE] == kind and self.global_dispatchers[di * GLOBAL_DISPATCH_STRIDE + 2] == b:
+                return GLOBAL_DISPATCH_BODY + di
+            di = self.global_dispatcher_next[di]
+        let index = self.global_dispatchers.len() as i32 / GLOBAL_DISPATCH_STRIDE
+        self.global_dispatchers.push(kind)
+        self.global_dispatchers.push(a)
+        self.global_dispatchers.push(b)
+        self.global_dispatcher_next.push(self.global_dispatcher_heads.get(a) ?? -1)
+        self.global_dispatcher_heads.insert(a, index)
+        GLOBAL_DISPATCH_BODY + index
+
+    // The bodies of function `fn_sym`, declared at `fn_node`: its own
+    // signature, and every concrete specialization of it.
+    fn push_fn_bodies(out0: Vec[i32], fn_sym: i32, fn_node: i32) -> Vec[i32]:
+        var out = out0
+        let sig = if fn_sym != 0: self.get_sig(fn_sym) else: -1
+        if sig >= 0:
+            out.push(sig)
+        if fn_node != 0:
+            for si in 0..self.concrete_specialization_nodes.len() as i32:
+                if self.concrete_specialization_nodes[si] == fn_node and self.concrete_specialization_sigs[si] >= 0:
+                    out.push(self.concrete_specialization_sigs[si])
+        out
+
+    // The bodies a dispatcher may run (global_dispatcher): every impl of a
+    // dyn method in this compilation.
+    mut fn dispatcher_bodies(index: i32) -> Vec[i32]:
+        var out: Vec[i32] = Vec.new()
+        let kind: i32 = self.global_dispatchers[index * GLOBAL_DISPATCH_STRIDE]
+        let a: i32 = self.global_dispatchers[index * GLOBAL_DISPATCH_STRIDE + 1]
+        let b: i32 = self.global_dispatchers[index * GLOBAL_DISPATCH_STRIDE + 2]
+        if kind == GLOBAL_DISPATCH_DYN:
+            for di in 0..self.ast.decl_count():
+                let decl = self.ast.get_decl(di)
+                if self.ast.kind(decl) != NodeKind.NK_IMPL_DECL or self.ast.get_data2(decl) != a:
+                    continue
+                let method_node = self.impl_decl_method_node(decl, b)
+                if method_node != 0:
+                    out = self.push_fn_bodies(move out, self.ast.get_data0(method_node), method_node)
+                else:
+                    // The trait's default body, checked as this impl's
+                    // method (check_trait_default_method_body_for_impl).
+                    let default_sig = self.lookup_method_sig(self.ast.get_data0(decl), b)
+                    if default_sig >= 0:
+                        out.push(default_sig)
+        else if kind == GLOBAL_DISPATCH_CALLABLE:
+            // Every callable value this compilation makes whose type the
+            // call's accepts (§12.4: a callable is a function or a closure):
+            // Sema tracks no value flow into a field or a container, so the
+            // callable's type is the tightest fact that names what is stored.
+            let value_count = self.global_callable_values.len() as i32 / 2
+            for vi in 0..value_count:
+                let value_ty = self.callable_any_fn_type(self.global_callable_values[vi * 2 + 1] as TypeId)
+                if value_ty != 0 and self.get_type_kind(value_ty as TypeId) == self.get_type_kind(a as TypeId) and self.fn_types_compatible(a, value_ty) != 0:
+                    out.push(self.global_callable_values[vi * 2])
+        else if kind == GLOBAL_DISPATCH_DROP:
+            out = self.push_drop_glue_bodies(move out, a)
+        out
+
+    // The Drop impl bodies the drop of `tid` runs: the type's own `drop`
+    // (each specialization of a generic impl's), then its elements', fields'
+    // and payloads' — the walk type_carries_user_drop makes.
+    mut fn push_drop_glue_bodies(out0: Vec[i32], tid: i32) -> Vec[i32]:
+        var out = out0
+        var seen: HashMap[i32, i32] = sema_new_map_i32_i32()
+        let work: Vec[i32] = Vec.new()
+        work.push(self.resolve_alias(tid as TypeId) as i32)
+        var k = 0
+        while k < work.len() as i32:
+            let t: i32 = work[k]
+            k = k + 1
+            if t <= 0 or seen.contains(t):
+                continue
+            seen.insert(t, 1)
+            let tk = self.get_type_kind(t as TypeId)
+            if self.type_has_drop_impl(t) != 0:
+                // A generic type's drop is its impl specialized for the
+                // type, checked here if MIR lowering has not demanded it yet.
+                let sig = if tk == TypeKind.TY_GENERIC_INST: self.ensure_generic_drop_specialization(t) else: self.lookup_method_sig(self.method_owner_symbol_for_type(t), self.pool_lookup_symbol("drop"))
+                if sig >= 0:
+                    out.push(sig)
+            if tk == TypeKind.TY_GENERIC_INST:
+                for ai in 0..self.get_generic_inst_arg_count(t):
+                    work.push(self.resolve_alias(self.get_generic_inst_arg(t, ai) as TypeId) as i32)
+            else if tk == TypeKind.TY_TUPLE:
+                for ei in 0..self.get_type_d1(t as TypeId):
+                    work.push(self.resolve_alias(self.type_extra[(self.get_type_d0(t as TypeId) + ei)] as TypeId) as i32)
+            else if tk == TypeKind.TY_ARRAY or tk == TypeKind.TY_RANGE:
+                work.push(self.resolve_alias(self.get_type_d0(t as TypeId) as TypeId) as i32)
+            else if tk == TypeKind.TY_TRAIT_OBJ:
+                // A `dyn Trait` value is any implementor: its drop runs the
+                // implementor's (every generic instance of a generic one).
+                let trait_sym = self.get_type_d0(t as TypeId)
+                for di in 0..self.ast.decl_count():
+                    let decl = self.ast.get_decl(di)
+                    if self.ast.kind(decl) != NodeKind.NK_IMPL_DECL or self.ast.get_data2(decl) != trait_sym:
+                        continue
+                    let target_sym = self.ast.get_data0(decl)
+                    let target = self.lookup_named_type_visible(target_sym)
+                    if target > 0:
+                        work.push(self.resolve_alias(target as TypeId) as i32)
+                    for ti in 1..self.type_kinds.len() as i32:
+                        if self.get_type_kind(ti as TypeId) == TypeKind.TY_GENERIC_INST and self.get_generic_inst_base(ti) == target_sym:
+                            work.push(ti)
+            else:
+                for fi in 0..self.type_reflection_field_count(t):
+                    work.push(self.resolve_alias(self.type_reflection_field_type(t, fi) as TypeId) as i32)
+                for vi in 0..self.type_reflection_variant_count(t):
+                    for pi in 0..self.type_reflection_variant_payload_count(t, vi):
+                        work.push(self.resolve_alias(self.type_reflection_variant_payload_type(t, vi, pi) as TypeId) as i32)
+        out
+
+    // #1827: a call through a callable value no binding names — a field, an
+    // element, a call's result, a local that is not a closure binding — runs
+    // any callable value of its type (dispatcher_bodies). -1 when `tid` is
+    // not callable.
+    mut fn callable_type_body(tid: i32) -> i32:
+        let fn_ty = if tid > 0: self.callable_any_fn_type(tid as TypeId) else: 0
+        if fn_ty == 0:
+            return -1
+        self.global_dispatcher(GLOBAL_DISPATCH_CALLABLE, fn_ty, 0)
+
+    // A callable value this compilation makes (a closure, or a function
+    // named as a value), for callable_type_body's dispatcher.
+    mut fn note_callable_value(body: i32, tid: i32):
+        if tid <= 0 or self.callable_any_fn_type(tid as TypeId) == 0:
+            return
+        self.global_callable_values.push(body)
+        self.global_callable_values.push(tid)
+
+    // #1827: every dispatcher runs each of its bodies, as a call it makes;
+    // a callable handed to a dispatcher's parameter is handed to each body's.
+    // A drop body checked here (ensure_generic_drop_specialization) may
+    // need dispatchers of its own: they are expanded in turn.
+    mut fn expand_global_dispatchers():
+        var di = self.global_dispatchers_expanded
+        while di < self.global_dispatchers.len() as i32 / GLOBAL_DISPATCH_STRIDE:
+            self.global_dispatchers_expanded = di + 1
+            let dispatcher = GLOBAL_DISPATCH_BODY + di
+            let bodies = self.dispatcher_bodies(di)
+            for bi in 0..bodies.len() as i32:
+                let call = self.global_calls.len() as i32 / GLOBAL_CALL_STRIDE
+                self.global_call_targets.push(bodies[bi])
+                self.global_call_targets.push(call)
+                self.global_call_targets.push(0)
+                self.push_global_call_record(dispatcher, 0, 0, self.global_call_targets.len() as i32 / GLOBAL_TARGET_STRIDE - 1, 1, bodies[bi], GLOBAL_SITE_CALL, 0)
+            for gi in 0..self.global_call_bindings.len() as i32 / GLOBAL_BINDING_STRIDE:
+                if self.global_call_bindings[gi * GLOBAL_BINDING_STRIDE] != dispatcher:
+                    continue
+                let param: i32 = self.global_call_bindings[gi * GLOBAL_BINDING_STRIDE + 1]
+                let bound: i32 = self.global_call_bindings[gi * GLOBAL_BINDING_STRIDE + 2]
+                let call: i32 = self.global_call_bindings[gi * GLOBAL_BINDING_STRIDE + 3]
+                for bi in 0..bodies.len() as i32:
+                    if bodies[bi] >= 0 and bodies[bi] < GLOBAL_PARAM_BODY:
+                        self.push_global_call_binding(bodies[bi], param, bound, call)
+            di = di + 1
+
+    mut fn push_global_view_check(call: i32, sym: i32, view_sym: i32, view_node: i32, last_use: i32, flags: i32):
+        self.global_view_call_checks.push(call)
+        self.global_view_call_checks.push(sym)
+        self.global_view_call_checks.push(view_sym)
+        self.global_view_call_checks.push(view_node)
+        self.global_view_call_checks.push(last_use)
+        self.global_view_call_checks.push(flags)
+
+    // #1819 (§9.1c: globals are places; §21.1 rule 1): a call writes every
+    // global its callee writes — and every global a callable it hands the
+    // callee writes, since the callee may run it. Which globals those are
+    // is known once every body is checked
+    // (check_calls_against_live_global_views): the call is kept with each
+    // view of a global live across it — a named view used after the call
+    // or inside it (borrow_liveness_at, the rule a direct write is judged
+    // by), and an argument or receiver that views a global for the whole
+    // call. `callee` is the called body (-1 when none is known); `args[i]`
+    // is the argument for the callee's parameter `first_param + i`.
+    mut fn note_call_global_effects(call_node: i32, callee: i32, first_param: i32, recv_node: i32, recv_by_place: bool, args: &Vec[i32], args_by_place: &Vec[bool]):
+        if call_node <= 0:
+            return
+        let call = self.global_calls.len() as i32 / GLOBAL_CALL_STRIDE
+        let target_start = self.global_call_targets.len() as i32 / GLOBAL_TARGET_STRIDE
+        var target_count = 0
+        if callee != -1:
+            self.global_call_targets.push(callee)
+            self.global_call_targets.push(call)
+            self.global_call_targets.push(0)
+            target_count = target_count + 1
+        for ai in 0..args.len() as i32:
+            let bound = self.arg_callable_body(args[ai])
+            if bound != -1:
+                // A closure literal's body was checked right here, under the
+                // views live at this call (check_closure): its writes and
+                // calls met them there; it is kept for the caller's writes
+                // and for this call's argument views.
+                self.global_call_targets.push(bound)
+                self.global_call_targets.push(call)
+                self.global_call_targets.push(if self.ast.kind(args[ai]) == NodeKind.NK_CLOSURE: 1 else: 0)
+                target_count = target_count + 1
+                self.push_global_call_binding(callee, first_param + ai, bound, call)
+        self.push_global_call_record(self.global_effect_body(), call_node, self.local_file_id, target_start, target_count, callee, GLOBAL_SITE_CALL, 0)
+        // A by-value argument moves into the callee, which drops it (§2.4):
+        // it is no temporary of the caller's statement
+        // (collect_drop_temporaries).
+        for ai in 0..args.len() as i32:
+            if args[ai] > 0 and not args_by_place[ai]:
+                self.global_consumed_args.insert(args[ai], 1)
+        if target_count == 0 or self.suppress_errors != 0:
+            return
+        self.keep_live_global_views(call, call_node, false)
+        var views: Vec[i32] = Vec.new()
+        if recv_node > 0 and recv_by_place:
+            views = self.push_arg_global_views(move views, recv_node, true)
+        for ai in 0..args.len() as i32:
+            views = self.push_arg_global_views(move views, args[ai], args_by_place[ai])
+        var vi = 0
+        while vi + 1 < views.len() as i32:
+            self.push_global_view_check(call, views[vi + 1], 0, views[vi], 0, 0)
+            vi = vi + 2
+
+    mut fn push_global_call_record(caller: i32, node: i32, file: i32, target_start: i32, target_count: i32, callee: i32, kind: i32, subject: i32):
+        self.global_calls.push(caller)
+        self.global_calls.push(node)
+        self.global_calls.push(file)
+        self.global_calls.push(target_start)
+        self.global_calls.push(target_count)
+        self.global_calls.push(callee)
+        self.global_calls.push(kind)
+        self.global_calls.push(subject)
+
+    // Every named view of a global live across the kept site `call`, at
+    // `site_node` — the liveness a direct write is judged by
+    // (borrow_liveness_at). A drop `at_end` of `site_node` (a block, a
+    // statement) comes after every use inside it: only a later use, or a
+    // loop's next iteration, keeps a view live across it.
+    mut fn keep_live_global_views(call: i32, site_node: i32, at_end: bool):
+        for bi in 0..self.borrow_kinds.len() as i32:
+            let ref_sym: i32 = self.borrow_refs[bi]
+            let kind: i32 = self.borrow_kinds[bi]
+            if ref_sym == 0 or (kind != BorrowKind.SHARED and kind != BorrowKind.EXCLUSIVE) or not self.names_global_place(self.borrow_places[bi]):
+                continue
+            let live = self.borrow_liveness_at(bi, site_node)
+            if live.state != BORROW_LIVE or (at_end and live.last_use == 0 and not live.loop_view):
+                continue
+            let decl = self.binding_decl_node(ref_sym)
+            let flags = (if live.loop_view: 1 else: 0) + (if live.gen_loop_view: 2 else: 0)
+            self.push_global_view_check(call, self.borrow_places[bi], ref_sym, if decl != 0: decl else: self.borrow_creation_nodes[bi], live.last_use, flags)
+
+    // #1827: whether dropping a value of type `tid` runs a user Drop impl —
+    // its own, or a field's, element's or payload's (type_carries_user_drop).
+    mut fn type_has_user_drop_glue(tid: i32) -> bool:
+        if tid <= 0:
+            return false
+        let resolved = self.resolve_alias(tid as TypeId) as i32
+        let cached = self.global_user_drop_types.get(resolved)
+        if cached.is_some():
+            return cached.unwrap() != 0
+        let has = self.type_carries_user_drop(resolved)
+        self.global_user_drop_types.insert(resolved, has)
+        has != 0
+
+    // #1827 (§2.4, §21.1 rule 7): an implicit drop runs its type's drop —
+    // the type's Drop impl and its fields', elements' and payloads' — at a
+    // drop point the language fixes: the end of a binding's scope (reverse
+    // declaration order), a reassignment (the old value), the end of the
+    // statement for a temporary, a `return`. MIR places each drop on its
+    // paths (§2.4, conditional drop) and adds none elsewhere, so these
+    // points bound where it runs; Sema judges the views live across them as
+    // it judges a call's (keep_live_global_views), and `views` are values
+    // that outlive the drop (a block's tail, a returned value). `display`
+    // is where the diagnostic points; `subject` the dropped binding (0 for a
+    // temporary).
+    // `scan_rows` is false where no view can be used after the drop (a
+    // function's last block, a `return`).
+    mut fn note_drop_global_effects(site_node: i32, display: i32, kind: i32, subject: i32, tid: i32, views: &Vec[i32], scan_rows: bool):
+        if site_node <= 0 or not self.type_has_user_drop_glue(tid):
+            return
+        let drop_body = self.global_dispatcher(GLOBAL_DISPATCH_DROP, self.resolve_alias(tid as TypeId) as i32, 0)
+        let call = self.global_calls.len() as i32 / GLOBAL_CALL_STRIDE
+        let target_start = self.global_call_targets.len() as i32 / GLOBAL_TARGET_STRIDE
+        self.global_call_targets.push(drop_body)
+        self.global_call_targets.push(call)
+        self.global_call_targets.push(0)
+        self.push_global_call_record(self.global_effect_body(), display, self.local_file_id, target_start, 1, drop_body, kind, subject)
+        if self.suppress_errors != 0:
+            return
+        if scan_rows:
+            self.keep_live_global_views(call, site_node, true)
+        var kept: Vec[i32] = Vec.new()
+        for vi in 0..views.len() as i32:
+            kept = self.push_arg_global_views(move kept, views[vi], false)
+        var ki = 0
+        while ki + 1 < kept.len() as i32:
+            self.push_global_view_check(call, kept[ki + 1], 0, kept[ki], 0, 0)
+            ki = ki + 2
+
+    // The drops at the end of a scope whose bindings start at `bind_start`:
+    // each binding (in reverse declaration order) whose drop runs a user
+    // Drop impl, with `views` outliving them. A binding moved on every path
+    // is not dropped there (§2.4); Sema's move state joins paths (§21.1 rule
+    // 9), so every binding counts — the drop may run on a path that kept it.
+    mut fn note_scope_exit_drops(site_node: i32, kind: i32, bind_start: i32, views: &Vec[i32], scan_rows: bool):
+        var bi = self.bind_names.len() as i32 - 1
+        while bi >= bind_start:
+            let sym: i32 = self.bind_names[bi]
+            let tid: i32 = self.bind_types[bi]
+            if not self.binding_index_is_global(bi, sym) and self.type_has_user_drop_glue(tid):
+                let decl = self.binding_decl_node(sym)
+                self.note_drop_global_effects(site_node, if kind == GLOBAL_SITE_SCOPE_DROP and decl != 0: decl else: site_node, kind, sym, tid, views, scan_rows)
+            bi = bi - 1
+
+    // A value that outlives the drops at a scope's end or a `return` when
+    // it views a global (`views` of note_drop_global_effects): 0 otherwise.
+    fn expr_views_global(node: i32) -> bool:
+        if node <= 0:
+            return false
+        var roots: Vec[i32] = Vec.new()
+        roots = self.collect_expr_view_deps(node, move roots)
+        for ri in 0..roots.len() as i32:
+            if self.names_global_place(roots[ri]):
+                return true
+        false
+
+    // #1827 (§2.4: temporaries created within an expression are dropped at
+    // the end of the enclosing statement): the temporaries `node` makes
+    // whose drop runs a user Drop impl, onto `out`. A value `owned` by its
+    // parent — a binding's initializer, an assigned or returned value, a
+    // field, element or payload of an aggregate, an argument moved into its
+    // callee — is dropped by its new owner, not here. A nested block's
+    // statements drop their own at their ends; its tail is this statement's.
+    mut fn collect_drop_temporaries(node: i32, owned: bool, out0: Vec[i32]) -> Vec[i32]:
+        var out = out0
+        if node <= 0:
+            return out
+        let kind = self.ast.kind(node)
+        if kind == NodeKind.NK_GROUPED or kind == NodeKind.NK_NO_SUSPEND or kind == NodeKind.NK_MOVE_ARG or kind == NodeKind.NK_COPY_ARG or kind == NodeKind.NK_CAST:
+            return self.collect_drop_temporaries(self.ast.get_data0(node), owned, move out)
+        if kind == NodeKind.NK_LET_DECL or kind == NodeKind.NK_LET_BINDING:
+            return self.collect_drop_temporaries(self.ast.get_data1(node), self.is_discard_binding_symbol(self.ast.get_data0(node)) == 0, move out)
+        if kind == NodeKind.NK_ASSIGN:
+            out = self.collect_drop_temporaries(self.ast.get_data0(node), false, move out)
+            return self.collect_drop_temporaries(self.ast.get_data1(node), true, move out)
+        if kind == NodeKind.NK_RETURN:
+            return self.collect_drop_temporaries(self.ast.get_data0(node), true, move out)
+        if kind == NodeKind.NK_IF_EXPR:
+            out = self.collect_drop_temporaries(self.ast.get_data0(node), false, move out)
+            out = self.collect_drop_temporaries(self.ast.get_data1(node), owned, move out)
+            return self.collect_drop_temporaries(self.ast.get_data2(node), owned, move out)
+        if kind == NodeKind.NK_MATCH:
+            out = self.collect_drop_temporaries(self.ast.get_data0(node), false, move out)
+            for ai in 0..self.ast.get_data2(node):
+                let arm = self.ast.get_extra(self.ast.get_data1(node) + ai)
+                if arm > 0 and self.ast.kind(arm) == NodeKind.NK_MATCH_ARM:
+                    out = self.collect_drop_temporaries(self.ast.get_data1(arm), owned, move out)
+            return out
+        if kind == NodeKind.NK_BLOCK:
+            return self.collect_drop_temporaries(self.ast.get_data2(node), owned, move out)
+        if kind == NodeKind.NK_FIELD_ACCESS:
+            return self.collect_drop_temporaries(self.ast.get_data0(node), false, move out)
+        if kind == NodeKind.NK_INDEX:
+            out = self.collect_drop_temporaries(self.ast.get_data0(node), false, move out)
+            return self.collect_drop_temporaries(self.ast.get_data1(node), false, move out)
+        if kind == NodeKind.NK_BINARY:
+            out = self.collect_drop_temporaries(self.ast.get_data1(node), false, move out)
+            return self.collect_drop_temporaries(self.ast.get_data2(node), false, move out)
+        if kind == NodeKind.NK_UNARY:
+            return self.collect_drop_temporaries(self.ast.get_data1(node), false, move out)
+        if kind == NodeKind.NK_FOR:
+            return self.collect_drop_temporaries(self.ast.get_data1(node), false, move out)
+        var producer = false
+        if kind == NodeKind.NK_CALL:
+            out = self.collect_drop_temporaries(self.ast.get_data0(node), false, move out)
+            let has_resolved = self.has_resolved_call_args(node) != 0
+            let count = if has_resolved: self.get_resolved_call_arg_count(node) else: self.ast.get_data2(node)
+            for ai in 0..count:
+                let arg = if has_resolved: self.get_resolved_call_arg(node, ai) else: self.ast.get_extra(self.ast.get_data1(node) + ai)
+                out = self.collect_drop_temporaries(arg, self.global_consumed_args.contains(arg), move out)
+            producer = true
+        else if kind == NodeKind.NK_STRUCT_LIT:
+            for fi in 0..self.ast.get_data2(node):
+                out = self.collect_drop_temporaries(self.ast.get_extra(self.ast.get_data1(node) + fi * 2 + 1), true, move out)
+            producer = true
+        else if kind == NodeKind.NK_TUPLE or kind == NodeKind.NK_ARRAY_LIT:
+            for ei in 0..self.ast.get_data1(node):
+                out = self.collect_drop_temporaries(self.ast.get_extra(self.ast.get_data0(node) + ei), true, move out)
+            producer = true
+        if producer and not owned:
+            let tid: i32 = self.typed_expr_types.get(node) ?? 0
+            if self.type_has_user_drop_glue(tid):
+                out.push(node)
+        out
+
+    // The drops at the end of statement `stmt` of its temporaries; `owned`
+    // when its value is a body's returned value, after which no view is used
+    // (`scan_rows` false).
+    mut fn note_statement_temporary_drops(stmt: i32, owned: bool, scan_rows: bool):
+        var temps: Vec[i32] = Vec.new()
+        temps = self.collect_drop_temporaries(stmt, owned, move temps)
+        let no_views: Vec[i32] = Vec.new()
+        for ti in 0..temps.len() as i32:
+            let tid: i32 = self.typed_expr_types.get(temps[ti]) ?? 0
+            self.note_drop_global_effects(stmt, temps[ti], GLOBAL_SITE_TEMP_DROP, 0, tid, no_views, scan_rows)
+
+    // note_call_global_effects for a call Sema resolved to signature
+    // `sig_idx` (arguments as record_call_view_origins takes them).
+    mut fn note_sig_call_global_effects(call_node: i32, sig_idx: i32, param_offset: i32, recv_node: i32, extra_start: i32, arg_count: i32, has_resolved: i32):
+        if call_node <= 0 or sig_idx < 0:
+            return
+        let param_count = self.sig_get_param_count(sig_idx)
+        let args: Vec[i32] = Vec.new()
+        let by_place: Vec[bool] = Vec.new()
+        for ai in 0..arg_count:
+            args.push(if has_resolved != 0: self.get_resolved_call_arg(call_node, ai) else: self.ast.get_extra(extra_start + ai))
+            by_place.push(ai + param_offset < param_count and self.type_takes_place(self.sig_param_type(sig_idx, ai + param_offset)))
+        let mode = self.sig_receiver_mode(sig_idx)
+        let recv_by_place = param_offset == 1 and param_count > 0 and (mode == ReceiverMode.Read or mode == ReceiverMode.Mut)
+        self.note_call_global_effects(call_node, sig_idx, param_offset, recv_node, recv_by_place, args, by_place)
+
+    fn global_effect_body_name(body: i32) -> str:
+        if body <= -2:
+            return "a closure"
+        if self.is_dispatch_body(body):
+            let index = body - GLOBAL_DISPATCH_BODY
+            let kind: i32 = self.global_dispatchers[index * GLOBAL_DISPATCH_STRIDE]
+            let a: i32 = self.global_dispatchers[index * GLOBAL_DISPATCH_STRIDE + 1]
+            let b: i32 = self.global_dispatchers[index * GLOBAL_DISPATCH_STRIDE + 2]
+            if kind == GLOBAL_DISPATCH_DYN:
+                return "`dyn " ++ with_str_clone_ref(self.pool_resolve(a)) ++ "." ++ with_str_clone_ref(self.pool_resolve(b)) ++ "`"
+            if kind == GLOBAL_DISPATCH_CALLABLE:
+                return "a callable of type `" ++ self.type_name(a) ++ "`"
+            if kind == GLOBAL_DISPATCH_DROP:
+                return "the drop of `" ++ self.type_name(a) ++ "`"
+            return "a callable"
+        if body < 0 or body >= self.sig_names.len() as i32:
+            return "a callable"
+        // A specialization's symbol is its template's name, `__sema__` or
+        // `__receiver__`, then its key; an extension method's carries
+        // `$ext$` and its extension's key, a displaced name `$in$` and its
+        // module (#1703).
+        let full: str = with_str_clone_ref(self.pool_resolve(self.sig_names[body]))
+        let parts = full.split("__sema__")[0].split("__receiver__")[0].split("$ext$")[0].split("$in$")
+        "`" ++ parts[0] ++ "`"
+
+    // A callable parameter's name (callable_param_body).
+    fn global_param_body_name(param_body: i32) -> str:
+        let sig = (param_body - GLOBAL_PARAM_BODY) / 32
+        let pi = (param_body - GLOBAL_PARAM_BODY) % 32
+        let fn_node = self.receiver_decl_node_for_sig(sig)
+        let meta = if fn_node != 0: self.ast.find_fn_meta(fn_node) else: -1
+        if meta < 0 or pi >= self.ast.fn_meta_param_count(meta):
+            return "its callable parameter"
+        "`" ++ with_str_clone_ref(self.pool_resolve(self.ast.fn_param_name(self.ast.fn_meta_param_start(meta), pi))) ++ "`"
+
+    // The callee a diagnostic names for a kept call: its signature, else the
+    // callable its callee expression names (`f()`).
+    fn global_call_callee_name(call: i32) -> str:
+        let callee: i32 = self.global_calls[call * GLOBAL_CALL_STRIDE + 5]
+        let call_node: i32 = self.global_calls[call * GLOBAL_CALL_STRIDE + 1]
+        let callee_expr = if call_node > 0 and self.ast.kind(call_node) == NodeKind.NK_CALL: self.ast.get_data0(call_node) else: 0
+        let through_value = self.is_dispatch_body(callee) and self.global_dispatchers[(callee - GLOBAL_DISPATCH_BODY) * GLOBAL_DISPATCH_STRIDE] == GLOBAL_DISPATCH_CALLABLE
+        if (callee >= 0 and callee < GLOBAL_PARAM_BODY) or (self.is_dispatch_body(callee) and not through_value):
+            return self.global_effect_body_name(callee)
+        // A callable value: the place it is called through.
+        if callee_expr != 0 and self.ast.kind(callee_expr) == NodeKind.NK_IDENT:
+            return "`" ++ with_str_clone_ref(self.pool_resolve(self.ast.get_data0(callee_expr))) ++ "`"
+        if callee_expr != 0 and self.ast.kind(callee_expr) == NodeKind.NK_FIELD_ACCESS and self.ast.kind(self.ast.get_data0(callee_expr)) == NodeKind.NK_IDENT:
+            return "`" ++ with_str_clone_ref(self.pool_resolve(self.ast.get_data0(self.ast.get_data0(callee_expr)))) ++ "." ++ with_str_clone_ref(self.pool_resolve(self.ast.get_data1(callee_expr))) ++ "`"
+        if through_value:
+            return self.global_effect_body_name(callee)
+        "the callable"
+
+    // #1819 (§9.1c: globals are places; §21.1 rule 1): with every body
+    // checked, each call's writes are known — its targets' own, and those
+    // of every call they make, recursion included; a callable parameter
+    // runs whatever closure a call binds to it. A view of a global live
+    // across a call that writes that global is refused, as a direct write
+    // under it is (check_mutation_against_views).
+    mut fn check_calls_against_live_global_views():
+        // Every dispatcher's call records, checks or not: the bundle build
+        // reads the call graph for the interface (fn_global_effects). A body
+        // expansion checks (a generic drop) may keep checks of its own.
+        self.expand_global_dispatchers()
+        if self.global_view_call_checks.len() == 0:
+            return
+        let check_count = self.global_view_call_checks.len() as i32 / GLOBAL_VIEW_CHECK_STRIDE
+        // The calls that run each body: its target entries, chained.
+        var runs_head: HashMap[i32, i32] = sema_new_map_i32_i32()
+        let runs_next: Vec[i32] = Vec.new()
+        let target_count = self.global_call_targets.len() as i32 / GLOBAL_TARGET_STRIDE
+        for ti in 0..target_count:
+            let body: i32 = self.global_call_targets[ti * GLOBAL_TARGET_STRIDE]
+            runs_next.push(runs_head.get(body) ?? -1)
+            runs_head.insert(body, ti)
+        // The callables bound to each callable parameter, chained.
+        var bound_head: HashMap[i32, i32] = sema_new_map_i32_i32()
+        let bound_next: Vec[i32] = Vec.new()
+        let binding_count = self.global_call_bindings.len() as i32 / GLOBAL_BINDING_STRIDE
+        for bi in 0..binding_count:
+            let callee: i32 = self.global_call_bindings[bi * GLOBAL_BINDING_STRIDE]
+            let param: i32 = self.global_call_bindings[bi * GLOBAL_BINDING_STRIDE + 1]
+            if callee < 0 or callee >= GLOBAL_PARAM_BODY or param >= 32:
+                bound_next.push(-1)
+                continue
+            let key = GLOBAL_PARAM_BODY + callee * 32 + param
+            bound_next.push(bound_head.get(key) ?? -1)
+            bound_head.insert(key, bi)
+        let write_count = self.global_write_records.len() as i32 / GLOBAL_WRITE_STRIDE
+        var judged: HashMap[i32, i32] = sema_new_map_i32_i32()
+        let reported: Vec[i32] = Vec.new()
+        for ci in 0..check_count:
+            let sym: i32 = self.global_view_call_checks[ci * GLOBAL_VIEW_CHECK_STRIDE + 1]
+            if judged.contains(sym):
+                continue
+            judged.insert(sym, 1)
+            // Every body that writes `sym`, itself or through its calls:
+            // `via` holds, toward the write, the target entry of the call
+            // it makes next, or -1 - the write record where it writes.
+            var via: HashMap[i32, i32] = sema_new_map_i32_i32()
+            let work: Vec[i32] = Vec.new()
+            for wi in 0..write_count:
+                let writer: i32 = self.global_write_records[wi * GLOBAL_WRITE_STRIDE]
+                if self.global_write_records[wi * GLOBAL_WRITE_STRIDE + 1] == sym and not via.contains(writer):
+                    via.insert(writer, -1 - wi)
+                    work.push(writer)
+            var k = 0
+            while k < work.len() as i32:
+                var e: i32 = runs_head.get(work[k]) ?? -1
+                k = k + 1
+                while e >= 0:
+                    let caller: i32 = self.global_calls[self.global_call_targets[e * GLOBAL_TARGET_STRIDE + 1] * GLOBAL_CALL_STRIDE]
+                    if caller != -1 and not via.contains(caller):
+                        via.insert(caller, e)
+                        work.push(caller)
+                    e = runs_next[e]
+            for cj in ci..check_count:
+                if self.global_view_call_checks[cj * GLOBAL_VIEW_CHECK_STRIDE + 1] != sym:
+                    continue
+                let call_node: i32 = self.global_calls[self.global_view_call_checks[cj * GLOBAL_VIEW_CHECK_STRIDE] * GLOBAL_CALL_STRIDE + 1]
+                var seen = false
+                var ri = 0
+                while ri + 1 < reported.len() as i32:
+                    if reported[ri] == call_node and reported[ri + 1] == sym:
+                        seen = true
+                    ri = ri + 2
+                if not seen and self.report_global_view_call_check(cj, &via, &bound_head, &bound_next):
+                    reported.push(call_node)
+                    reported.push(sym)
+
+    // The binding through which callable parameter `param_body` runs a body
+    // that writes (is in `via`): a closure a call binds to it, directly or
+    // through a parameter of the caller that it forwards. -1 when none does.
+    fn param_binding_writer(param_body: i32, via: &HashMap[i32, i32], bound_head: &HashMap[i32, i32], bound_next: &Vec[i32]) -> i32:
+        var seen: HashMap[i32, i32] = sema_new_map_i32_i32()
+        let work: Vec[i32] = Vec.new()
+        seen.insert(param_body, 1)
+        work.push(param_body)
+        var k = 0
+        while k < work.len() as i32:
+            var b: i32 = bound_head.get(work[k]) ?? -1
+            k = k + 1
+            while b >= 0:
+                let bound: i32 = self.global_call_bindings[b * GLOBAL_BINDING_STRIDE + 2]
+                if self.is_param_body(bound):
+                    if not seen.contains(bound):
+                        seen.insert(bound, 1)
+                        work.push(bound)
+                else if via.contains(bound):
+                    return b
+                b = bound_next[b]
+        -1
+
+    // One kept check against `via` (check_calls_against_live_global_views):
+    // reported when a body the call runs writes the global.
+    mut fn report_global_view_call_check(ci: i32, via: &HashMap[i32, i32], bound_head: &HashMap[i32, i32], bound_next: &Vec[i32]) -> bool:
+        let base = ci * GLOBAL_VIEW_CHECK_STRIDE
+        let call: i32 = self.global_view_call_checks[base]
+        let sym: i32 = self.global_view_call_checks[base + 1]
+        let view_sym: i32 = self.global_view_call_checks[base + 2]
+        let view_node: i32 = self.global_view_call_checks[base + 3]
+        let last_use: i32 = self.global_view_call_checks[base + 4]
+        let flags: i32 = self.global_view_call_checks[base + 5]
+        let call_node: i32 = self.global_calls[call * GLOBAL_CALL_STRIDE + 1]
+        let file: i32 = self.global_calls[call * GLOBAL_CALL_STRIDE + 2]
+        let target_start: i32 = self.global_calls[call * GLOBAL_CALL_STRIDE + 3]
+        let target_count: i32 = self.global_calls[call * GLOBAL_CALL_STRIDE + 4]
+        let callee: i32 = self.global_calls[call * GLOBAL_CALL_STRIDE + 5]
+        // The body the call runs that writes, and the binding that hands it
+        // over when the call runs a callable parameter.
+        var body = -1
+        var hit = -1
+        var binding = -1
+        for ti in target_start..target_start + target_count:
+            let target: i32 = self.global_call_targets[ti * GLOBAL_TARGET_STRIDE]
+            // A closure literal's body met the named views in place.
+            if hit >= 0 or (view_sym != 0 and self.global_call_targets[ti * GLOBAL_TARGET_STRIDE + 2] != 0):
+                continue
+            if self.is_param_body(target):
+                let b = self.param_binding_writer(target, via, bound_head, bound_next)
+                if b >= 0:
+                    hit = ti
+                    binding = b
+                    body = self.global_call_bindings[b * GLOBAL_BINDING_STRIDE + 2]
+            else if via.contains(target):
+                hit = ti
+                body = target
+        if hit < 0:
+            return false
+        let name: str = with_str_clone_ref(self.pool_resolve(sym))
+        let callee_name = self.global_call_callee_name(call)
+        // The way from the call to the write: the body the call runs, each
+        // body it calls next, and the one that writes.
+        let hit_target: i32 = self.global_call_targets[hit * GLOBAL_TARGET_STRIDE]
+        var chain = if binding >= 0 and hit == target_start and callee != -1: callee_name ++ " runs the callable a caller passes for it"
+            else if binding >= 0: callee_name ++ " runs " ++ self.global_param_body_name(hit_target) ++ ", the callable a caller passes for it"
+            else if hit != target_start or callee == -1: callee_name ++ " runs " ++ self.global_effect_body_name(hit_target) ++ " it is handed"
+            else: self.global_effect_body_name(body)
+        var step: i32 = via.get(body) ?? -1
+        while step >= 0:
+            // A dispatcher runs one of its bodies (a drop runs all of
+            // them); a body calls the next.
+            let runs = if not self.is_dispatch_body(body): ", which calls "
+                else if self.global_dispatchers[(body - GLOBAL_DISPATCH_BODY) * GLOBAL_DISPATCH_STRIDE] == GLOBAL_DISPATCH_DROP: ", which runs "
+                else: ", which may be "
+            body = self.global_call_targets[step * GLOBAL_TARGET_STRIDE]
+            chain = chain ++ runs ++ self.global_effect_body_name(body)
+            step = via.get(body) ?? -1
+        let write = -1 - step
+        let call_span = Span { file, start: self.ast.get_start(call_node), end: self.ast.get_end(call_node) }
+        let site_kind: i32 = self.global_calls[call * GLOBAL_CALL_STRIDE + 6]
+        let subject: i32 = self.global_calls[call * GLOBAL_CALL_STRIDE + 7]
+        let subject_name = if subject != 0: "`" ++ with_str_clone_ref(self.pool_resolve(subject)) ++ "`" else: "the place"
+        let site = if site_kind == GLOBAL_SITE_SCOPE_DROP: "the drop of " ++ subject_name ++ " at the end of its scope"
+            else if site_kind == GLOBAL_SITE_REASSIGN_DROP: "the drop of " ++ subject_name ++ "'s old value at this assignment"
+            else if site_kind == GLOBAL_SITE_TEMP_DROP: "the drop of this temporary at the end of its statement"
+            else if site_kind == GLOBAL_SITE_RETURN_DROP: "the drop of " ++ subject_name ++ " at this `return`"
+            else: "call to " ++ callee_name
+        let what = if view_sym != 0: "`" ++ with_str_clone_ref(self.pool_resolve(view_sym)) ++ "` is a live view into it" else if site_kind == GLOBAL_SITE_CALL: "its argument is a live view into it" else: "a view into it outlives the drop"
+        var diag = Diagnostic.err(site ++ " mutates global `" ++ name ++ "` while " ++ what, call_span)
+        if view_node != 0:
+            let view_label = if view_sym != 0: "`" ++ with_str_clone_ref(self.pool_resolve(view_sym)) ++ "` views a value stored in `" ++ name ++ "`" else if site_kind == GLOBAL_SITE_CALL: "this argument views `" ++ name ++ "` for the whole call" else: "this value views `" ++ name ++ "` and outlives the drop"
+            diag.add_label(Span { file, start: self.ast.get_start(view_node), end: self.ast.get_end(view_node) }, view_label)
+        diag.add_label(call_span, (if site_kind == GLOBAL_SITE_CALL: "this call mutates `" else: "this drop mutates `") ++ name ++ "`: " ++ chain ++ ", which writes it")
+        if binding >= 0:
+            let bind_call: i32 = self.global_call_bindings[binding * GLOBAL_BINDING_STRIDE + 3]
+            let bind_node: i32 = self.global_calls[bind_call * GLOBAL_CALL_STRIDE + 1]
+            let bind_file: i32 = self.global_calls[bind_call * GLOBAL_CALL_STRIDE + 2]
+            diag.add_label(Span { file: bind_file, start: self.ast.get_start(bind_node), end: self.ast.get_end(bind_node) }, "the callable is passed here")
+        if write >= 0 and write < self.global_write_records.len() as i32 / GLOBAL_WRITE_STRIDE:
+            let write_node: i32 = self.global_write_records[write * GLOBAL_WRITE_STRIDE + 2]
+            let write_file: i32 = self.global_write_records[write * GLOBAL_WRITE_STRIDE + 3]
+            let write_kind: i32 = self.global_write_records[write * GLOBAL_WRITE_STRIDE + 4]
+            let write_label = if write_kind == GLOBAL_WRITE_BUNDLE: "a bundle function, declared here: its declared write contract names `" ++ name ++ "` (§21.1 rule 1, D39)" else: "`" ++ name ++ "` is written here"
+            diag.add_label(Span { file: write_file, start: self.ast.get_start(write_node), end: self.ast.get_end(write_node) }, write_label)
+        if last_use != 0:
+            diag.add_label(Span { file, start: self.ast.get_start(last_use), end: self.ast.get_end(last_use) }, if site_kind == GLOBAL_SITE_CALL: "view is used here after the call" else: "view is used here after the drop")
+        if (flags & 2) != 0:
+            diag.add_note("the generator `" ++ with_str_clone_ref(self.pool_resolve(view_sym)) ++ "` is still running while the loop body runs (§13.4); collect the changes and apply them after the loop")
+        else if (flags & 1) != 0:
+            diag.add_note("the loop reads `" ++ name ++ "` again on its next iteration; collect the changes and apply them after the loop")
+        if site_kind == GLOBAL_SITE_CALL:
+            diag.add_note("a call writes every global its callee writes, through every call it makes (§9.1c: globals are places; §21.1 rule 1)")
+        else:
+            diag.add_note("an implicit drop runs its type's Drop impls, and writes every global they write (§2.4; §21.1 rules 1 and 7)")
+        self.diags.emit(move diag)
+        true
 
     fn global_data_race_access_needs_proof(idx: i32) -> i32:
         let sym = self.global_race_access_syms[idx]
@@ -2372,6 +3375,9 @@ impl Sema:
 
         // Push function scope
         self.push_scope()
+        // #1827: a `return` drops every binding from here (§2.4).
+        let saved_fn_bind_start: i32 = self.current_fn_bind_start
+        self.current_fn_bind_start = self.bind_names.len() as i32
 
         // `Self` in the body is the method's own declaration, resolved from
         // the body's module: collect_fn_decl binds it for the signature and
@@ -2451,6 +3457,10 @@ impl Sema:
         // Effect tracking: save outer state and populate for this function
         let saved_eff_sig_idx: i32 = self.current_fn_sig_idx
         let saved_fn_variadic: i32 = self.current_fn_variadic
+        // #1819: this body's writes and calls are its own, not those of a
+        // closure being checked when it was instantiated.
+        let saved_effect_body: i32 = self.current_effect_body
+        self.current_effect_body = -1
         let saved_eff_param_syms = sema_clone_i32_vec(&self.current_fn_param_syms)
         let saved_eff_param_effs = sema_clone_i32_vec(&self.current_fn_param_effs)
         let saved_eff_param_direct_effs = sema_clone_i32_vec(&self.current_fn_param_direct_effs)
@@ -2580,13 +3590,27 @@ impl Sema:
         // and an arm's else-less `if` was refused as an expression.
         let unit_body_stmt = body_expected_ret == self.ty_void and self.ast.kind(source_body) != NodeKind.NK_BLOCK
         let checked_body_ty = if unit_body_stmt: self.check_expr_statement_context(body) else: self.check_expr(body)
+        // #1827 (§2.4): the parameters drop when the body ends, its value
+        // outliving them; the value's temporaries drop there too, and the
+        // value itself unless the body returns it (not `-> Unit`, not an
+        // entry point's statement tail, D43).
+        // §9.1: a single-statement assignment body is discarded exactly when
+        // check_block discards the body block's assignment tail.
+        let body_discarded = self.discard_body_tail(source_body, body_tail_discards, body_tail_is_statement) != 0
+        let body_value = if self.ast.kind(source_body) == NodeKind.NK_BLOCK: self.ast.get_data2(source_body) else: source_body
+        self.note_statement_temporary_drops(body_value, body_expected_ret != self.ty_void as i32 and not body_tail_is_statement and not body_discarded, false)
+        // A discarded tail (an assignment under D43's inferred `Unit`, an
+        // entry point's) is no value: nothing of it outlives the drops.
+        let body_views: Vec[i32] = Vec.new()
+        if body_value != 0 and body_expected_ret != self.ty_void as i32 and not body_discarded and not self.tail_value_discarded(body_value) and self.expr_views_global(body_value):
+            body_views.push(body_value)
+        self.note_scope_exit_drops(source_body, GLOBAL_SITE_SCOPE_DROP, self.current_fn_bind_start, body_views, false)
+        self.current_fn_bind_start = saved_fn_bind_start
         self.body_tail_block = saved_body_tail_block
         self.body_tail_holder = saved_body_tail_holder
         self.body_tail_discards = saved_body_tail_discards
         self.body_tail_is_statement = saved_body_tail_is_statement
-        // §9.1: a single-statement assignment body is discarded exactly when
-        // check_block discards the body block's assignment tail.
-        let body_ty = if self.discard_body_tail(source_body, body_tail_discards, body_tail_is_statement) != 0: self.ty_void else: checked_body_ty
+        let body_ty = if body_discarded: self.ty_void else: checked_body_ty
         self.infer_tail_node = saved_infer_tail
         self.infer_tail_is_closure = saved_infer_closure
         self.stamp_move_site_liveness(body_site_start)
@@ -2786,6 +3810,7 @@ impl Sema:
         self.current_fn_variadic = saved_fn_variadic
         self.fn_param_invocations = saved_invocations
         self.fn_param_many_nodes = saved_many_nodes
+        self.current_effect_body = saved_effect_body
         while self.current_fn_param_syms.len() > 0:
             self.current_fn_param_syms.pop()
             self.current_fn_param_effs.pop()
@@ -2963,7 +3988,12 @@ impl Sema:
         self.current_return_type = ret_tid as TypeId
         let fn_sym = self.lookup_method_fn(impl_type_sym, method_sym)
         self.current_fn_symbol = fn_sym
+        // #1827: the default body is the impl's method: its writes and calls
+        // are that signature's (a dyn call and a direct one run it).
+        let saved_effect_body: i32 = self.current_effect_body
+        self.current_effect_body = sig_idx
         let body_ty = self.check_expr_with_expected(body, ret_tid as TypeId)
+        self.current_effect_body = saved_effect_body
         self.typed_expr_types.insert(body, body_ty as i32)
         if ret_tid != 0 and ret_tid != self.ty_void and body_ty != 0 and body_ty != self.ty_void and body_ty != self.ty_never:
             let _ = self.check_body_explicit_value_results(body, 1, ret_tid, "return type mismatch")
@@ -6411,6 +7441,21 @@ impl Sema:
 
     fn tail_is_discarded(node: i32): node != 0 and self.discarded_tails.contains(node)
 
+    // #1827: whether a tail's value is discarded, through the wrappers a
+    // body's tail may sit in (body_tail_holder_of: a block's tail, `unsafe:`,
+    // `no_suspend`, groupings) — the holder's tail is what discard_body_tail
+    // recorded. A discarded tail views nothing past the scope's drops.
+    fn tail_value_discarded(node: i32) -> bool:
+        var cur = node
+        while cur != 0:
+            if self.tail_is_discarded(cur):
+                return true
+            let kind = self.ast.kind(cur)
+            cur = if kind == NodeKind.NK_BLOCK: self.ast.get_data2(cur)
+                else if kind == NodeKind.NK_UNSAFE_BLOCK or kind == NodeKind.NK_NO_SUSPEND or kind == NodeKind.NK_GROUPED: self.ast.get_data0(cur)
+                else: 0
+        false
+
     // §9.1 / D73: the node that holds the body's tail. A body block's tail
     // may be a wrapper that yields its own inner tail — `unsafe:` /
     // `unsafe { }`, `no_suspend`, a plain block, through groupings: the
@@ -6635,6 +7680,64 @@ type SemaLaterUse {
 }
 
 impl Copy for SemaLaterUse
+
+// How a borrow row stands at a mutation (borrow_liveness_at): dead for good
+// (its last use is behind the mutation), dead for this mutation only (a
+// loop view whose loop ends right after it), or live — with the use after
+// the mutation, 0 when the view is used inside the mutating expression.
+const BORROW_DEAD: i32 = 0
+const BORROW_DEAD_HERE: i32 = 1
+const BORROW_LIVE: i32 = 2
+
+// #1827: Sema.global_calls chained by caller (global_call_index), the
+// bundle build's index for fn_global_effects.
+pub type SemaGlobalCallIndex {
+    head: HashMap[i32, i32],
+    next: Vec[i32],
+}
+
+type SemaBorrowLiveness {
+    state: i32,
+    last_use: i32,
+    loop_view: bool,
+    gen_loop_view: bool,
+}
+
+impl Copy for SemaBorrowLiveness
+
+// #1819: record strides of Sema.global_write_records, global_calls,
+// global_call_targets, global_call_bindings and global_view_call_checks,
+// and the body a callable parameter stands for: GLOBAL_PARAM_BODY + its
+// function's signature index * 32 + the parameter's index. A body is a
+// signature index, -2 - a closure node, a callable parameter's, or a
+// dispatcher's (#1827): GLOBAL_DISPATCH_BODY + its index in
+// Sema.global_dispatchers.
+const GLOBAL_WRITE_STRIDE: i32 = 5
+// What a write record is: a write of the place in the body, or a bundle
+// function's assumed write of a global its bundle exports (#1827).
+const GLOBAL_WRITE_PLACE: i32 = 0
+const GLOBAL_WRITE_BUNDLE: i32 = 1
+const GLOBAL_CALL_STRIDE: i32 = 8
+// What a kept call site is (#1827): a call, or an implicit drop (§2.4) at
+// the end of a binding's scope, of a reassigned place's old value, of a
+// statement's temporary, or of a binding at a `return`.
+const GLOBAL_SITE_CALL: i32 = 0
+const GLOBAL_SITE_SCOPE_DROP: i32 = 1
+const GLOBAL_SITE_REASSIGN_DROP: i32 = 2
+const GLOBAL_SITE_TEMP_DROP: i32 = 3
+const GLOBAL_SITE_RETURN_DROP: i32 = 4
+const GLOBAL_TARGET_STRIDE: i32 = 3
+const GLOBAL_BINDING_STRIDE: i32 = 4
+const GLOBAL_VIEW_CHECK_STRIDE: i32 = 6
+const GLOBAL_PARAM_BODY: i32 = 536870912
+const GLOBAL_DISPATCH_BODY: i32 = 1073741824
+const GLOBAL_DISPATCH_STRIDE: i32 = 3
+// A dispatcher runs every impl of a dyn method (a = trait, b = method), or
+// every callable value of a callable type (a = the type).
+const GLOBAL_DISPATCH_DYN: i32 = 1
+const GLOBAL_DISPATCH_CALLABLE: i32 = 2
+// ... or every Drop impl the drop of a type runs (a = the type).
+const GLOBAL_DISPATCH_DROP: i32 = 3
 
 impl Sema:
     fn int_literal_i64_value(node: i32) -> SemaIntLiteralValue:
@@ -8062,8 +9165,12 @@ impl Sema:
                         self.emit_error("cannot use unsafe fn where a safe function type is expected; mark the target type 'unsafe fn' or wrap the contract in a safe function", node)
                         return 0
                     self.typed_expr_types.insert(node, expected as i32)
+                    self.fn_value_ident_sigs.insert(node, sig_idx)
+                    self.note_callable_value(sig_idx, expected as i32)
                     return expected as i32
             self.typed_expr_types.insert(node, fn_tid)
+            self.fn_value_ident_sigs.insert(node, sig_idx)
+            self.note_callable_value(sig_idx, fn_tid)
             return fn_tid
         if (sig_idx >= 0 or self.generic_fn_node_for_symbol(sym) != 0) and self.symbol_visible_from_current(sym) == 0:
             self.emit_private_symbol_error(sym, node)
@@ -9358,6 +10465,12 @@ impl Sema:
             self.emit_error("selected unary operator cannot accept the exact operand type", operand_node)
             return 0
         self.operator_method_calls.insert(node, candidate.fn_sym)
+        // #1819: the operator is a call of its method.
+        let args: Vec[i32] = Vec.new()
+        let by_place: Vec[bool] = Vec.new()
+        args.push(operand_node)
+        by_place.push(self.type_takes_place(expected_operand))
+        self.note_call_global_effects(node, candidate.sig, 0, 0, false, args, by_place)
         self.sig_return_type(candidate.sig)
 
     mut fn check_binary_operator_method(node: i32, op: i32, lhs: i32, rhs: i32) -> i32:
@@ -9423,6 +10536,14 @@ impl Sema:
                 return 0
         self.operator_method_calls.insert(node, selected.fn_sym)
         self.operator_method_reversed.insert(node, reversed)
+        // #1819: the operator is a call of its method.
+        let args: Vec[i32] = Vec.new()
+        let by_place: Vec[bool] = Vec.new()
+        args.push(selected_lhs_node)
+        args.push(selected_rhs_node)
+        by_place.push(self.type_takes_place(expected_lhs))
+        by_place.push(self.type_takes_place(expected_rhs))
+        self.note_call_global_effects(node, selected.sig, 0, 0, false, args, by_place)
         ret
 
     // For comparison, a `&str` behaves like the `str` it points at (string value
@@ -10403,6 +11524,8 @@ impl Sema:
             if stmt_kind == NodeKind.NK_RETURN or stmt_kind == NodeKind.NK_BREAK or stmt_kind == NodeKind.NK_CONTINUE or stmt_kind == NodeKind.NK_GOTO or (stmt_ty == self.ty_never and self.stmt_starts_reachable_region(stmt) == 0):
                 block_diverged = 1
             self.check_task_statement_disposition(stmt)
+            // #1827 (§2.4): the statement's temporaries drop at its end.
+            self.note_statement_temporary_drops(stmt, false, true)
             self.expire_dead_borrows_in_block(extra_start, stmt_count, i + 1, tail)
 
         var result: TypeId = if tail == 0 and last_stmt_ty == self.ty_never: self.ty_never else: self.ty_void
@@ -10497,6 +11620,12 @@ impl Sema:
             result = if blk_break_ty != 0: blk_break_ty as TypeId else: self.ty_void
         if block_label != 0:
             self.pop_label_frame()
+        // #1827 (§2.4): the drops at this block's end, its tail's value
+        // outliving them; nothing is used after a function's last block.
+        let tail_views: Vec[i32] = Vec.new()
+        if tail != 0 and not self.tail_value_discarded(tail) and self.expr_views_global(tail):
+            tail_views.push(tail)
+        self.note_scope_exit_drops(node, GLOBAL_SITE_SCOPE_DROP, block_scope_start, tail_views, node != self.body_tail_block)
         self.check_unused_task_bindings_since(block_scope_start)
         self.pop_scope()
         if result != 0 and result != self.ty_void:
@@ -12307,6 +13436,12 @@ impl Sema:
         let value = self.ast.get_data0(node)
         if value != 0:
             let val_type = if self.current_return_type != 0: self.check_expr_with_owned_demand(value, self.current_return_type) else: self.check_expr(value)
+            // #1827 (§2.4): the return drops every binding of the body, and
+            // the returned value outlives them.
+            if self.expr_views_global(value):
+                let returned: Vec[i32] = Vec.new()
+                returned.push(value)
+                self.note_scope_exit_drops(node, GLOBAL_SITE_RETURN_DROP, self.current_fn_bind_start, returned, false)
             // Record the return value's type at this single choke point so
             // return-type inference (body_return_type_info) sees it regardless
             // of the value's node kind. check_expr types bool literals and
@@ -12452,7 +13587,7 @@ impl Sema:
             if lhs_kind == PlaceKind.PK_NotPlace:
                 self.emit_warning("cannot assign to a non-place expression", node)
             else if lhs_mut_state == PlaceMut.PM_ReadOnly or lhs_via_ro_ref != 0:
-                self.emit_error("cannot assign through a read-only place (e.g., dereferenced &T or *const T) (§15.10)", node)
+                self.emit_read_only_place_assign(base_expr, node)
 
             self.reject_mutation_through_view_binding(self.place_root_sym(base_expr), node)
 
@@ -12500,6 +13635,9 @@ impl Sema:
         // If assignment target's root is a parameter, record EFF_WRITE
         self.note_place_effect(target, EFF_WRITE)
         self.record_global_place_write(target, node)
+        // #1827 (§2.4): the assignment drops the place's old value first.
+        let reassign_views: Vec[i32] = Vec.new()
+        self.note_drop_global_effects(node, node, GLOBAL_SITE_REASSIGN_DROP, self.place_root_sym(target), target_type as i32, reassign_views, true)
 
         // Check mutability
         if self.ast.kind(target) == NodeKind.NK_IDENT:
@@ -12537,7 +13675,7 @@ impl Sema:
                 else:
                     self.emit_warning("cannot assign to a non-place expression", node)
             else if lhs_mut_state == PlaceMut.PM_ReadOnly:
-                self.emit_error("cannot assign through a read-only place (e.g., dereferenced &T or *const T) (§15.10)", node)
+                self.emit_read_only_place_assign(target, node)
             // docs/completed/mut.md Rev 8 §15.17 — mutation through a view-bound
             // for-loop variable (e.g., `for u in xs.iter(): u.age += 1`).
             self.reject_mutation_through_view_binding(self.place_root_sym(target), node)
@@ -12641,6 +13779,23 @@ impl Sema:
                 return rhs
         lhs
 
+    // #1819: a `for` over an Iter[T] type calls its `next()` each time round
+    // (§13.5); a generic one's call is noted by demand_generic_iter_next.
+    mut fn note_iter_next_global_effects(iter_type: i32, iterable: i32, node: i32):
+        if iter_type == 0 or self.get_type_kind(self.resolve_alias(iter_type as TypeId)) == TypeKind.TY_GENERIC_INST:
+            return
+        let owner_sym = self.method_owner_symbol_for_type(self.resolve_alias(iter_type as TypeId) as i32)
+        let next_sym = self.pool_lookup_symbol("next")
+        if owner_sym == 0 or next_sym <= 0:
+            return
+        let sig = self.lookup_method_sig(owner_sym, next_sym)
+        if sig < 0:
+            return
+        let no_args: Vec[i32] = Vec.new()
+        let no_places: Vec[bool] = Vec.new()
+        let mode = self.sig_receiver_mode(sig)
+        self.note_call_global_effects(node, sig, 1, iterable, mode == ReceiverMode.Read or mode == ReceiverMode.Mut, no_args, no_places)
+
     // #912: an iteration desugar over a generic iterator IS a next() call,
     // but no spelled call ever demands the specialization. Register it via
     // the ordinary generic-method-call machinery, keyed so the lowering can
@@ -12721,6 +13876,7 @@ impl Sema:
             // no spelled call ever demands the specialization — register it here,
             // keyed by the for node, so MIR dispatches the concrete next().
             self.demand_generic_iter_next(iter_type, iterable, node)
+            self.note_iter_next_global_effects(iter_type as i32, iterable, node)
 
         // §13 implicit iteration: `for x in vec` borrows the collection (the
         // compiler-inserted .iter() form), so no consuming gate applies. Drop-
@@ -12910,6 +14066,11 @@ impl Sema:
         self.gen_for_each_sigs.insert(node, each_sig)
         if each_mono != 0:
             self.gen_for_each_monos.insert(node, each_mono)
+        // #1819: the loop is a call of `each` on the iterable.
+        let no_args: Vec[i32] = Vec.new()
+        let no_places: Vec[bool] = Vec.new()
+        let mode = self.sig_receiver_mode(each_sig)
+        self.note_call_global_effects(node, each_sig, 1, iterable, mode == ReceiverMode.Read or mode == ReceiverMode.Mut, no_args, no_places)
         elem
 
     // The concrete `each` of a generic Gen impl, demanded through the ordinary
@@ -15124,7 +16285,10 @@ impl Sema:
             result_type = self.resolve_contextual_join(match_anchor as i32, &join_expr_nodes, &join_origin_nodes, &arm_types, &join_roles, node, "match") as TypeId
             self.infer_tail_join = saved_infer_join
             self.d32_check_owned_join_arms(result_type as i32, &join_expr_nodes, "match arm")
-        else if stmt_arms_mixed:
+        else if is_infer_tail or stmt_arms_mixed:
+            // D43: a missing arm made this inferred tail a statement above.
+            // Even equal written-arm types cannot supply the absent arm's
+            // value; keeping that type made MIR read an unwritten join temp.
             result_type = self.ty_void
 
         // Exhaustiveness checking for enum and bool subjects.
@@ -15206,6 +16370,10 @@ impl Sema:
     mut fn check_match_exhaustiveness(node: i32, subject_type: i32, extra_start: i32, arm_count: i32, require_exhaustive: i32, warn_partial_statement_match: i32):
         if subject_type == 0:
             return
+        // A match that must be exhaustive is, or this reports it and the
+        // compilation stops: MirLower gives its last arm no failure path.
+        if require_exhaustive != 0:
+            self.exhaustive_matches.insert(node, 1)
         let resolved = self.resolve_alias(subject_type)
         var tk = self.get_type_kind(resolved)
         var enum_resolved = resolved
@@ -15260,12 +16428,23 @@ impl Sema:
                     self.emit_partial_statement_match_warning("partial statement-position match on bool", node)
             return
 
-        // Sealed trait object exhaustiveness
-        if tk == TypeKind.TY_TRAIT_OBJ:
+        // Trait object exhaustiveness (#1860, Eric 2026-09-28 option (a)):
+        // a `@[sealed]` trait's implementor set makes the match exhaustive;
+        // a non-sealed trait's implementors are open, so it needs a `_` arm.
+        // The subject is the object through its reference (`&dyn T`).
+        let obj_shape = self.exh_shape_type(subject_type)
+        if self.get_type_kind(obj_shape as TypeId) == TypeKind.TY_TRAIT_OBJ:
             if require_exhaustive == 0 and warn_partial_statement_match == 0:
                 return
-            let trait_sym = self.get_type_d0(resolved)
-            if self.sealed_traits.contains(trait_sym) and self.sealed_impl_counts.contains(trait_sym):
+            let trait_sym = self.get_type_d0(obj_shape as TypeId)
+            if not self.sealed_traits.contains(trait_sym):
+                let trait_name: str = with_str_clone_ref(self.pool_resolve(trait_sym))
+                if require_exhaustive != 0:
+                    self.emit_error_with_help("non-exhaustive match on `dyn " ++ trait_name ++ "`: `" ++ trait_name ++ "` is not @[sealed], so its implementors are open", node, "add a `_` arm")
+                else:
+                    self.emit_partial_statement_match_warning("partial statement-position match on `dyn " ++ trait_name ++ "`: the trait is not @[sealed]", node)
+                return
+            if self.sealed_impl_counts.contains(trait_sym):
                 let si_count: i32 = self.sealed_impl_counts.get(trait_sym).unwrap()
                 let si_start = self.sealed_impl_starts.get(trait_sym).unwrap()
                 // Check that each implementor is covered by an arm
@@ -16668,6 +17847,17 @@ impl Sema:
             return self.pool_lookup_symbol(text.slice((dot + 1) as i64, text.len() as i64))
         variant_name
 
+    // A read-only place: a `&T`'s pointee, a `*const T`. A downcast binding
+    // (`c: Circle` over a `&dyn T`, #1860) is a view of the object; With has
+    // no `&mut T` (§15.1), so the help names where mutation goes.
+    mut fn emit_read_only_place_assign(place_expr: i32, node: i32):
+        let msg = "cannot assign through a read-only place (e.g., dereferenced &T or *const T) (§15.10)"
+        let root = self.place_root_sym(place_expr)
+        if root != 0 and self.dyn_downcast_binding_syms.contains(root):
+            self.emit_error_with_help(msg, node, "`" ++ self.pool_resolve(root) ++ "` is a view of the trait object its downcast pattern matched; With has no `&mut T` (§15.1): mutate through the trait's `mut fn` methods on the object's place")
+            return
+        self.emit_error(msg, node)
+
     fn pattern_subject_shape_type(subject_type: i32) -> i32:
         if subject_type == 0:
             return 0
@@ -16843,21 +18033,33 @@ impl Sema:
         if kind == NodeKind.NK_PAT_TYPED_BIND:
             let bind_sym = self.ast.get_data0(node)
             let type_sym = self.ast.get_data1(node)
-            // A type-annotated binding pattern `name: Type` is a dynamic
-            // downcast — only meaningful when the subject is a trait object.
-            // On a concrete subject (e.g. an i32 variant payload) it has no
-            // runtime meaning and used to reach the dyn-vtable-compare lowering
-            // with a null trait, crashing at runtime (#663). Reject it loudly.
+            // A typed binding pattern `name: Type` downcasts a trait object
+            // seen through a reference (Eric, 2026-09-28, option (a), #1860):
+            // on a `&dyn T` subject it binds `name: &Type`, a view of the
+            // object. A concrete subject has no runtime meaning (#663); a
+            // by-value dyn is no subject (#1852, owned matching waits on
+            // #724); a type that does not implement the trait never matches.
             let tb_subject_resolved = self.resolve_alias(subject_type as TypeId)
-            if subject_type != 0 and self.get_type_kind(tb_subject_resolved) != TypeKind.TY_TRAIT_OBJ:
+            let tb_ref_mut = self.pattern_subject_ref_mutability(subject_type)
+            let tb_object = if tb_ref_mut >= 0: self.resolve_alias(self.get_type_d0(tb_subject_resolved) as TypeId) else: tb_subject_resolved
+            if subject_type != 0 and self.get_type_kind(tb_object) != TypeKind.TY_TRAIT_OBJ:
                 self.emit_error("type-annotated binding pattern `name: Type` is only valid to downcast a trait object; bind the value with `name` instead", node)
                 return
-            var concrete_type = 0
-            concrete_type = self.lookup_named_type_visible(type_sym)
-            if concrete_type != 0:
-                self.scope_put_at(bind_sym, concrete_type, self.pattern_bind_mut, node)
-            else:
-                self.scope_put_at(bind_sym, subject_type, self.pattern_bind_mut, node)
+            if subject_type != 0 and tb_ref_mut < 0:
+                self.emit_error_with_help("a typed binding pattern `name: Type` downcasts a trait object through a reference; this subject is a `dyn` value", node, "match on `&dyn T`: the object's place, a `&dyn T` parameter, or a `Box[dyn T]`'s `.as_ref()`")
+                return
+            let concrete_type = self.lookup_named_type_visible(type_sym)
+            if concrete_type == 0:
+                self.emit_error(self.unknown_type_message(type_sym), node)
+                return
+            let tb_trait_sym = self.get_type_d0(tb_object)
+            if self.select_trait_impl(type_sym, tb_trait_sym) == 0:
+                self.emit_error("type '" ++ self.pool_resolve(type_sym) ++ "' does not implement trait '" ++ self.pool_resolve(tb_trait_sym) ++ "'; a downcast pattern names an implementor", node)
+                return
+            let tb_view_ty = self.ensure_exact_type(TypeKind.TY_REF, concrete_type, tb_ref_mut, 0) as i32
+            self.scope_put_at(bind_sym, tb_view_ty, self.pattern_bind_mut, node)
+            self.dyn_downcast_binding_types.insert(node, tb_view_ty)
+            self.dyn_downcast_binding_syms.insert(bind_sym, 1)
             return
 
         if kind == NodeKind.NK_PAT_VARIANT or kind == NodeKind.NK_PAT_ENUM_SHORTHAND:
@@ -17486,6 +18688,8 @@ impl Sema:
                 if self.pool_resolve(p_sym).starts_with("__partial_arg_"):
                     self.emit_error("placeholder partial application does not support named arguments", node)
                     break
+        for cpi in 0..param_count:
+            self.refuse_dyn_by_value_params(self.ast.get_extra(extra_start + cpi * 2 + 1), true)
         let outer_count = self.bind_names.len() as i32
         let saved_capture_sig_idx: i32 = self.current_fn_sig_idx
         // A closure has its own frame: `va_start()` in it would start no list
@@ -17522,6 +18726,10 @@ impl Sema:
                 self.current_fn_param_origins.push(0)
                 self.current_fn_param_view_nodes.push(0)
         self.current_fn_sig_idx = if closure_capture_syms.len() > 0: 0 else: saved_capture_sig_idx
+        // #1819: the body's writes and calls are the closure's: they happen
+        // when it runs (note_call_global_effects).
+        let saved_effect_body: i32 = self.current_effect_body
+        self.current_effect_body = -2 - node
 
         var expected_fn_tid = 0
         if self.has_expected_type != 0 and self.expected_expr_type != 0:
@@ -17542,6 +18750,9 @@ impl Sema:
         let saved_borrow_len = self.borrow_kinds.len() as i32
 
         self.push_scope()
+        // #1827: a `return` in the closure drops the closure's bindings.
+        let saved_closure_bind_start: i32 = self.current_fn_bind_start
+        self.current_fn_bind_start = self.bind_names.len() as i32
         // The parameter types are collected first and written to type_extra
         // after the loop: resolving an annotation can itself append to
         // type_extra (a new generic instance records its arguments there), and
@@ -17644,6 +18855,14 @@ impl Sema:
         let body_ty = if body_discarded: self.ty_void else: checked_body_ty
         if body_discarded:
             self.typed_expr_types.insert(body, self.ty_void as i32)
+        // #1827 (§2.4): the closure's parameters and its value's temporaries
+        // drop when it returns; its value outlives them unless discarded.
+        let closure_value = if self.ast.kind(body) == NodeKind.NK_BLOCK: self.ast.get_data2(body) else: body
+        self.note_statement_temporary_drops(closure_value, body_ty != self.ty_void, false)
+        let closure_views: Vec[i32] = Vec.new()
+        if closure_value != 0 and body_ty != self.ty_void and not body_discarded and not self.tail_value_discarded(closure_value) and self.expr_views_global(closure_value):
+            closure_views.push(closure_value)
+        self.note_scope_exit_drops(body, GLOBAL_SITE_SCOPE_DROP, self.current_fn_bind_start, closure_views, false)
         self.record_returned_tail_reads(body, if expected_ret_ty != 0: expected_ret_ty else: body_ty as i32, body_ty as i32)
         self.infer_tail_node = saved_infer_tail
         self.infer_tail_is_closure = saved_infer_closure
@@ -17748,6 +18967,8 @@ impl Sema:
             self.current_fn_param_view_nodes.push(saved_capture_view_nodes[i])
         self.current_fn_sig_idx = saved_capture_sig_idx
         self.current_fn_variadic = saved_capture_fn_variadic
+        self.current_effect_body = saved_effect_body
+        self.current_fn_bind_start = saved_closure_bind_start
 
         // Restore borrow state — discard borrows created inside closure body.
         while self.borrow_kinds.len() as i32 > saved_borrow_len:
@@ -17859,6 +19080,8 @@ impl Sema:
         let closure_kind = if expected_extern_fn != 0: TypeKind.TY_EXTERN_FN else: TypeKind.TY_FN
         let closure_ty = self.add_type(closure_kind, te_start, param_count, closure_ret_ty) as i32
         self.typed_expr_types.insert(node, closure_ty)
+        // #1827: a callable value a call through its type may run.
+        self.note_callable_value(-2 - node, closure_ty)
         closure_ty
 
     // A closure literal with an unannotated parameter, passed to a generic
@@ -18971,6 +20194,24 @@ impl Sema:
             let eph_arg_node = if has_resolved != 0: self.get_resolved_call_arg(node, ai) else: self.ast.get_extra(extra_start + ai)
             self.check_ephemeral_task_arg_escape(eph_arg_node, expected_ty, 0, 0, param_i)
 
+        // #1819: a call of a closure binding runs that closure's body, and a
+        // call of a callable parameter whatever closure a caller binds to it
+        // (callable_param_body); a call through any other callable value — a
+        // field, an element, a call's result — runs any callable value of its
+        // type (callable_type_body, #1827).
+        let global_args: Vec[i32] = Vec.new()
+        let global_by_place: Vec[bool] = Vec.new()
+        for gai in 0..arg_count:
+            global_args.push(if has_resolved != 0: self.get_resolved_call_arg(node, gai) else: self.ast.get_extra(extra_start + gai))
+            global_by_place.push(self.type_takes_place(self.fn_type_param_type(fn_tid, gai + param_offset)))
+        let callee_expr = self.ast.get_data0(node)
+        var called_body = if closure_node > 0: -2 - closure_node
+            else if self.ast.kind(callee_expr) == NodeKind.NK_IDENT: self.callable_param_body(self.ast.get_data0(callee_expr))
+            else: -1
+        if called_body == -1:
+            called_body = self.callable_type_body(fn_tid)
+        self.note_call_global_effects(node, called_body, param_offset, 0, false, global_args, global_by_place)
+
         if closure_node > 0:
             let capture_count = self.closure_capture_summary_count(closure_node)
             var closure_view_deps: Vec[i32] = Vec.new()
@@ -19241,6 +20482,7 @@ impl Sema:
         self.qualified_extension_call_nodes.insert(node, 1)
         self.propagate_method_call_param_effects(node, sig_idx, 0, 0, extra_start, arg_count, 0)
         self.record_call_view_origins(node, sig_idx, 0, 0, extra_start, arg_count, 0)
+        self.note_sig_call_global_effects(node, sig_idx, 0, 0, extra_start, arg_count, 0)
         let ret = self.sig_return_type(sig_idx)
         self.typed_expr_types.insert(node, ret)
         ret
@@ -19995,6 +21237,7 @@ impl Sema:
                 self.check_mut_slice_call_exclusivity(sc_mut_args, sc_all_args)
             self.check_dyn_trait_call_compat(fn_sym, resolved_extra_start, arg_types, resolved_arg_count, param_offset)
             self.record_call_view_origins(node, sig_idx, param_offset, 0, resolved_extra_start, resolved_arg_count, has_resolved)
+            self.note_sig_call_global_effects(node, sig_idx, param_offset, 0, resolved_extra_start, resolved_arg_count, has_resolved)
             self.record_generator_call_ref_origins(node, sig_idx, param_offset, 0, resolved_extra_start, resolved_arg_count, has_resolved)
             self.typed_expr_types.insert(node, ret)
             return ret
@@ -20557,7 +21800,20 @@ impl Sema:
                 continue
 
             let arg_ty = arg_types[ai]
-            let concrete_sym = self.dyn_arg_concrete_type_symbol(arg_ty)
+            // An argument that already is this parameter's trait object (a
+            // `Box[dyn T]` for a `Box[dyn T]`, a `&dyn T` for a `&dyn T`)
+            // passes as itself; for a `Box[dyn T]` parameter the implementor
+            // is the boxed value, never the Box. Every such argument was
+            // refused: "type 'Box' does not implement trait 'T'", "argument
+            // cannot be converted to dyn trait object" (#1854).
+            let param_is_box = self.ast.kind(p_type_node) == NodeKind.NK_TYPE_GENERIC
+            let arg_box_payload = self.std_box_payload_type(arg_ty)
+            let arg_object = if param_is_box: arg_box_payload else: self.ref_pointee_type(arg_ty)
+            if arg_object != 0 and self.get_type_kind(self.resolve_alias(arg_object)) == TypeKind.TY_TRAIT_OBJ:
+                if self.dyn_trait_symbol_for_type(arg_object) == trait_sym:
+                    continue
+            let impl_ty = if param_is_box and arg_box_payload != 0: arg_box_payload else: arg_ty
+            let concrete_sym = self.dyn_arg_concrete_type_symbol(impl_ty)
             if concrete_sym == 0:
                 self.emit_error("argument cannot be converted to dyn trait object", self.ast.get_extra(call_extra_start + ai))
                 continue
@@ -20782,6 +22038,13 @@ impl Sema:
                 self.facade_check_callback_arg(fn_sym, ai, actual_ty, arg_node)
         if slice_mut_args.len() > 0:
             self.check_mut_slice_call_exclusivity(slice_mut_args, arg_nodes)
+        // #1819: the specialization is the body the call runs.
+        let args: Vec[i32] = Vec.new()
+        let by_place: Vec[bool] = Vec.new()
+        for ai in 0..arg_count:
+            args.push(if ai < arg_nodes.len() as i32: arg_nodes[ai] else: 0)
+            by_place.push(ai < param_count and self.type_takes_place(self.sig_param_type(sig_idx, ai)))
+        self.note_call_global_effects(call_node, sig_idx, 0, 0, false, args, by_place)
 
     mut fn check_generic_call(fn_sym: i32, fn_node: i32, arg_types: &Vec[i32], arg_nodes: &Vec[i32], arg_count: i32, call_node: i32) -> i32:
         let meta = self.ast.find_fn_meta(fn_node)
@@ -22282,76 +23545,84 @@ impl ConcreteSubst:
 // semantic dispatch. Codegen then performs only a keyed lookup.
 impl Sema:
     mut fn register_generic_drop_specializations():
-        let drop_method = self.pool_lookup_symbol("drop")
         let type_count = self.type_kinds.len() as i32
         for tid in 1..type_count:
             let resolved = self.resolve_alias(tid as TypeId) as i32
             if resolved != tid or self.get_type_kind(resolved as TypeId) != TypeKind.TY_GENERIC_INST:
                 continue
-            if self.concrete_drop_sigs.contains(resolved):
+            self.ensure_generic_drop_specialization(resolved)
+
+    // The Drop.drop body of concrete generic type `resolved`, specialized
+    // and checked on first use (a drop has no call node to demand it); -1
+    // when no Drop impl applies. #1827 demands it when Sema judges a drop
+    // of the type (push_drop_glue_bodies); MIR lowering for every type.
+    mut fn ensure_generic_drop_specialization(resolved: i32) -> i32:
+        if self.concrete_drop_sigs.contains(resolved):
+            let known: i32 = self.concrete_drop_sigs.get(resolved).unwrap()
+            return known
+        let drop_method = self.pool_lookup_symbol("drop")
+        var method_fn = 0
+        var method_node = 0
+        var matched_subst_names: Vec[i32] = Vec.new()
+        var matched_subst_types: Vec[i32] = Vec.new()
+        for di in 0..self.ast.decl_count():
+            if self.decl_is_lazy_skipped(di):
                 continue
-
-            var method_fn = 0
-            var method_node = 0
-            var matched_subst_names: Vec[i32] = Vec.new()
-            var matched_subst_types: Vec[i32] = Vec.new()
-            for di in 0..self.ast.decl_count():
-                if self.decl_is_lazy_skipped(di):
-                    continue
-                let impl_node = self.ast.get_decl(di)
-                if self.ast.kind(impl_node) != NodeKind.NK_IMPL_DECL or self.ast.get_data2(impl_node) != self.syms.drop:
-                    continue
-                var target = self.impl_target_match(impl_node, resolved)
-                if target.ok == 0:
-                    continue
-                let candidate_node = self.impl_decl_method_node(impl_node, drop_method)
-                if candidate_node == 0:
-                    sema_phase_bug(f"BUG: applicable Drop impl has no drop method for type {resolved}")
-                let candidate_fn = self.fn_decl_semantic_symbol_at(candidate_node, self.ast.get_data0(candidate_node), self.find_decl_index(candidate_node))
-                if method_fn != 0 and method_fn != candidate_fn:
-                    sema_phase_bug(f"BUG: ambiguous Drop impls for concrete generic type {resolved}")
-                method_fn = candidate_fn
-                method_node = candidate_node
-                matched_subst_names = move target.subst_names
-                matched_subst_types = move target.subst_types
-
-            if method_fn == 0:
+            let impl_node = self.ast.get_decl(di)
+            if self.ast.kind(impl_node) != NodeKind.NK_IMPL_DECL or self.ast.get_data2(impl_node) != self.syms.drop:
                 continue
-            if method_node == 0:
-                sema_phase_bug(f"BUG: Drop.drop declaration is missing for concrete generic type {resolved}")
+            var target = self.impl_target_match(impl_node, resolved)
+            if target.ok == 0:
+                continue
+            let candidate_node = self.impl_decl_method_node(impl_node, drop_method)
+            if candidate_node == 0:
+                sema_phase_bug(f"BUG: applicable Drop impl has no drop method for type {resolved}")
+            let candidate_fn = self.fn_decl_semantic_symbol_at(candidate_node, self.ast.get_data0(candidate_node), self.find_decl_index(candidate_node))
+            if method_fn != 0 and method_fn != candidate_fn:
+                sema_phase_bug(f"BUG: ambiguous Drop impls for concrete generic type {resolved}")
+            method_fn = candidate_fn
+            method_node = candidate_node
+            matched_subst_names = move target.subst_names
+            matched_subst_types = move target.subst_types
 
-            var subst = ConcreteSubst.init()
-            for si in 0..matched_subst_names.len() as i32:
-                subst.push(matched_subst_names[si], matched_subst_types[si])
+        if method_fn == 0:
+            return -1
+        if method_node == 0:
+            sema_phase_bug(f"BUG: Drop.drop declaration is missing for concrete generic type {resolved}")
 
-            let owner_sym = self.get_generic_inst_base(resolved)
-            if self.type_decl_nodes.contains(owner_sym):
-                let owner_decl = self.type_decl_nodes.get(owner_sym).unwrap()
-                var tp_pos = self.type_decl_tp_start(owner_decl)
-                let owner_tp_count = self.type_decl_tp_count(owner_decl)
-                if owner_tp_count != self.get_generic_inst_arg_count(resolved):
-                    sema_phase_bug(f"BUG: generic Drop owner arity mismatch for type {resolved}")
-                for ti in 0..owner_tp_count:
-                    let tp_sym = self.ast.get_extra(tp_pos)
-                    let bound_count = self.ast.get_extra(tp_pos + 1)
-                    subst.push(tp_sym, self.get_generic_inst_arg(resolved, ti))
-                    tp_pos = tp_pos + 2 + bound_count
-            subst.push(self.syms.self_type, resolved)
+        var subst = ConcreteSubst.init()
+        for si in 0..matched_subst_names.len() as i32:
+            subst.push(matched_subst_names[si], matched_subst_types[si])
 
-            var mono_text = f"{self.pool_resolve(method_fn)}__receiver__{resolved}"
-            for ai in 0..self.get_generic_inst_arg_count(resolved):
-                mono_text = f"{mono_text}_{self.get_generic_inst_arg(resolved, ai)}"
-            let mono_sym = self.pool_intern(mono_text)
-            if with_getenv_str("WITH_DEBUG_SUBST").len() > 0:
-                with_eprint(f"[gdrop] tid={resolved} base={self.pool_resolve(self.get_generic_inst_base(resolved))} method_fn={self.pool_resolve(method_fn)} node={method_node} mono={mono_text}")
-            var sig_idx = self.get_sig(mono_sym)
-            if sig_idx < 0:
-                let concrete_params: Vec[i32] = Vec.new()
-                sig_idx = self.check_fn_body_concrete(method_node, subst.names, subst.types, mono_sym, concrete_params)
-            if sig_idx < 0:
-                sema_phase_bug(f"BUG: failed to specialize Drop.drop for concrete generic type {resolved}")
-            self.concrete_drop_sigs.insert(resolved, sig_idx)
-            self.concrete_drop_mono_syms.insert(resolved, mono_sym)
+        let owner_sym = self.get_generic_inst_base(resolved)
+        if self.type_decl_nodes.contains(owner_sym):
+            let owner_decl = self.type_decl_nodes.get(owner_sym).unwrap()
+            var tp_pos = self.type_decl_tp_start(owner_decl)
+            let owner_tp_count = self.type_decl_tp_count(owner_decl)
+            if owner_tp_count != self.get_generic_inst_arg_count(resolved):
+                sema_phase_bug(f"BUG: generic Drop owner arity mismatch for type {resolved}")
+            for ti in 0..owner_tp_count:
+                let tp_sym = self.ast.get_extra(tp_pos)
+                let bound_count = self.ast.get_extra(tp_pos + 1)
+                subst.push(tp_sym, self.get_generic_inst_arg(resolved, ti))
+                tp_pos = tp_pos + 2 + bound_count
+        subst.push(self.syms.self_type, resolved)
+
+        var mono_text = f"{self.pool_resolve(method_fn)}__receiver__{resolved}"
+        for ai in 0..self.get_generic_inst_arg_count(resolved):
+            mono_text = f"{mono_text}_{self.get_generic_inst_arg(resolved, ai)}"
+        let mono_sym = self.pool_intern(mono_text)
+        if with_getenv_str("WITH_DEBUG_SUBST").len() > 0:
+            with_eprint(f"[gdrop] tid={resolved} base={self.pool_resolve(self.get_generic_inst_base(resolved))} method_fn={self.pool_resolve(method_fn)} node={method_node} mono={mono_text}")
+        var sig_idx = self.get_sig(mono_sym)
+        if sig_idx < 0:
+            let concrete_params: Vec[i32] = Vec.new()
+            sig_idx = self.check_fn_body_concrete(method_node, subst.names, subst.types, mono_sym, concrete_params)
+        if sig_idx < 0:
+            sema_phase_bug(f"BUG: failed to specialize Drop.drop for concrete generic type {resolved}")
+        self.concrete_drop_sigs.insert(resolved, sig_idx)
+        self.concrete_drop_mono_syms.insert(resolved, mono_sym)
+        sig_idx
 
     // Autoderef's user-Deref dispatch: specialize deref for the concrete
     // receiver and RECORD the resolution on the base expression node —
@@ -22573,6 +23844,7 @@ impl Sema:
             // identical to effect propagation so Option[&T] retains its concrete
             // collection origin at the caller (D22 Rule 10).
             self.record_call_view_origins(node, concrete_sig, recv_param_offset, receiver, extra_start, arg_count, self.has_resolved_call_args(node))
+            self.note_sig_call_global_effects(node, concrete_sig, recv_param_offset, receiver, extra_start, arg_count, self.has_resolved_call_args(node))
             self.record_generator_call_ref_origins(node, concrete_sig, recv_param_offset, receiver, extra_start, arg_count, self.has_resolved_call_args(node))
         if ret_ty != 0:
             self.typed_expr_types.insert(node, ret_ty)
@@ -24384,6 +25656,40 @@ impl Sema:
                 return 0
         1
 
+    // #1852 (§11.3: `dyn Trait` is unsized): a parameter takes a trait object
+    // borrowed (`&dyn T`) or owned (`Box[dyn T]`). A bare `dyn T` names no
+    // value that can be passed, so it is refused where it is written, with
+    // both spellings; it used to compile and never drop what it was given.
+    // `impl T` is a generic parameter, not a trait object. The parameters of
+    // a fn type inside the declared type are parameters too.
+    mut fn refuse_dyn_by_value_params(type_node: i32, is_param: bool):
+        if type_node == 0:
+            return
+        let kind = self.ast.kind(type_node)
+        if kind == NodeKind.NK_TYPE_TRAIT_OBJ:
+            if is_param and self.ast.get_data1(type_node) != TYPE_TRAIT_OBJECT_IMPL and self.suppress_errors == 0:
+                let text = "dyn " ++ self.pool_resolve(self.ast.get_data0(type_node))
+                var diag = Diagnostic.err(f"a parameter cannot take `{text}` by value: a trait object is unsized (§11.3)", Span { file: self.local_file_id, start: self.ast.get_start(type_node), end: self.ast.get_end(type_node) })
+                diag.set_origin(__FILE__, __FN__, __LINE__ as i32, type_node)
+                diag.add_help(f"borrow it: `&{text}`")
+                diag.add_help(f"or own it: `Box[{text}]`")
+                self.diags.emit(move diag)
+            return
+        if kind == NodeKind.NK_TYPE_FN or kind == NodeKind.NK_TYPE_EXTERN_FN:
+            let fn_extra = self.ast.get_data0(type_node)
+            for pi in 0..self.ast.get_data1(type_node):
+                self.refuse_dyn_by_value_params(self.ast.get_extra(fn_extra + pi), true)
+            self.refuse_dyn_by_value_params(self.ast.get_data2(type_node), false)
+            return
+        if kind == NodeKind.NK_TYPE_REF or kind == NodeKind.NK_TYPE_PTR or kind == NodeKind.NK_TYPE_OPTIONAL or kind == NodeKind.NK_TYPE_SLICE or kind == NodeKind.NK_TYPE_ARRAY:
+            self.refuse_dyn_by_value_params(self.ast.get_data0(type_node), false)
+            return
+        if kind == NodeKind.NK_TYPE_GENERIC or kind == NodeKind.NK_TYPE_TUPLE:
+            let arg_extra = if kind == NodeKind.NK_TYPE_GENERIC: self.ast.get_data1(type_node) else: self.ast.get_data0(type_node)
+            let arg_count = if kind == NodeKind.NK_TYPE_GENERIC: self.ast.get_data2(type_node) else: self.ast.get_data1(type_node)
+            for ai in 0..arg_count:
+                self.refuse_dyn_by_value_params(self.ast.get_extra(arg_extra + ai), false)
+
     fn trait_object_from_type_node(type_node: i32) -> i32:
         if type_node == 0:
             return 0
@@ -24417,6 +25723,22 @@ impl Sema:
             if self.type_symbol_is_std_box(base) != 0 and self.get_generic_inst_arg_count(resolved as i32) == 1:
                 return self.dyn_trait_symbol_for_type(self.get_generic_inst_arg(resolved as i32, 0))
         0
+
+    // The boxed type of a `Box[T]`, else 0.
+    fn std_box_payload_type(tid: i32) -> i32:
+        if tid == 0 or self.type_is_std_box_inst(tid) == 0:
+            return 0
+        self.get_generic_inst_arg(self.resolve_alias(tid) as i32, 0)
+
+    // The pointee of a `&T` or `*T`, else 0.
+    fn ref_pointee_type(tid: i32) -> i32:
+        if tid == 0:
+            return 0
+        let resolved = self.resolve_alias(tid)
+        let tk = self.get_type_kind(resolved)
+        if tk != TypeKind.TY_REF and tk != TypeKind.TY_PTR:
+            return 0
+        self.get_type_d0(resolved)
 
     fn type_is_box_dyn_trait(tid: i32) -> i32:
         if tid == 0:
@@ -24517,6 +25839,9 @@ impl Sema:
                 self.emit_error("consuming dyn trait method requires a Box[dyn Trait] receiver", node)
                 return 0
             self.check_trait_receiver_mode(&info, receiver_expr, node)
+            // #1847: this dyn call consumes its receiver; every other one
+            // observes it (MirLower passes the place, never moves it).
+            self.dyn_consuming_calls.insert(node, 1)
         else:
             self.check_trait_receiver_mode(&info, receiver_expr, node)
 
@@ -24542,6 +25867,17 @@ impl Sema:
         if info.ret_node != 0 and self.ast.kind(info.ret_node) == NodeKind.NK_TYPE_NAMED and self.ast.get_data0(info.ret_node) == self.syms.self_type:
             self.emit_error("dyn trait method return type cannot be Self", node)
             return 0
+        // #1827: a call through the vtable runs one of the method's impls —
+        // any of them in this compilation (global_dispatcher).
+        let dyn_args: Vec[i32] = Vec.new()
+        let dyn_by_place: Vec[bool] = Vec.new()
+        for dai in 0..arg_count:
+            dyn_args.push(self.ast.get_extra(extra_start + dai))
+            let dyn_param_node = if dai + 1 < info.param_count: self.ast.fn_param_type(info.param_start, dai + 1) else: 0
+            dyn_by_place.push(dyn_param_node != 0 and self.ast.kind(dyn_param_node) == NodeKind.NK_TYPE_REF)
+        let dyn_recv_by_place = fn_param_is_move_self(receiver_flags) == 0
+        let dyn_body = self.global_dispatcher(GLOBAL_DISPATCH_DYN, trait_sym, method_sym)
+        self.note_call_global_effects(node, dyn_body, 1, receiver_expr, dyn_recv_by_place, dyn_args, dyn_by_place)
         let ret_ty = self.trait_method_effective_return_type(info.method_flags, info.ret_node)
         if ret_ty != 0:
             self.typed_expr_types.insert(node, ret_ty)
@@ -24684,6 +26020,8 @@ impl Sema:
         if self.fn_decl_nodes.contains(found_fn) or self.generic_fn_node_for_symbol(found_fn) != 0:
             self.emit_no_await_guard_may_suspend_call(node, found_fn)
             self.note_allocating_callee(node, found_fn)
+        // #1819: the impl method is the body the call runs.
+        self.note_sig_call_global_effects(node, self.get_sig(found_fn), 1, expr, extra_start, arg_count, has_resolved_args)
         let ret_ty = self.resolve_type_node_with_subst(found_info.ret_node, recv_type, found_subst_names, found_subst_types)
         if ret_ty != 0:
             self.typed_expr_types.insert(node, ret_ty)
@@ -25138,6 +26476,8 @@ impl Sema:
                     if (mc_recv_tk == TypeKind.TY_INT or mc_recv_tk == TypeKind.TY_FLOAT) and self.int_narrowing_requires_cast(mc_expected as TypeId, mc_arg_ty as TypeId) != 0:
                         self.emit_error("min/max operands must be the same type; use an explicit `as` cast", mc_arg_node)
             if self.method_arg_stores_value(obj_type as i32, field, ai) != 0:
+                // #1827: the container owns it now; it drops it (§2.4).
+                self.global_consumed_args.insert(mc_arg_node, 1)
                 self.check_ephemeral_task_storage(mc_arg_node, "generic container")
                 // Container stores take ownership of their element just like an
                 // owned function parameter. Builtins have no ordinary signature
@@ -25644,6 +26984,7 @@ impl Sema:
                     if mc_subst_ret != 0:
                         self.propagate_method_call_param_effects(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
                         self.record_call_view_origins(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
+                        self.note_sig_call_global_effects(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
                         self.record_generator_call_ref_origins(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
                         return mc_subst_ret
                 // A STATIC call has no receiver param: args pair with params from
@@ -25656,6 +26997,7 @@ impl Sema:
                 // mirrors mc_plain_poff in the #567 type-check loop above.
                 self.propagate_method_call_param_effects(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
                 self.record_call_view_origins(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
+                self.note_sig_call_global_effects(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
                 self.record_generator_call_ref_origins(node, sig_idx, call_param_offset, call_effect_recv, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
                 return mc_ret
 
@@ -26324,6 +27666,7 @@ impl Sema:
                     if eg_arg > 0 and self.expr_is_ephemeral_value(eg_arg) != 0:
                         self.check_ephemeral_task_arg_escape(eg_arg, 0, 0, method_fn_sym, egi)
                 self.propagate_method_call_param_effects(node, sig_idx, 0, 0, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
+                self.note_sig_call_global_effects(node, sig_idx, 0, 0, extra_start, mc_resolved_arg_count, mc_has_resolved_args)
                 return self.sig_return_type(sig_idx)
 
         let builtin_recv_type = if field == self.syms.unwrap or field == self.syms.is_some or field == self.syms.is_none:
@@ -27527,6 +28870,33 @@ impl Sema:
             self.diags.emit(move diag)
             return
 
+    // Whether borrow row `i` is live across a mutation at `err_node` — a
+    // write, or a call that writes (#1819). A view whose final use is
+    // already behind the mutation is dead. This also handles a mutation on
+    // a diverging arm: a lexical use after the enclosing branch is not
+    // reachable from that mutation. A use inside the mutating call itself
+    // remains a conflict because ordinary call checking does not permit the
+    // receiver mutation and an overlapping argument view to coexist. A `for`
+    // binding is read from the iterated place again on the next iteration,
+    // so its borrow lives until the loop ends (#1317) — it is not removed
+    // even when this mutation ends the loop, since other paths may not. A
+    // generator's view (#1734) stays live even when the loop ends right
+    // after the mutation: the stopped generator leaves at its `yield`
+    // through its own scopes and defers, which may read it.
+    fn borrow_liveness_at(i: i32, err_node: i32) -> SemaBorrowLiveness:
+        let ref_sym: i32 = self.borrow_refs[i]
+        let last_use = self.view_last_use(ref_sym, err_node, self.borrow_scope_depths[i])
+        let loop_body_depth = self.for_view_binding_depth(ref_sym)
+        let loop_view = loop_body_depth != 0
+        let gen_loop_view = loop_view and self.for_view_binding_is_gen_loop(ref_sym)
+        var state = BORROW_LIVE
+        if last_use == 0 and not self.view_used_in(err_node, ref_sym):
+            if not loop_view:
+                state = BORROW_DEAD
+            else if not gen_loop_view and self.loop_ends_after_current_stmt(loop_body_depth) != 0:
+                state = BORROW_DEAD_HERE
+        SemaBorrowLiveness { state, last_use, loop_view, gen_loop_view }
+
     mut fn check_mutation_against_views(place_node: i32, err_node: i32):
         let place = self.borrow_root_place(place_node)
         if place == 0:
@@ -27552,37 +28922,22 @@ impl Sema:
             if self.are_borrows_disjoint_paths(path_start, path_count, ex_path_start, ex_path_count) != 0:
                 i = i + 1
                 continue
+            let live = self.borrow_liveness_at(i, err_node)
+            if live.state == BORROW_DEAD:
+                self.remove_borrow_at(i)
+                continue
+            if live.state == BORROW_DEAD_HERE:
+                i = i + 1
+                continue
             let place_name = self.pool_resolve(place)
             let ref_name: str = with_str_clone_ref(self.pool_resolve(ref_sym))
-            let creation_node = self.borrow_creation_nodes[i]
             let binding_node = self.binding_decl_node(ref_sym)
-            let last_use = self.view_last_use(ref_sym, err_node, self.borrow_scope_depths[i])
-            // A view whose final use is already behind this mutation is dead.
-            // This also handles a mutation on a diverging arm: a lexical use
-            // after the enclosing branch is not reachable from that mutation.
-            // A use inside the mutating call itself remains a conflict because
-            // ordinary call checking does not permit the receiver mutation and
-            // an overlapping argument view to coexist. A `for` binding is read
-            // from the iterated place again on the next iteration, so its
-            // borrow lives until the loop ends (#1317) — it is not removed even
-            // when this mutation ends the loop, since other paths may not.
-            let loop_body_depth = self.for_view_binding_depth(ref_sym)
-            let is_loop_view = if loop_body_depth != 0: 1 else: 0
-            // A generator's view (#1734) stays live even when the loop ends
-            // right after the mutation: the stopped generator leaves at its
-            // `yield` through its own scopes and defers, which may read it.
-            let is_gen_loop_view = is_loop_view != 0 and self.for_view_binding_is_gen_loop(ref_sym)
-            if last_use == 0 and not self.view_used_in(err_node, ref_sym):
-                if is_loop_view == 0:
-                    self.remove_borrow_at(i)
-                    continue
-                if not is_gen_loop_view and self.loop_ends_after_current_stmt(loop_body_depth) != 0:
-                    i = i + 1
-                    continue
+            let last_use = live.last_use
+            let is_gen_loop_view = live.gen_loop_view
             let mutation_start = self.ast.get_start(err_node)
             let mutation_end = self.ast.get_end(err_node)
             let diag = Diagnostic.err("cannot mutate `" ++ place_name ++ "` while `" ++ ref_name ++ "` is a live view into it", Span { file: self.local_file_id, start: mutation_start, end: mutation_end })
-            let view_node = if binding_node != 0: binding_node else: creation_node
+            let view_node = if binding_node != 0: binding_node else: self.borrow_creation_nodes[i]
             if view_node != 0:
                 let cr_start = self.ast.get_start(view_node)
                 let cr_end = self.ast.get_end(view_node)
@@ -27594,7 +28949,7 @@ impl Sema:
                 diag.add_label(Span { file: self.local_file_id, start: lu_start, end: lu_end }, "view is used here after the mutation")
             if is_gen_loop_view:
                 diag.add_note("the generator `" ++ ref_name ++ "` is still running while the loop body runs (§13.4); collect the changes and apply them after the loop")
-            else if is_loop_view != 0:
+            else if live.loop_view:
                 diag.add_note("the loop reads `" ++ place_name ++ "` again on its next iteration; collect the changes and apply them after the loop")
             let fixed = self.with_copy_view_fixit(move diag, ref_sym, false)
             // §8, §57: a facade resource that depends on the place says why.
