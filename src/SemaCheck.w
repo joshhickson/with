@@ -419,6 +419,98 @@ impl Sema:
             return false
         self.resolve_alias(self.get_type_d0(target) as TypeId) == self.resolve_alias(self.get_type_d0(self.resolve_alias(ref_ty as TypeId)) as TypeId)
 
+    // §4.5: a distinct type's representation through every distinct layer
+    // (`type B = distinct A`, `type A = distinct str`: str); any other type
+    // is its own.
+    fn distinct_underlying(tid: i32) -> i32:
+        var t = tid
+        var inner = self.unwrap_builtin_arg_distinct(t)
+        var depth = 0
+        while inner != 0 and inner != t and depth < 64:
+            t = inner
+            inner = self.unwrap_builtin_arg_distinct(t)
+            depth += 1
+        t
+
+    // §4.5 (D75): a cast from `src` to `target` relabels the value — into or
+    // out of a distinct type, between two distinct types over one
+    // representation, or to the same type — so the result is the source
+    // value itself under another name.
+    fn cast_relabels_value(src: i32, target: i32) -> bool:
+        src != 0 and target != 0 and self.types_identical(self.distinct_underlying(src), self.distinct_underlying(target))
+
+    // A cast operand naming a place reached through a view — a field of a
+    // borrowed base (D22 §13.6) or a binding that names what's there — is
+    // cast through a reference.
+    fn cast_operand_is_borrowed_place(node: i32) -> bool:
+        var n = node
+        while n != 0 and self.ast.kind(n) == NodeKind.NK_GROUPED:
+            n = self.ast.get_data0(n)
+        if n == 0:
+            return false
+        if self.view_projection_exprs.contains(n):
+            return true
+        self.ast.kind(n) == NodeKind.NK_IDENT and self.scope_has(self.ast.get_data0(n)) != 0 and self.scope_is_view_bound(self.ast.get_data0(n)) != 0
+
+    // §4.5 (D75, #1802): "Casting an owned value into or out of its distinct
+    // type moves it … A cast whose target is a view (`n as &str`), or any
+    // cast through a reference, borrows and yields a view." The target states
+    // the mode, as a parameter's type does; Sema records it in cast_modes and
+    // MirLower materializes it. Before, a cast read its source: `s as Name`
+    // left the buffer with `s` and `n as str` made a second owner.
+    // - a `&T` source relabeled (`r as str`, `r as &Tag`) is the same
+    //   reference, typed `&Target`, with the source's origins. A Copy target
+    //   keeps D22 §6.2: a cast target is an owned demand, met by a copy.
+    // - an owned source cast to a view (`n as &str`, `s as []u8`) borrows
+    //   it, exactly as `&n` does.
+    // - an owned non-Copy source relabeled moves into the result; one that
+    //   names a place reached through a view is cast through a reference.
+    // Other casts (numbers, pointers, discriminants) are value conversions.
+    // Returns the cast's type.
+    mut fn classify_cast_ownership(node: i32, src_node: i32, src_tid: i32, cast_tid: i32) -> i32:
+        let src = self.resolve_alias(src_tid as TypeId) as i32
+        let target = self.resolve_alias(cast_tid as TypeId) as i32
+        let src_kind = self.get_type_kind(src as TypeId)
+        let target_kind = self.get_type_kind(target as TypeId)
+        let target_is_view = target_kind == TypeKind.TY_REF and self.get_type_d1(target as TypeId) == 0
+        let target_value = if target_is_view: self.get_type_d0(target as TypeId) else: target
+        if src_kind == TypeKind.TY_REF:
+            if self.get_type_d1(src as TypeId) != 0 or not self.cast_relabels_value(self.get_type_d0(src as TypeId), target_value):
+                return cast_tid
+            if not target_is_view and self.is_copy(target as TypeId) != 0:
+                return cast_tid
+            self.cast_modes.insert(node, CastMode.REF_RELABEL as i32)
+            self.record_transparent_view_origins(node, src_node)
+            return if target_is_view: cast_tid else: self.ensure_exact_type(TypeKind.TY_REF, cast_tid, 0, 0) as i32
+        if src_kind == TypeKind.TY_PTR or target_kind == TypeKind.TY_PTR:
+            return cast_tid
+        if target_kind == TypeKind.TY_SLICE or target_is_view:
+            if target_is_view and not self.cast_relabels_value(src, target_value):
+                return cast_tid
+            self.record_cast_borrow(node, src_node)
+            return cast_tid
+        if not self.cast_relabels_value(src, target) or self.is_copy(src as TypeId) != 0:
+            return cast_tid
+        if self.cast_operand_is_borrowed_place(src_node):
+            self.record_cast_borrow(node, src_node)
+            return self.ensure_exact_type(TypeKind.TY_REF, cast_tid, 0, 0) as i32
+        self.mark_moved_if_consumed(src_node)
+        self.cast_modes.insert(node, CastMode.MOVE as i32)
+        cast_tid
+
+    // A cast that views its source place borrows it as `&place` does: the
+    // place is a shared borrow and the result's origin. A string literal is
+    // static storage — a view of it has no origin and is no temporary.
+    mut fn record_cast_borrow(node: i32, src_node: i32):
+        self.cast_modes.insert(node, CastMode.BORROW as i32)
+        var literal = src_node
+        while literal != 0 and self.ast.kind(literal) == NodeKind.NK_GROUPED:
+            literal = self.ast.get_data0(literal)
+        if literal != 0 and self.ast.kind(literal) == NodeKind.NK_STRING_LIT:
+            return
+        self.check_borrow_create(src_node, BorrowKind.SHARED, node)
+        self.record_view_producer_origins(node, src_node)
+
     // `&place as *T` is the blessed address-taking spelling; a cast operand
     // spelled with an explicit borrow must not materialize its pointee.
     fn cast_operand_is_explicit_borrow(node: i32) -> i32:
@@ -2364,6 +2456,13 @@ impl Sema:
         let saved_eff_param_direct_effs = sema_clone_i32_vec(&self.current_fn_param_direct_effs)
         let saved_eff_param_origins = sema_clone_i32_vec(&self.current_fn_param_origins)
         let saved_eff_param_view_nodes = sema_clone_i32_vec(&self.current_fn_param_view_nodes)
+        // D63: the invocation counts are this body's. A generic callee's
+        // specialization is checked in the middle of its caller's body, and
+        // reset the caller's counts: `f(); id(1); f()` counted one call.
+        let saved_invocations = move self.fn_param_invocations
+        let saved_many_nodes = move self.fn_param_many_nodes
+        self.fn_param_invocations = sema_new_map_i32_i32()
+        self.fn_param_many_nodes = sema_new_map_i32_i32()
         while self.current_fn_param_syms.len() > 0:
             self.current_fn_param_syms.pop()
             self.current_fn_param_effs.pop()
@@ -2373,7 +2472,6 @@ impl Sema:
         if meta >= 0:
             let eff_ps = self.ast.fn_meta_param_start(meta)
             let eff_pc = self.ast.fn_meta_param_count(meta)
-            self.fn_param_invocations = sema_new_map_i32_i32()
             for pi in 0..eff_pc:
                 self.current_fn_param_syms.push(self.ast.fn_param_name(eff_ps, pi))
                 // §9.5/G2 (D6): a `move self` receiver is CONSUMED by the callee, so
@@ -2648,9 +2746,13 @@ impl Sema:
             // parameter that is only invoked accrues no effect bits, so this
             // sits outside the `eff != 0` guard above.
             if sig_idx >= 0 and pi < self.current_fn_param_syms.len() as i32:
-                let invoke_sym = self.current_fn_param_syms[pi]
-                let invocations = if self.fn_param_invocations.contains(invoke_sym): self.fn_param_invocations.get(invoke_sym).unwrap() else: 0
+                let invoke_sym: i32 = self.current_fn_param_syms[pi]
+                let invocations = self.fn_param_invocations.get(invoke_sym) ?? 0
                 self.set_sig_param_invoke_many(sig_idx, pi, if invocations > 1: 1 else: 0)
+                // §12.4 (D75): `once` is a checked contract.
+                if invocations > 1 and meta >= 0 and fn_param_is_once(self.ast.fn_param_flags(self.ast.fn_meta_param_start(meta), pi)):
+                    let once_name: str = with_str_clone_ref(self.pool_resolve(invoke_sym))
+                    self.emit_error("`" ++ once_name ++ "` is declared `once`, but this body may invoke it more than once — a second call, or a call inside a loop (§12.4)", self.fn_param_many_nodes.get(invoke_sym) ?? node)
 
         if raw_validity_param_sym != 0 and self.fn_symbol_is_unsafe(fn_name) == 0:
             let param_name: str = self.pool_resolve(raw_validity_param_sym)
@@ -2682,6 +2784,8 @@ impl Sema:
         // Restore state
         self.current_fn_sig_idx = saved_eff_sig_idx
         self.current_fn_variadic = saved_fn_variadic
+        self.fn_param_invocations = saved_invocations
+        self.fn_param_many_nodes = saved_many_nodes
         while self.current_fn_param_syms.len() > 0:
             self.current_fn_param_syms.pop()
             self.current_fn_param_effs.pop()
@@ -7221,8 +7325,11 @@ impl Sema:
                     // `T` and turned its value into an address — `r as *const
                     // i32` on `r: &i32`, and the facade's `ud as *const U` for
                     // a scalar userdata, a fault in safe code.
+                    // §4.5 (D75): a view target is no owned demand — `r as
+                    // &Tag` relabels the reference (classify_cast_ownership).
                     let cast_src_resolved = self.resolve_alias(src_tid)
-                    if self.get_type_kind(cast_src_resolved) == TypeKind.TY_REF and self.get_type_d1(cast_src_resolved) == 0 and self.cast_operand_is_explicit_borrow(src_node) == 0 and not self.cast_relabels_reference(cast_src_resolved as i32, cast_tid as i32):
+                    let cast_target_is_ref = self.get_type_kind(self.resolve_alias(cast_tid)) == TypeKind.TY_REF
+                    if self.get_type_kind(cast_src_resolved) == TypeKind.TY_REF and self.get_type_d1(cast_src_resolved) == 0 and not cast_target_is_ref and self.cast_operand_is_explicit_borrow(src_node) == 0 and not self.cast_relabels_reference(cast_src_resolved as i32, cast_tid as i32):
                         let _ = self.record_contextual_copy_adjustment(src_node, self.get_type_d0(cast_src_resolved), src_tid as i32)
             // Store resolved cast type so MIR lowering can read it without
             // calling resolve_type_expr (which would add_type on a shallow-copied Sema).
@@ -7239,6 +7346,10 @@ impl Sema:
                     self.note_raw_pointer_validity_precondition(self.ast.get_data0(node))
                     if self.require_unsafe_operation("raw pointer to safe memory abstraction conversion requires unsafe context", node) == 0:
                         return 0 as TypeId
+                let cast_result = self.classify_cast_ownership(node, src_node, src_tid as i32, cast_tid as i32)
+                if cast_result != cast_tid as i32:
+                    self.typed_expr_types.insert(node, cast_result)
+                    return cast_result as TypeId
             return cast_tid
 
         if kind == NodeKind.NK_PIPELINE:
@@ -11183,6 +11294,12 @@ impl Sema:
                         is_view = true
                 if is_view:
                     out = self.push_unique_i32(move out, cap_sym)
+            return out
+        // §4.5 (D75): a cast that borrows its source place carries the
+        // place's origins recorded at the cast, as `&place` does below.
+        if kind == NodeKind.NK_CAST and (self.cast_modes.get(node) ?? 0) == CastMode.BORROW as i32:
+            for i in 0..self.expr_view_dep_count(node):
+                out = self.push_unique_i32(move out, self.expr_view_dep_at(node, i))
             return out
         if kind == NodeKind.NK_GROUPED or kind == NodeKind.NK_CAST or kind == NodeKind.NK_COMPTIME or kind == NodeKind.NK_UNSAFE_BLOCK or kind == NodeKind.NK_NO_SUSPEND:
             out = self.collect_expr_view_deps(self.ast.get_data0(node), move out)
@@ -17127,15 +17244,52 @@ impl Sema:
                     return 1
         0
 
+    // The declaration a signature was registered from, or 0.
+    fn sig_decl_node(sig_idx: i32) -> i32:
+        if sig_idx < 0 or sig_idx >= self.sig_names.len() as i32:
+            return 0
+        self.fn_decl_nodes.get(self.sig_names[sig_idx]) ?? 0
+
+    // §3.4: a signature whose declaration has no body in this compilation —
+    // a bundle interface (D39) — may do anything its declaration allows.
+    fn sig_is_bodiless(sig_idx: i32) -> bool:
+        let decl = self.sig_decl_node(sig_idx)
+        decl != 0 and self.ast.fn_decl_body_is_interface(decl as NodeId)
+
+    // §12.4 (D75): whether parameter `pi` is declared `once` — the contract
+    // the declaration states and a bundle interface records.
+    fn sig_param_is_once(sig_idx: i32, pi: i32) -> bool:
+        let decl = self.sig_decl_node(sig_idx)
+        if decl == 0:
+            return false
+        let meta = self.ast.find_fn_meta(decl)
+        if meta < 0 or pi < 0 or pi >= self.ast.fn_meta_param_count(meta):
+            return false
+        fn_param_is_once(self.ast.fn_param_flags(self.ast.fn_meta_param_start(meta), pi))
+
+    // §12.4: a callee may invoke parameter `pi` more than once when its body
+    // does (sig_param_invoke_many, forwarding included), or when it has no
+    // body in this compilation and its declaration does not say `once`, or
+    // when it is a facade callback's userdata, which C invokes through the
+    // callback.
+    fn sig_param_may_invoke_many(sig_idx: i32, pi: i32) -> bool:
+        self.sig_param_invoke_many_at(sig_idx, pi) != 0 or (self.sig_is_bodiless(sig_idx) and not self.sig_param_is_once(sig_idx, pi)) or self.sig_param_is_c_invoked_userdata(sig_idx, pi)
+
+    // §16.2b.9: parameter `pi` of a facade callback method's concrete
+    // signature is the userdata C passes back to the callback — invoked, when
+    // it is callable, as often as C calls the callback: any number of times
+    // (facade_note_callback_method_sig).
+    fn sig_param_is_c_invoked_userdata(sig_idx: i32, pi: i32) -> bool:
+        pi >= 0 and (self.facade_c_invoked_userdata.get(sig_idx) ?? -1) == pi
+
     // D63 (§12.4 "The callable type"), checked where a closure literal is
     // handed to a parameter: a non-move closure is a view of this frame and
     // may only reach a callee that neither stores nor returns the parameter
     // (its ESCAPE_VALUE effect says it does — pass `move () => ...`); a
-    // consuming closure is call-once and may only reach a callee whose body
-    // invokes the parameter at most once (proved from the body; a callee
-    // without a body in this compilation — a bundle interface — may invoke
-    // it any number of times and is refused until a `once` annotation
-    // exists, #1604).
+    // consuming closure is call-once and may only reach a callee that
+    // invokes the parameter at most once — proved from the callee's body,
+    // or, across a bundle boundary, declared `once` (D75). A callable
+    // parameter passed on is recorded as a forward (note_callable_forward).
     mut fn check_closure_arg_against_param(arg_node: i32, callee_sym: i32, sig_idx: i32, param_i: i32, call_node: i32):
         if arg_node <= 0 or sig_idx < 0:
             return
@@ -17147,6 +17301,7 @@ impl Sema:
         else if self.ast.kind(arg_node) == NodeKind.NK_IDENT and self.binding_closure_nodes.contains(self.ast.get_data0(arg_node)) and self.scope_has(self.ast.get_data0(arg_node)) != 0:
             closure_node = self.binding_closure_nodes.get(self.ast.get_data0(arg_node)).unwrap()
         if closure_node == 0:
+            self.note_callable_forward(arg_node, callee_sym, sig_idx, param_i)
             return
         if param_i < 0 or param_i >= self.sig_get_param_count(sig_idx):
             return
@@ -17173,6 +17328,7 @@ impl Sema:
     // judged against its callee's final parameter facts.
     mut fn finalize_closure_arg_checks():
         let n = self.deferred_closure_arg_checks.len() as i32
+        let saved_file_id: i32 = self.local_file_id
         var i = 0
         while i + 5 < n:
             let closure_node: i32 = self.deferred_closure_arg_checks[i]
@@ -17182,17 +17338,31 @@ impl Sema:
             let consumes: i32 = self.deferred_closure_arg_checks[(i + 4)]
             let by_place_sym: i32 = self.deferred_closure_arg_checks[(i + 5)]
             i = i + 6
-            let callee_name: str = with_str_clone_ref(self.pool_resolve(callee_sym))
+            let callee_name = self.call_once_callee_name(callee_sym)
+            // Judged after every body: the diagnostic names the closure's own
+            // file, not the one checked last.
+            self.local_file_id = self.ast.file(closure_node as NodeId) as i32
             if by_place_sym != 0 and (self.sig_param_effect(sig_idx, param_i) & EFF_ESCAPE_VALUE) != 0:
                 let cap_name: str = with_str_clone_ref(self.pool_resolve(by_place_sym))
                 self.emit_error("closure argument holds `" ++ cap_name ++ "` by place — a view of this frame — and `" ++ callee_name ++ "` stores or returns its parameter (§12.4); pass an owning closure: `move () => ...`", closure_node)
                 continue
             if consumes != 0:
-                let bodiless = if self.fn_decl_nodes.contains(callee_sym) and self.ast.fn_decl_body_is_interface(self.fn_decl_nodes.get(callee_sym).unwrap() as NodeId): 1 else: 0
                 if self.sig_param_invoke_many_at(sig_idx, param_i) != 0:
                     self.emit_error("this closure consumes its capture and may be invoked once, but `" ++ callee_name ++ "` invokes its parameter more than once (§12.4)", closure_node)
-                else if bodiless != 0:
-                    self.emit_error("this closure consumes its capture and may be invoked once, but `" ++ callee_name ++ "` has no body in this compilation (a bundle boundary), so it may invoke its parameter any number of times (§12.4; a `once` parameter annotation is #1604)", closure_node)
+                else if self.sig_param_is_c_invoked_userdata(sig_idx, param_i):
+                    self.emit_error("this closure consumes its capture and may be invoked once, but `" ++ callee_name ++ "` hands it to C as a callback's userdata, and C may call that callback any number of times (§12.4, §16.2b.9)", closure_node)
+                else if self.sig_is_bodiless(sig_idx) and not self.sig_param_is_once(sig_idx, param_i):
+                    self.emit_error("this closure consumes its capture and may be invoked once, but `" ++ callee_name ++ "` has no body in this compilation (a bundle boundary) and its parameter is not declared `once` (`f: once fn(A) -> R`), so it may invoke it any number of times (§12.4)", closure_node)
+        self.local_file_id = saved_file_id
+
+    // The name a call-once diagnostic gives a callee: a facade's free
+    // callback bridge under the name the program calls it by, not the
+    // rendered `__with_facade_<name>`.
+    fn call_once_callee_name(callee_sym: i32) -> str:
+        let mi = self.facade_callback_method_for(callee_sym)
+        if mi >= 0 and self.facade_callback_methods[mi].receiver_params == 0:
+            return self.facade_presented_free_name(self.facade_callback_methods[mi].contract)
+        with_str_clone_ref(self.pool_resolve(callee_sym))
 
     // Whether a binding's recorded origins name a stack local of this frame
     // (a non-move closure over `xs`, a value holding one).
@@ -17203,6 +17373,60 @@ impl Sema:
             if self.view_origin_is_stack_local(self.binding_view_dep_at(sym, di)) != 0:
                 return true
         false
+    // D63 (§12.4): a callable parameter passed on (`twice(f)`) is invoked as
+    // often as the parameter it reaches. The callee's facts are final only
+    // after every body is checked, so the forward is recorded here and
+    // judged by propagate_callable_forwards.
+    mut fn note_callable_forward(arg_node: i32, callee_sym: i32, sig_idx: i32, param_i: i32):
+        var n = arg_node
+        while n != 0 and (self.ast.kind(n) == NodeKind.NK_GROUPED or self.ast.kind(n) == NodeKind.NK_MOVE_ARG):
+            n = self.ast.get_data0(n)
+        if n == 0 or self.ast.kind(n) != NodeKind.NK_IDENT or self.current_fn_sig_idx < 0:
+            return
+        let caller_pi = self.param_index_for_sym(self.ast.get_data0(n))
+        if caller_pi < 0 or param_i < 0 or param_i >= self.sig_get_param_count(sig_idx):
+            return
+        if self.get_type_kind(self.resolve_alias(self.sig_param_type(self.current_fn_sig_idx, caller_pi) as TypeId)) != TypeKind.TY_FN:
+            return
+        self.deferred_callable_forwards.push(self.current_fn_sig_idx)
+        self.deferred_callable_forwards.push(caller_pi)
+        self.deferred_callable_forwards.push(sig_idx)
+        self.deferred_callable_forwards.push(param_i)
+        self.deferred_callable_forwards.push(n)
+        self.deferred_callable_forwards.push(callee_sym)
+
+    // D63 (§12.4): a parameter forwarded to one that may be invoked more
+    // than once may itself be — to a fixpoint over the forwards, after every
+    // body published its own count and before closure arguments are judged.
+    // Before, `fn apply(f: fn() -> str) -> str: twice(f)` took a consuming
+    // closure and `twice` ran it twice (the second call read the
+    // move-blanked capture). A `once` parameter forwarded that way is a body
+    // that may invoke it more than once (D75).
+    mut fn propagate_callable_forwards():
+        let n = self.deferred_callable_forwards.len() as i32
+        var changed = true
+        while changed:
+            changed = false
+            var i = 0
+            while i + 5 < n:
+                let caller_sig: i32 = self.deferred_callable_forwards[i]
+                let caller_pi: i32 = self.deferred_callable_forwards[(i + 1)]
+                let callee_sig: i32 = self.deferred_callable_forwards[(i + 2)]
+                let callee_pi: i32 = self.deferred_callable_forwards[(i + 3)]
+                let arg_node: i32 = self.deferred_callable_forwards[(i + 4)]
+                let callee_sym: i32 = self.deferred_callable_forwards[(i + 5)]
+                i = i + 6
+                if self.sig_param_invoke_many_at(caller_sig, caller_pi) != 0 or not self.sig_param_may_invoke_many(callee_sig, callee_pi):
+                    continue
+                self.set_sig_param_invoke_many(caller_sig, caller_pi, 1)
+                changed = true
+                if self.sig_param_is_once(caller_sig, caller_pi):
+                    let param_name: str = with_str_clone_ref(self.pool_resolve(self.ast.get_data0(arg_node)))
+                    let callee_name = self.call_once_callee_name(callee_sym)
+                    let saved_file_id: i32 = self.local_file_id
+                    self.local_file_id = self.ast.file(arg_node as NodeId) as i32
+                    self.emit_error("`" ++ param_name ++ "` is declared `once`, but `" ++ callee_name ++ "` may invoke its parameter more than once (§12.4)", arg_node)
+                    self.local_file_id = saved_file_id
 
     // A non-move closure that captures a non-Copy local holds a view of that
     // local's place (§12.4); the binding that holds the closure carries those
@@ -17396,9 +17620,19 @@ impl Sema:
         // declared return; a non-Unit one makes a tail assignment its value.
         let body_tail_discards = expected_ret_ty == 0 or expected_ret_ty == self.ty_void as i32
         self.body_tail_discards = body_tail_discards
+        // §12.4: creating a non-`move` closure moves nothing — a capture the
+        // body consumes is moved by each call (apply_closure_capture_consumes)
+        // through the body's effect summary. Checking the body marked the
+        // outer binding moved at creation, so the first call of
+        // `let c = () => take(ys); c()` (the spec's example) was reported as a
+        // second one ("an earlier call already did").
+        let creation_states = self.save_scope_states()
+        let creation_moved_fields = self.save_moved_field_state()
         self.closure_body_depth = self.closure_body_depth + 1
         let checked_body_ty = if expected_ret_ty != 0: self.check_expr_with_expected(body, expected_ret_ty as TypeId) else: self.check_expr_value_context(body)
         self.closure_body_depth = self.closure_body_depth - 1
+        self.restore_scope_states(&creation_states)
+        self.restore_moved_field_state(&creation_moved_fields)
         self.body_tail_block = saved_body_tail_block
         self.body_tail_holder = saved_body_tail_holder
         self.body_tail_discards = saved_body_tail_discards
@@ -19180,8 +19414,10 @@ impl Sema:
                     callable_closure_node = self.binding_closure_nodes.get(fn_sym).unwrap()
                 // D63 call-once: count this body's invocations of the callable
                 // binding; inside a loop one site counts as many.
-                let seen = if self.fn_param_invocations.contains(fn_sym): self.fn_param_invocations.get(fn_sym).unwrap() else: 0
-                self.fn_param_invocations.insert(fn_sym, seen + (if self.loop_depth > 0: 2 else: 1))
+                let invocations = (self.fn_param_invocations.get(fn_sym) ?? 0) + (if self.loop_depth > 0: 2 else: 1)
+                self.fn_param_invocations.insert(fn_sym, invocations)
+                if invocations > 1 and not self.fn_param_many_nodes.contains(fn_sym):
+                    self.fn_param_many_nodes.insert(fn_sym, node)
             if local_tid < 0 and self.symbol_visible_from_current(fn_sym) == 0:
                 self.emit_private_symbol_error(fn_sym, callee)
                 return 0
@@ -20524,6 +20760,11 @@ impl Sema:
         for ai in 0..arg_count:
             if ai >= param_count:
                 break
+            // D63 (§12.4): the specialization's body is the proof a consuming
+            // closure argument needs — it was never consulted, so a generic
+            // callee ran a call-once closure twice.
+            if ai < arg_nodes.len() as i32:
+                self.check_closure_arg_against_param(arg_nodes[ai], fn_sym, sig_idx, ai, call_node)
             let expected_ty = self.sig_param_type(sig_idx, ai)
             let actual_ty = arg_types[ai]
             if expected_ty == 0 or actual_ty == 0:
@@ -22299,6 +22540,16 @@ impl Sema:
         // (§16.2b.7) through its concrete signature (SemaFacade.w).
         self.facade_note_callback_method_sig(method_fn_sym, concrete_sig)
         self.facade_note_pair_op_sig(method_fn_sym, concrete_sig)
+        // D63 (§12.4): the specialization is the proof a closure argument
+        // needs, as for a generic free call (check_selected_generic_call_args).
+        // The argument loop ran before it existed (sig -1), so a consuming
+        // closure reached a generic method — a facade callback method's
+        // userdata among them — unjudged.
+        if concrete_sig >= 0:
+            let resolved_args = self.has_resolved_call_args(node) != 0
+            for ai4 in 0..arg_count:
+                let arg = if resolved_args: self.get_resolved_call_arg(node, ai4) else: self.ast.get_extra(extra_start + ai4)
+                self.check_closure_arg_against_param(arg, method_fn_sym, concrete_sig, ai4 + param_offset, node)
         let ret_ty = if concrete_sig >= 0:
             self.sig_return_type(concrete_sig)
         else:

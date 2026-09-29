@@ -673,6 +673,9 @@ pub type Sema {
     // Per body: how many times each callable binding is invoked (symbol →
     // count; an invocation inside a loop counts twice).
     fn_param_invocations: HashMap[i32, i32],
+    // Per body: the call that made a callable binding's count exceed one
+    // (the site a `once` parameter's error names, §12.4).
+    fn_param_many_nodes: HashMap[i32, i32],
     sig_param_eff_starts: Vec[i32],
     // Parallel signature metadata for value parameters lowered through pointer ABI.
     // This is distinct from semantic reference types: `self: &Self` is already a
@@ -916,6 +919,10 @@ pub type Sema {
     lang_trait_syms: HashMap[i32, i32],
     local_type_names: HashMap[i32, i32],
     distinct_type_names: HashMap[i32, i32],
+    // §4.5 (D75, #1802): the ownership mode of a cast whose target relabels
+    // its source (CastMode, keyed by the NK_CAST node). Absent: an ordinary
+    // value conversion. MirLower materializes the mode; it never re-derives it.
+    cast_modes: HashMap[i32, i32],
     ephemeral_types: HashMap[i32, i32],
     sealed_traits: HashMap[i32, i32],
     // Sealed trait implementors: flat vec of type syms, with start/count per trait
@@ -1383,6 +1390,7 @@ pub type Sema {
     // call sites).
     facade_callback_methods: Vec[FacadeCallbackMethod],
     facade_callback_method_index: HashMap[i32, i32],   // the method's generic fn node -> facade_callback_methods index
+    facade_c_invoked_userdata: HashMap[i32, i32],      // §12.4/§16.2b.9: a callback method's concrete signature -> its userdata parameter (signature index), which C invokes through the callback any number of times
     facade_pair_ops: Vec[FacadePairOp],                // D66 #1652: per concrete signature (facade_pair_op_by_sig)
     facade_pair_op_by_sig: HashMap[i32, i32],
     facade_pair_setter_contract: HashMap[i32, i32],    // a pair setter's generic fn node -> foreign_contracts index …
@@ -1519,6 +1527,11 @@ pub type Sema {
     // record: closure node, callee sym, sig, param index, consumes (0/1),
     // by-place capture sym (0 when none).
     deferred_closure_arg_checks: Vec[i32],
+    // D63 (§12.4): a callable parameter passed on to another callee's
+    // parameter — it is invoked as often as that parameter is. Six ints per
+    // record: caller sig, caller param index, callee sig, callee param index,
+    // argument node, callee sym. Judged after the effect fixpoint.
+    deferred_callable_forwards: Vec[i32],
     binding_view_dep_data: Vec[i32],
     // Expression-level view metadata for call expressions and view-producing nodes.
     expr_view_param_origins: HashMap[i32, i32],
@@ -2521,6 +2534,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         sig_param_view_origins: Vec.new(),
         sig_param_invoke_many: Vec.new(),
         fn_param_invocations: sema_new_map_i32_i32(),
+        fn_param_many_nodes: sema_new_map_i32_i32(),
         sig_param_eff_starts: Vec.new(),
         sig_value_ref_abi_params: Vec.new(),
         mres_nodes: Vec.new(),
@@ -2639,6 +2653,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         lang_trait_syms,
         local_type_names,
         distinct_type_names: sema_new_map_i32_i32(),
+        cast_modes: sema_new_map_i32_i32(),
         ephemeral_types,
         sealed_traits,
         sealed_impl_types,
@@ -2889,6 +2904,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         facade_convention_nodes: Vec.new(),
         facade_callback_methods: Vec.new(),
         facade_callback_method_index: sema_new_map_i32_i32(),
+        facade_c_invoked_userdata: sema_new_map_i32_i32(),
         facade_pair_ops: Vec.new(),
         facade_pair_op_by_sig: sema_new_map_i32_i32(),
         facade_pair_setter_contract: sema_new_map_i32_i32(),
@@ -2980,6 +2996,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         binding_closure_nodes: sema_new_map_i32_i32(),
         callable_clone_nodes: sema_new_map_i32_i32(),
         deferred_closure_arg_checks: Vec.new(),
+        deferred_callable_forwards: Vec.new(),
         binding_view_dep_data: Vec.new(),
         expr_view_param_origins: sema_new_map_i32_i32(),
         expr_view_into_temporary: sema_new_map_i32_i32(),
@@ -8428,6 +8445,9 @@ impl Sema:
         // write/consume/escape_value effects across the call graph so sig_param_effects is
         // final before any share-place decision (lowering/ABI) reads it.
         self.fixpoint_effect_flow()
+        // D63: a callable parameter passed on is invoked as often as the
+        // parameter it reaches; settled before closure arguments are judged.
+        self.propagate_callable_forwards()
         // D63: closure arguments are judged against their callee's complete
         // escape effects and call-once flags, whatever the declaration order.
         self.finalize_closure_arg_checks()
