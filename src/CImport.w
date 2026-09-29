@@ -30,6 +30,9 @@ var g_cimport_omitted_symbol_locations: Vec[str] = Vec.new()
 var g_cimport_omitted_symbol_categories: Vec[str] = Vec.new()
 var g_cimport_included_files: str = ""
 var g_cimport_raw_function_names: str = ""
+// #1831: `|name|` for each declaration without a prototype this
+// translation emits; the manifest lines below carry it to the Frontend.
+var g_cimport_unprototyped_names: str = ""
 var g_cimport_report_untranslated_macros: i32 = 0
 var g_ci_migrate_in_unsafe_function_body: bool = false
 // §16.2a no_methods opt-out. Set per-import before translation.
@@ -484,6 +487,27 @@ fn ci_omitted_manifest_comments() -> str:
         out.push_str("\n")
     out.to_str()
 
+// #1831: one `// @with-cimport-unprototyped|name` line per declaration
+// without a prototype. The generated text states the fact, the Frontend
+// sets it on the parsed NK_EXTERN_FN (flag bit 1), and Sema reads it there:
+// no source a person writes can spell it.
+fn ci_unprototyped_manifest_comments() -> str:
+    var out = StringBuilder.new()
+    for name in g_cimport_unprototyped_names.split("|"):
+        if name.len() > 0:
+            out.push_str("// @with-cimport-unprototyped|" ++ name ++ "\n")
+    out.to_str()
+
+// `|name|` for each unprototyped-declaration manifest line of c_import's
+// generated `text` (fresh or cached).
+pub fn c_import_unprototyped_names(text: &str) -> str:
+    let prefix = "// @with-cimport-unprototyped|"
+    var out = ""
+    for line in text.split("\n"):
+        if line.starts_with(prefix):
+            out = out ++ "|" ++ line.slice(prefix.len(), line.len()) ++ "|"
+    out
+
 fn ci_record_untranslated_macro(name: &str):
     if g_cimport_report_untranslated_macros == 0:
         return
@@ -601,6 +625,7 @@ pub fn process_c_import_with_defines(header_spec: &str, defines: &Vec[str]) -> s
         g_cimport_last_error = "c_import is not supported with --target " ++ target_spec_name() ++ " yet: header parsing would use host headers, not the target's"
         return ""
     g_cimport_raw_function_names = ""
+    g_cimport_unprototyped_names = ""
     ci_record_field_caches_clear()
     g_cimport_report_untranslated_macros = ci_should_report_untranslated_macros(header_spec)
     if with_cimport_available() == 0:
@@ -789,7 +814,7 @@ pub fn process_c_import_with_defines(header_spec: &str, defines: &Vec[str]) -> s
     g_migrate_macro_miss_names = HashMap.new()
 
     let rendered = output.to_str()
-    ci_omitted_manifest_comments() ++ rendered
+    ci_omitted_manifest_comments() ++ ci_unprototyped_manifest_comments() ++ rendered
 
 // Mark all declaration names from cached text as emitted in the global dedup table.
 // This ensures that fs-cached c_import results don't conflict with subsequent c_imports.
@@ -1633,6 +1658,104 @@ fn ci_cursor_needs_demoted_layout(session: i64, cursor: i32, demoted: &str) -> s
             return inner
     ""
 
+// #1848: the argument types every call to the unprototyped function `name`
+// in this unit passes — clang's own default argument promotions, read off
+// each argument's (implicitly converted) type — as `T0|T1|…`. "" when
+// nothing calls it; `!reason` when the calls disagree, a type has no With
+// spelling, or the function is used as a value (a call needs no pointer).
+pub fn ci_migrate_unprototyped_call_shape(session: i64, name: &str) -> str:
+    let found = ci_migrate_collect_unprototyped_uses(session, with_ci_root_cursor(session), name, "")
+    if found.len() == 0:
+        return ""
+    var shape = ""
+    var calls = 0
+    var refs = 0
+    for entry in found.split("\n"):
+        if entry.len() == 0:
+            continue
+        if entry == "#ref":
+            refs = refs + 1
+            continue
+        if entry.starts_with("!"):
+            return entry.clone()
+        calls = calls + 1
+        if calls == 1:
+            shape = entry.slice(1, entry.len())
+        else if entry.slice(1, entry.len()) != shape:
+            return "!its calls pass different arguments"
+    if refs > calls:
+        return "!it is used as a value"
+    shape
+
+fn ci_migrate_collect_unprototyped_uses(session: i64, cursor: i32, name: &str, acc: str) -> str:
+    var out = acc
+    let kind = with_ci_cursor_kind(session, cursor)
+    if kind == CXK_CALL_EXPR and with_ci_num_children(session, cursor) > 0 and ci_call_callee_name(session, with_ci_child(session, cursor, 0)) == name:
+        var shape = "="
+        for ai in 1..with_ci_num_children(session, cursor):
+            let ty = ci_pointer_type_explicit_mut(with_ci_type_translated(session, with_ci_cursor_type(session, with_ci_child(session, cursor, ai))))
+            if ty.len() == 0 or ci_starts_with(ty, "__UNSUPPORTED:"):
+                return out ++ "!an argument of one of its calls has no With type\n"
+            shape = shape ++ (if ai > 1: "|" else: "") ++ ci_unsafe_fn_ptr_type(ty)
+        out = out ++ shape ++ "\n"
+    else if kind == CXK_DECL_REF and with_ci_cursor_spelling(session, cursor) == name:
+        out = out ++ "#ref\n"
+    for ci in 0..with_ci_num_children(session, cursor):
+        out = ci_migrate_collect_unprototyped_uses(session, with_ci_child(session, cursor, ci), name, out)
+    out
+
+// `T0|T1` as a parameter list `a0: T0, a1: T1`.
+pub fn ci_migrate_unprototyped_params(shape: &str) -> str:
+    if shape.len() == 0:
+        return ""
+    var out = ""
+    var i = 0
+    for ty in shape.split("|"):
+        out = out ++ (if i > 0: ", " else: "") ++ f"a{i}: {ty}"
+        i = i + 1
+    out
+
+// D51 (#1830): whether a call to C function `idx` is raw — its declaration
+// is variadic, or passes or returns a raw-ABI type — or,
+// for an inline function translated with its body, whether that body makes
+// a raw call. The same test the extern path (ci_translate_function) applies
+// to mark a function raw, asked of a callee. Past the depth bound (mutually
+// recursive inline functions) the answer is raw: at worst it removes the
+// safe surface, never grants one.
+fn ci_c_function_call_is_raw(session: i64, idx: i32, depth: i32) -> bool:
+    if with_cimport_fn_is_variadic(session, idx) != 0:
+        return true
+    for pi in 0..with_cimport_fn_param_count(session, idx):
+        if ci_cimport_param_type_requires_raw_abi(ci_pointer_type_explicit_mut(with_cimport_fn_param_type_translated(session, idx, pi))):
+            return true
+    if ci_cimport_type_is_raw_abi(ci_pointer_type_explicit_mut(with_cimport_fn_return_type_translated(session, idx))):
+        return true
+    if with_cimport_fn_is_inline(session, idx) == 0:
+        return false
+    if depth >= 8:
+        return true
+    let definition = ci_fn_definition_cursor(session, idx)
+    definition >= 0 and ci_cursor_calls_raw_function(session, definition, depth + 1)
+
+// Whether the code under `cursor` calls a raw C function directly (D51,
+// #1830). A call through a parameter's function pointer is decided by that
+// parameter's type, which the signature check already reads. A libc call
+// the body translator rewrites to its own With form (calloc to
+// with_alloc_zeroed, strlen, a libm function, a builtin) is not a call to
+// the C function: the translator states that form's context itself.
+fn ci_cursor_calls_raw_function(session: i64, cursor: i32, depth: i32) -> bool:
+    if with_ci_cursor_kind(session, cursor) == CXK_CALL_EXPR and with_ci_num_children(session, cursor) > 0:
+        let callee_ref = with_ci_child(session, cursor, 0)
+        let callee = ci_call_callee_name(session, callee_ref)
+        if callee.len() > 0 and not ci_has_value_libc_call_mapping(callee) and not with_ci_cursor_references_parameter(session, callee_ref):
+            ci_fn_decl_index_ensure(session)
+            if g_ci_fn_decl_by_raw.contains(callee) and ci_c_function_call_is_raw(session, g_ci_fn_decl_by_raw.get(callee).unwrap(), depth):
+                return true
+    for ci in 0..with_ci_num_children(session, cursor):
+        if ci_cursor_calls_raw_function(session, with_ci_child(session, cursor, ci), depth):
+            return true
+    false
+
 fn ci_translate_function(session: i64, idx: i32, known_structs: &str, demoted_types: &str) -> str:
     // B9: fresh per-function temp counter.
     ci_temp_reset()
@@ -1697,6 +1820,11 @@ fn ci_translate_function(session: i64, idx: i32, known_structs: &str, demoted_ty
             if opaque_record.len() > 0:
                 ci_record_omitted_symbol_cat(name, ci_get_decl_location(session, name), "inexpressible", "inline body needs the layout of '" ++ opaque_record ++ "', which c_import imports opaque (§16.9)")
                 return ""
+            // D51 (#1830): a body that calls a raw C function is raw
+            // itself. The wrapper does not become safe by inference: it is
+            // an `unsafe fn`, and the body is printed in that context.
+            if not si_raw and ci_cursor_calls_raw_function(session, definition, 0):
+                si_raw = true
         // #1678: a `static inline` function's only definition is its body
         // — no symbol exists for a manual extern to bind — so an omitted
         // body is inexpressible; a non-static inline may have an external
@@ -1736,7 +1864,12 @@ fn ci_translate_function(session: i64, idx: i32, known_structs: &str, demoted_ty
             return bw
 
     let param_count = with_cimport_fn_param_count(session, idx)
-    let is_variadic = with_cimport_fn_is_variadic(session, idx)
+    // #1831: `int f();` names no parameters. It is spelled `(...)` — any
+    // arguments, a raw call — and recorded in the unprototyped manifest, so
+    // each call passes its promoted arguments with the fixed-argument
+    // convention.
+    let is_unprototyped = with_cimport_fn_is_unprototyped(session, idx) != 0
+    let is_variadic = if is_unprototyped: 1 else: with_cimport_fn_is_variadic(session, idx)
 
     // Check for unsupported types — omitted declarations are recorded in the
     // c_import manifest instead of emitted as callable failure stubs.
@@ -1806,6 +1939,8 @@ fn ci_translate_function(session: i64, idx: i32, known_structs: &str, demoted_ty
     // A renamed extern (keyword or prelude collision) keeps its C linkage
     // through the original symbol.
     let link_prefix = if safe_name != name: "@[link_name(\"" ++ name ++ "\")]\n" else: ""
+    if is_unprototyped:
+        g_cimport_unprototyped_names = g_cimport_unprototyped_names ++ "|" ++ safe_name ++ "|"
     let ret_render = ci_unsafe_fn_ptr_type(ret)
     link_prefix ++ cc_prefix ++ "extern fn " ++ safe_name ++ "(" ++ params ++ ") -> " ++ ret_render ++ "\n"
 

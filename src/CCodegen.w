@@ -8999,13 +8999,17 @@ impl CCodegen:
                 out = out ++ "typedef struct " ++ cc_lbrace() ++ " " ++ member ++ "; void* ctx; " ++ cc_rbrace() ++ " " ++ self.fn_type_c_name(tid as i32) ++ ";\n"
                 continue
             var params = ""
+            let variadic = self.sema.fn_type_is_variadic(tid as i32)
             if count == 0:
-                params = "void"
+                params = if variadic: "..." else: "void"
             else:
                 for pi in 0..count:
                     if pi > 0:
                         params = params ++ ", "
                     params = params ++ self.c_type(self.sema.type_extra[(start + pi)], 0)
+                // #1832: a C variadic function pointer.
+                if variadic:
+                    params = params ++ ", ..."
             let fn_name = "(*" ++ self.fn_type_c_name(tid as i32) ++ ")(" ++ params ++ ")"
             if self.type_is_pointer_to_array(ret_tid):
                 out = out ++ "typedef " ++ self.c_decl(ret_tid, fn_name) ++ ";\n"
@@ -9420,7 +9424,13 @@ impl CCodegen:
                 params = params ++ self.c_type(p_tid, 0) ++ f"* _{i + 1}"
             else:
                 params = params ++ self.c_decl(p_tid, f"_{i + 1}")
-        if self.sema.sig_is_variadic(sig_idx) != 0:
+        // #1831: an unprototyped declaration stays unprototyped, so the C
+        // compiler passes each call's promoted arguments with the
+        // fixed-argument convention. (A C23 compiler reads `()` as `(void)`
+        // and refuses a call with arguments — loud, never a wrong ABI.)
+        if self.sema.sig_is_unprototyped(sig_idx):
+            params = ""
+        else if self.sema.sig_is_variadic(sig_idx) != 0:
             if param_count > 0:
                 params = params ++ ", ..."
             else:

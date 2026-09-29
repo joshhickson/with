@@ -596,20 +596,71 @@ impl Sema:
     // machinery a fixed Copy param uses (record_contextual_copy_adjustment
     // re-validates Copy-ness) — otherwise MIR lowers the view's address and the
     // callee reads a pointer instead of the value.
-    mut fn materialize_variadic_value_arg(arg_node: i32, arg_ty: i32):
+    // Returns the type the slot passes: the pointee when the view
+    // materializes, else `arg_ty`.
+    mut fn materialize_variadic_value_arg(arg_node: i32, arg_ty: i32) -> i32:
         if arg_node <= 0 or arg_ty == 0:
-            return
+            return arg_ty
         // An explicit `&x` at a variadic slot passes its address by intent
         // (e.g. `%p`); only implicit element/field Copy views materialize.
         if self.cast_operand_is_explicit_borrow(arg_node) != 0:
-            return
+            return arg_ty
         let resolved = self.resolve_alias(arg_ty as TypeId)
         if self.get_type_kind(resolved) != TypeKind.TY_REF or self.get_type_d1(resolved) != 0:
-            return
+            return arg_ty
         let pointee = self.get_type_d0(resolved)
         if pointee == 0:
-            return
-        let _ = self.record_contextual_copy_adjustment(arg_node, pointee, arg_ty)
+            return arg_ty
+        if self.record_contextual_copy_adjustment(arg_node, pointee, arg_ty) != 0: pointee else: arg_ty
+
+    // C11 6.5.2.2p6, the default argument promotions: the C type an argument
+    // of type `tid` is passed as to a function with no parameter type for it.
+    // An integer narrower than `int`, a `bool`, an enum of such a
+    // representation become `c_int`; `f32` becomes `f64`; a wider integer,
+    // `f64`, a pointer, a reference and a C function pointer pass as they
+    // are. 0 when the type has no C argument form.
+    fn c_default_promoted_type(tid: i32) -> i32:
+        let resolved = self.resolve_alias(tid as TypeId) as i32
+        let kind = self.get_type_kind(resolved)
+        if kind == TypeKind.TY_BOOL:
+            return self.ty_i32 as i32
+        if kind == TypeKind.TY_INT:
+            return if self.get_type_d0(resolved) < 32: self.ty_i32 as i32 else: resolved
+        if kind == TypeKind.TY_ENUM:
+            let repr = self.enum_repr_type(resolved)
+            return if repr != 0: self.c_default_promoted_type(repr) else: 0
+        if kind == TypeKind.TY_FLOAT:
+            let bits = self.get_type_d0(resolved)
+            return if bits == 32: self.ty_f64 as i32 else if bits == 64: resolved else: 0
+        if kind == TypeKind.TY_PTR or kind == TypeKind.TY_REF or kind == TypeKind.TY_EXTERN_FN:
+            return resolved
+        0
+
+    // C passes an argument that has no parameter type after the default
+    // argument promotions. Sema states the promoted types once, per call,
+    // for codegen to pass:
+    // - #1831: every argument of a function declared without a prototype;
+    //   codegen builds the call's FnAbi from them (the fixed-argument
+    //   convention), and an argument with no C form is refused here, loudly.
+    // - #1849: each argument from `variadic_from` on that a `...` receives,
+    //   where the promotion changes its type (0 elsewhere); codegen converts
+    //   the argument (sign- or zero-extending by its own type).
+    mut fn record_c_promoted_args(call_node: i32, fn_sym: i32, arg_nodes: &Vec[i32], arg_types: &Vec[i32], passed_types: &HashMap[i32, i32], variadic_from: i32):
+        let unprototyped = variadic_from < 0
+        let start = self.c_promoted_arg_data.len() as i32
+        self.c_promoted_arg_data.push(arg_types.len() as i32)
+        for ai in 0..arg_types.len() as i32:
+            let arg_node = if ai < arg_nodes.len() as i32: arg_nodes[ai] else: 0
+            // A Copy view the variadic slot materialized passes its pointee.
+            let value_ty = passed_types.get(ai) ?? arg_types[ai]
+            var promoted = if value_ty != 0 and (unprototyped or ai >= variadic_from): self.c_default_promoted_type(value_ty) else: 0
+            if not unprototyped and promoted == self.resolve_alias(value_ty as TypeId) as i32:
+                promoted = 0
+            if unprototyped and promoted == 0 and value_ty != 0:
+                let fname: str = self.pool_resolve(fn_sym)
+                self.emit_error(f"'{fname}' is declared without a prototype, so C passes its arguments after the default argument promotions, and a value of type '{self.type_name(value_ty)}' has no C argument form; pass an integer, float, pointer or C function pointer, or declare '{fname}' with its parameters in a manual `extern \"C\"` block (§16.3)", if arg_node > 0: arg_node else: call_node)
+            self.c_promoted_arg_data.push(promoted)
+        self.c_promoted_arg_starts.insert(call_node, start)
 
     fn has_contextual_copy_adjustment(source_node: i32) -> i32:
         self.has_contextual_copy_adjustment_for_sig(self.current_fn_sig_idx, source_node)
@@ -1409,8 +1460,7 @@ impl Sema:
             // No return annotation on a fn type means Unit, not TY_ERR.
             let ret = if ret_node != 0: self.resolve_type_expr(ret_node) else: self.ty_void
             let fn_kind = if kind == NodeKind.NK_TYPE_EXTERN_FN: TypeKind.TY_EXTERN_FN else: TypeKind.TY_FN
-            let is_unsafe = self.ast.is_unsafe_fn_type_node(node)
-            return self.ensure_callable_type(fn_kind, param_types, param_count, ret, is_unsafe)
+            return self.ensure_callable_type(fn_kind, param_types, param_count, ret, self.fn_type_node_flags(node))
 
         if kind == NodeKind.NK_TYPE_ARRAY:
             let elem = self.resolve_type_expr(self.ast.get_data0(node))
@@ -1656,8 +1706,7 @@ impl Sema:
             // the mutable resolver above — the twins must intern identical types).
             let ret = if ret_node != 0: self.resolve_type_expr_frozen(ret_node) else: self.ty_void
             let fn_kind = if kind == NodeKind.NK_TYPE_EXTERN_FN: TypeKind.TY_EXTERN_FN else: TypeKind.TY_FN
-            let is_unsafe = self.ast.is_unsafe_fn_type_node(node)
-            return self.find_fn_type_of_kind_u(fn_kind, &param_types, param_count, ret, is_unsafe)
+            return self.find_fn_type_of_kind_u(fn_kind, &param_types, param_count, ret, self.fn_type_node_flags(node))
         if kind == NodeKind.NK_TYPE_ARRAY:
             let elem = self.resolve_type_expr_frozen(self.ast.get_data0(node))
             return self.find_exact_type(TypeKind.TY_ARRAY, elem as i32, self.ast.get_data1(node), 0)
@@ -3331,6 +3380,7 @@ impl Sema:
         if self.fn_decl_has_c_export(node) != 0:
             self.record_global_concurrency_evidence(node, "@[c_export]")
             self.validate_c_export_signature(node, sig_idx, fn_name)
+            self.check_c_export_against_declarations(node, sig_idx, fn_name)
         let saved_no_alloc_depth: i32 = self.current_no_alloc_depth
         let saved_fn_may_alloc: i32 = self.current_fn_may_alloc
         let saved_current_fn_symbol: i32 = self.current_fn_symbol
@@ -4554,6 +4604,90 @@ impl Sema:
         let rt = self.sig_return_type(sig_idx)
         if self.type_is_c_abi_expressible(rt, 1) == 0:
             self.emit_error("@[c_export] function '" ++ fn_name ++ "' return type '" ++ self.type_name(rt) ++ "' is not C-ABI-expressible; use a scalar, a raw pointer, or a @[repr(C)] type", node)
+
+    // §16.5 (#1850): the C symbol a `@[c_export]` fn defines may also be
+    // declared — a c_imported header's prototype, a manual extern — and C
+    // code, like With code calling that extern, calls it through that
+    // declaration. The definition must be the function the declaration
+    // describes: the same C function type, or, for a declaration without a
+    // prototype (`int f();`), a definition whose parameters are what the
+    // default argument promotions pass (C11 6.7.6.3p15). Anything else is a
+    // conflicting definition, refused here with both types.
+    mut fn check_c_export_against_declarations(node: i32, sig_idx: i32, fn_sym: i32):
+        if sig_idx < 0:
+            return
+        let symbol = self.cheader_export_name(node)
+        for decl in self.extern_decls_of_c_symbol(symbol):
+            let ext_sig = self.extern_decl_sigs.get(decl) ?? -1
+            if ext_sig < 0 or ext_sig == sig_idx:
+                continue
+            let mismatch = self.c_export_declaration_mismatch(sig_idx, ext_sig)
+            if mismatch.len() > 0:
+                let fname: str = self.pool_resolve(fn_sym)
+                self.emit_error(f"@[c_export(\"{symbol}\")] fn '{fname}' is `{self.sig_c_fn_text(sig_idx, false)}`, but '{symbol}' is declared `{self.sig_c_fn_text(ext_sig, self.sig_is_unprototyped(ext_sig))}`, and C calls it through that declaration: {mismatch}; make the definition agree with the declaration (§16.5)", node)
+                return
+
+    // The extern declarations whose C symbol is `symbol`: the `@[link_name]`
+    // when there is one, else the declared name.
+    fn extern_decls_of_c_symbol(symbol: &str) -> Vec[i32]:
+        let out: Vec[i32] = Vec.new()
+        for di in 0..self.ast.decl_count():
+            let decl = self.ast.get_decl(di)
+            if self.ast.kind(decl) != NodeKind.NK_EXTERN_FN:
+                continue
+            let meta = self.ast.find_fn_meta(decl)
+            var linked = self.pool_resolve(self.ast.get_data0(decl)) == symbol
+            if meta >= 0 and self.ast.fn_meta_tp_start(meta) != 0:
+                let cc = self.pool_resolve(self.ast.fn_meta_tp_start(meta))
+                if cc.starts_with("link_name:"):
+                    linked = cc.slice(10, cc.len()) == symbol
+            if linked:
+                out.push(decl)
+        out
+
+    // Why a definition with signature `def_sig` is not the C function the
+    // declaration `ext_sig` describes; "" when it is.
+    fn c_export_declaration_mismatch(def_sig: i32, ext_sig: i32) -> str:
+        if not self.c_abi_same_type(self.sig_return_type(def_sig), self.sig_return_type(ext_sig)):
+            return "the result types differ"
+        let count = self.sig_get_param_count(def_sig)
+        if self.sig_is_unprototyped(ext_sig):
+            for pi in 0..count:
+                let p = self.sig_param_type(def_sig, pi)
+                if self.c_default_promoted_type(p) != self.resolve_alias(p as TypeId) as i32:
+                    return f"a declaration without a prototype is called with promoted arguments, and parameter {pi + 1} is '{self.type_name(p)}', which a promoted argument never is"
+            return ""
+        if (self.sig_is_variadic(def_sig) != 0) != (self.sig_is_variadic(ext_sig) != 0):
+            return "one is variadic and the other is not"
+        if count != self.sig_get_param_count(ext_sig):
+            return "the parameter counts differ"
+        for pi in 0..count:
+            if not self.c_abi_same_type(self.sig_param_type(def_sig, pi), self.sig_param_type(ext_sig, pi)):
+                return f"parameter {pi + 1} differs"
+        ""
+
+    // Whether two types are one C argument type: the same type, or any two
+    // pointers (a C prototype's `void *` against a definition's `*mut u8`).
+    fn c_abi_same_type(a: i32, b: i32) -> bool:
+        let ka = self.get_type_kind(self.resolve_alias(a as TypeId))
+        let kb = self.get_type_kind(self.resolve_alias(b as TypeId))
+        let a_ptr = ka == TypeKind.TY_PTR or ka == TypeKind.TY_REF or ka == TypeKind.TY_EXTERN_FN
+        let b_ptr = kb == TypeKind.TY_PTR or kb == TypeKind.TY_REF or kb == TypeKind.TY_EXTERN_FN
+        if a_ptr or b_ptr:
+            return a_ptr and b_ptr
+        self.types_identical(a, b)
+
+    // A signature spelled as the C function type it is.
+    fn sig_c_fn_text(sig: i32, unprototyped: bool) -> str:
+        if unprototyped:
+            return f"extern \"C\" fn(...) -> {self.type_name(self.sig_return_type(sig))}"
+        var out = "extern \"C\" fn("
+        let count = self.sig_get_param_count(sig)
+        for pi in 0..count:
+            out = out ++ (if pi > 0: ", " else: "") ++ self.type_name(self.sig_param_type(sig, pi))
+        if self.sig_is_variadic(sig) != 0:
+            out = out ++ (if count > 0: ", ..." else: "...")
+        out ++ ") -> " ++ self.type_name(self.sig_return_type(sig))
 
     // ── §16.5 C header generation for @[c_export] symbols ──────────────────
 
@@ -7934,6 +8068,30 @@ impl Sema:
             return 1
         0
 
+    // A callable type node's identity bits. A variadic C function pointer
+    // is unsafe to call whether or not `unsafe` is spelled (§16.3c: a
+    // variadic call is raw), so both spellings are one type (#1832).
+    fn fn_type_node_flags(node: i32) -> i32:
+        if self.ast.is_variadic_fn_type_node(node):
+            return CALLABLE_UNSAFE | CALLABLE_VARIADIC
+        if self.ast.is_unsafe_fn_type_node(node) != 0: CALLABLE_UNSAFE else: 0
+
+    // §16.11: why a direct call to `fn_sym` from the module being checked
+    // needs an unsafe context — an `unsafe fn`, a raw c_import function, or
+    // a manual extern with an unmodeled contract; "" when it does not. One
+    // rule for the call and for the function used as a value: the value's
+    // type is unsafe exactly when the call is (#1829). A presented facade
+    // call (§16.2b.8) is safe at its call site; the function's value is not
+    // presented, so a value use passes `presented` false.
+    fn fn_symbol_unsafe_call_reason(fn_sym: i32, presented: bool) -> str:
+        if self.fn_symbol_is_unsafe(fn_sym) != 0 and not presented:
+            return "unsafe function call requires unsafe context"
+        if self.fn_symbol_is_raw_c_import(fn_sym) != 0:
+            return "raw c_import function call requires unsafe context"
+        if self.fn_symbol_is_manual_extern(fn_sym) != 0:
+            return "manual extern function call requires unsafe context"
+        ""
+
     // The module being checked declared this extern itself (#1695): its own
     // declaration governs the call, so another module's declaration of the
     // same name (std.fs's `strerror`) cannot make the call exempt.
@@ -9156,22 +9314,42 @@ impl Sema:
             if self.fn_decl_is_variadic_definition(self.fn_symbol_decl_node(sym)):
                 self.emit_error("`" ++ self.pool_resolve(sym) ++ "` is defined with `...`: it is called directly (under `unsafe`), never used as a value", node)
                 return 0
-            let fn_is_unsafe = self.fn_symbol_is_unsafe(sym)
+            // #1831: a function declared without a prototype has no With
+            // function type — each call passes its own promoted arguments —
+            // so it is called directly, never used as a value.
+            if self.sig_is_unprototyped(sig_idx):
+                self.emit_error("'" ++ self.pool_resolve(sym) ++ "' is declared without a prototype: each call passes its own promoted arguments, so it has no function type; call it directly (under unsafe), or declare it with its parameters in a manual `extern \"C\"` block to use it as a value (§16.3)", node)
+                return 0
+            // §16.11: a function whose call needs `unsafe` is an unsafe
+            // callable as a value too — its type carries the unsafety, so a
+            // call through the value needs the same context (#1829).
+            let fn_is_unsafe = self.fn_symbol_unsafe_call_reason(sym, false).len() > 0
+            // #1832: a variadic extern is a C variadic function pointer as a
+            // value, `extern "C" fn(A, ...) -> R` — never a fixed-arity type.
+            if self.sig_is_variadic(sig_idx) != 0 and self.extern_fn_names.contains(sym):
+                let variadic_tid = self.variadic_callable_type(fn_tid)
+                self.typed_expr_types.insert(node, variadic_tid)
+                return variadic_tid
+            let value_tid = if fn_is_unsafe: self.unsafe_callable_type(fn_tid) else: fn_tid
             if self.has_expected_type != 0 and self.expected_expr_type != 0:
                 let expected = self.resolve_alias(self.expected_expr_type)
-                if self.get_type_kind(expected) == TypeKind.TY_EXTERN_FN and self.fn_types_compatible(expected, fn_tid) != 0:
-                    // §16.11: an unsafe fn may not coerce to a safe callable type.
-                    if fn_is_unsafe != 0 and self.fn_type_is_unsafe(expected as i32) == 0:
-                        self.emit_error("cannot use unsafe fn where a safe function type is expected; mark the target type 'unsafe fn' or wrap the contract in a safe function", node)
-                        return 0
+                let expected_kind = self.get_type_kind(expected)
+                let matches = if expected_kind == TypeKind.TY_EXTERN_FN: self.fn_types_compatible(expected, fn_tid) != 0
+                    else if expected_kind == TypeKind.TY_FN: self.fn_types_assignable(expected as i32, fn_tid) != 0
+                    else: false
+                // §16.11: an unsafe callable may not coerce to a safe callable type.
+                if matches and fn_is_unsafe and self.fn_type_is_unsafe(expected as i32) == 0:
+                    self.emit_error("cannot use unsafe fn where a safe function type is expected; mark the target type 'unsafe fn' or wrap the contract in a safe function", node)
+                    return 0
+                if matches and expected_kind == TypeKind.TY_EXTERN_FN:
                     self.typed_expr_types.insert(node, expected as i32)
                     self.fn_value_ident_sigs.insert(node, sig_idx)
                     self.note_callable_value(sig_idx, expected as i32)
                     return expected as i32
-            self.typed_expr_types.insert(node, fn_tid)
+            self.typed_expr_types.insert(node, value_tid)
             self.fn_value_ident_sigs.insert(node, sig_idx)
-            self.note_callable_value(sig_idx, fn_tid)
-            return fn_tid
+            self.note_callable_value(sig_idx, value_tid)
+            return value_tid
         if (sig_idx >= 0 or self.generic_fn_node_for_symbol(sym) != 0) and self.symbol_visible_from_current(sym) == 0:
             self.emit_private_symbol_error(sym, node)
             return 0
@@ -20156,8 +20334,10 @@ impl Sema:
             self.check_indirect_may_suspend_context(node, closure_node)
         let expected = self.get_type_d1(fn_tid)
         let actual = arg_count + param_offset
+        // #1832: a variadic pointer takes its fixed arguments and any more.
+        let variadic = self.fn_type_is_variadic(fn_tid)
         if self.ast.has_call_named_args(node) == 0 and self.has_resolved_call_args(node) == 0:
-            if actual != expected:
+            if actual != expected and not (variadic and actual > expected):
                 if call_name.len() > 0:
                     self.emit_error(f"callable '{call_name}' expects {expected} argument(s), found {actual}", node)
                 else:
@@ -20548,11 +20728,21 @@ impl Sema:
                 if self.ast.has_call_named_args(node) != 0:
                     self.emit_error("named arguments are not supported for closures or function pointers", node)
                 let arg_types_for_callable: Vec[i32] = Vec.new()
+                let callable_arg_nodes: Vec[i32] = Vec.new()
+                var callable_passed_types = sema_new_map_i32_i32()
                 for cai in 0..arg_count:
                     let arg_node = self.ast.get_extra(extra_start + cai)
                     let expected_ty = self.fn_type_param_type(callable_tid, cai)
                     let arg_ty = if expected_ty != 0: self.check_expr_with_expected(arg_node, expected_ty as TypeId) else: self.check_expr_value_context(arg_node)
+                    // #1832: an argument a variadic pointer's `...` receives.
+                    if expected_ty == 0 and self.fn_type_is_variadic(callable_tid):
+                        let passed_ty = self.materialize_variadic_value_arg(arg_node, arg_ty as i32)
+                        if passed_ty != arg_ty as i32:
+                            callable_passed_types.insert(cai, passed_ty)
                     arg_types_for_callable.push(arg_ty as i32)
+                    callable_arg_nodes.push(arg_node)
+                if self.fn_type_is_variadic(callable_tid):
+                    self.record_c_promoted_args(node, 0, callable_arg_nodes, arg_types_for_callable, callable_passed_types, self.get_type_d1(callable_tid))
                 for cai2 in 0..arg_count:
                     self.mark_moved_if_consumed(self.ast.get_extra(extra_start + cai2))
                 return self.check_callable_value_call("", callable_tid, 0, node, extra_start, arg_count, 0, 0, arg_types_for_callable)
@@ -20875,6 +21065,8 @@ impl Sema:
             return 0
         var arg_types: Vec[i32] = Vec.new()
         let checked_arg_nodes: Vec[i32] = Vec.new()
+        // Argument index -> the pointee a variadic slot's Copy view passes.
+        var variadic_passed_types = sema_new_map_i32_i32()
         // docs/completed/mut.md Rev 8 §15.8 — borrow indices to remove after this call's
         // arg-loop completes. Iterator-of-self borrows live for the duration of
         // the enclosing call so sibling closures conflict with them.
@@ -20951,8 +21143,12 @@ impl Sema:
             // D27 value context). An element/Copy view reaching a variadic slot
             // has no param type to drive materialization, so demand it here — else
             // MIR passes the view's address and the callee reads a pointer.
-            if expected_ty == 0 and sig_idx >= 0 and self.sig_is_variadic(sig_idx) != 0 and (ai + param_offset) >= self.sig_get_param_count(sig_idx):
-                self.materialize_variadic_value_arg(arg_node, arg_ty as i32)
+            let variadic_slot = if sig_idx >= 0: self.sig_is_variadic(sig_idx) != 0 and (ai + param_offset) >= self.sig_get_param_count(sig_idx)
+                else: callable_value_tid != 0 and self.fn_type_is_variadic(callable_value_tid) and (ai + param_offset) >= self.get_type_d1(callable_value_tid)
+            if expected_ty == 0 and variadic_slot:
+                let passed_ty = self.materialize_variadic_value_arg(arg_node, arg_ty as i32)
+                if passed_ty != arg_ty as i32:
+                    variadic_passed_types.insert(ai, passed_ty)
             // §16.3c: a string literal that provably contains an interior NUL must
             // not coerce to a C string at an FFI boundary — C would truncate.
             if expected_ty != 0 and self.sema_type_is_c_char_pointer(expected_ty) != 0 and (self.extern_fn_names.contains(fn_sym) or self.ci_syms.contains(fn_sym)):
@@ -20990,6 +21186,15 @@ impl Sema:
             let iter_idx = self.maybe_register_iter_of_self_borrow(arg_node)
             if iter_idx >= 0:
                 iter_borrow_idxs.push(iter_idx)
+        // #1831: a call to a function declared without a prototype; #1849:
+        // the arguments a variadic callee's `...` receives.
+        if sig_idx >= 0 and self.sig_is_unprototyped(sig_idx):
+            self.record_c_promoted_args(node, fn_sym, checked_arg_nodes, arg_types, variadic_passed_types, -1)
+        else if sig_idx >= 0 and self.sig_is_variadic(sig_idx) != 0:
+            self.record_c_promoted_args(node, fn_sym, checked_arg_nodes, arg_types, variadic_passed_types, self.sig_get_param_count(sig_idx) - param_offset)
+        else if sig_idx < 0 and callable_value_tid != 0 and self.fn_type_is_variadic(callable_value_tid):
+            // #1832: a call through a C variadic function pointer.
+            self.record_c_promoted_args(node, 0, checked_arg_nodes, arg_types, variadic_passed_types, self.get_type_d1(callable_value_tid) - param_offset)
         // Drop iter-of-self borrows in reverse insertion order so indices stay valid.
         var ibi = iter_borrow_idxs.len() as i32 - 1
         while ibi >= 0:
@@ -21029,14 +21234,9 @@ impl Sema:
         // facade item as a covered return is: the pointer C hands back never
         // reaches the program, only the `Option[CStr]` made of it — the
         // translated inline body's `unsafe` marking is about that pointer.
-        if self.fn_symbol_is_unsafe(fn_sym) != 0 and not self.facade_call_is_presented(fn_sym):
-            if self.require_unsafe_operation("unsafe function call requires unsafe context", node) == 0:
-                return 0
-        else if self.fn_symbol_is_raw_c_import(fn_sym) != 0:
-            if self.require_unsafe_operation("raw c_import function call requires unsafe context", node) == 0:
-                return 0
-        else if self.fn_symbol_is_manual_extern(fn_sym) != 0:
-            if self.require_unsafe_operation("manual extern function call requires unsafe context", node) == 0:
+        let unsafe_call_reason = self.fn_symbol_unsafe_call_reason(fn_sym, self.facade_call_is_presented(fn_sym))
+        if unsafe_call_reason.len() > 0:
+            if self.require_unsafe_operation(unsafe_call_reason, node) == 0:
                 return 0
         else if self.in_unsafe != 0 and sema_name_is_compiler_abi_extern(self.pool_resolve(fn_sym)) != 0:
             // D30 transition: a runtime-ABI call (with_/rt_/wl_) is
@@ -28344,13 +28544,11 @@ impl Sema:
             return 0
         if kind == NodeKind.NK_TYPE_PTR or kind == NodeKind.NK_TYPE_OPTIONAL:
             return self.type_expr_contains_ref(self.ast.get_data0(node))
+        // A callable type holds no reference its signature names: `fn(&T) -> R`
+        // takes a view per call and holds none (§16.6, §22.1 rule 1; #1833).
+        // What a closure captures is value-level (§22), not in its type.
         if kind == NodeKind.NK_TYPE_FN or kind == NodeKind.NK_TYPE_EXTERN_FN:
-            let extra_start = self.ast.get_data0(node)
-            let param_count = self.ast.get_data1(node)
-            for pi in 0..param_count:
-                if self.type_expr_contains_ref(self.ast.get_extra(extra_start + pi)) != 0:
-                    return 1
-            return self.type_expr_contains_ref(self.ast.get_data2(node))
+            return 0
         if kind == NodeKind.NK_TYPE_TUPLE:
             let extra_start = self.ast.get_data0(node)
             let elem_count = self.ast.get_data1(node)
@@ -28393,13 +28591,9 @@ impl Sema:
             return 0
         if kind == NodeKind.NK_TYPE_PTR or kind == NodeKind.NK_TYPE_OPTIONAL:
             return self.type_expr_is_collection_with_ref(self.ast.get_data0(node))
+        // A callable type stores nothing its signature names (#1833).
         if kind == NodeKind.NK_TYPE_FN or kind == NodeKind.NK_TYPE_EXTERN_FN:
-            let extra_start = self.ast.get_data0(node)
-            let param_count = self.ast.get_data1(node)
-            for pi in 0..param_count:
-                if self.type_expr_is_collection_with_ref(self.ast.get_extra(extra_start + pi)) != 0:
-                    return 1
-            return self.type_expr_is_collection_with_ref(self.ast.get_data2(node))
+            return 0
         if kind == NodeKind.NK_TYPE_TUPLE:
             let extra_start = self.ast.get_data0(node)
             let elem_count = self.ast.get_data1(node)
