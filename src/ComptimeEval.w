@@ -2,6 +2,7 @@ use ComptimeValue
 use Sema
 use Ast
 use Span
+use Source
 use Diagnostic
 use InternPool
 use TypeLayout
@@ -89,6 +90,11 @@ extern fn with_str_from_byte(byte: i32) -> str
 extern fn with_str_starts_with_ref(s: &str, prefix: &str) -> i32
 extern fn with_str_ends_with_ref(s: &str, suffix: &str) -> i32
 extern fn with_str_replace_ref(s: &str, old: &str, new_s: &str) -> str
+extern fn with_str_trim_ref(s: &str) -> str
+extern fn with_str_to_upper_ref(s: &str) -> str
+extern fn with_str_to_lower_ref(s: &str) -> str
+extern fn with_str_index_of_ref(hay: &str, needle: &str) -> i64
+extern fn with_str_repeat_ref(s: &str, count: i64) -> str
 extern fn with_sysinfo_hostname() -> str
 
 const COMPTIME_RECURSION_LIMIT: i32 = 256
@@ -1726,7 +1732,11 @@ impl ComptimeEvaluator:
         comptime_value_invalid()
 
     mut fn fail(node: i32, msg: &str) -> ComptimeControl:
-        self.last_error_msg = with_str_clone_ref(msg)
+        // The message names its source line: the build driver prints
+        // error_msg alone (the pending diagnostic is not rendered there), and
+        // "generic comptime function expects 1 type argument(s)" over a
+        // 300-line action named nothing (#1866, #1804).
+        self.last_error_msg = self.node_location(node) ++ msg
         if self.had_error == 0 and self.require_success != 0 and self.sema.suppress_errors == 0:
             let start = self.ast.get_start(node)
             let end = self.ast.get_end(node)
@@ -1734,6 +1744,14 @@ impl ComptimeEvaluator:
             self.pending_diag = Diagnostic.err(msg, Span { file: self.sema.local_file_id, start, end })
         self.had_error = 1
         comptime_control_error()
+
+    /// `path:line:col: ` for a node of the current module, "" when unknown.
+    mut fn node_location(node: i32) -> str:
+        let path = self.current_source_path()
+        if node == 0 or path == "<unknown>": return ""
+        let source = Source.from_string(path, self.current_source_text(), 0)
+        let loc = source.offset_to_location(self.ast.get_start(node))
+        f"{path}:{loc.line + 1}:{loc.col + 1}: "
 
     mut fn unsupported(node: i32) -> ComptimeControl:
         self.fail(node, f"expression kind {self.ast.kind(node)} is not comptime-evaluable yet")
@@ -3489,6 +3507,39 @@ impl ComptimeEvaluator:
             if arg_count != 0:
                 return self.fail(node, "str." ++ method ++ "() takes no arguments")
             return comptime_control_value(comptime_value_str(with_str_clone_ref(text)))
+        // The rest of MirLower's str intrinsic set (#1866): the build layer
+        // runs here whenever the native runner cannot be linked yet, and
+        // build/seed.w's seed_lock_value trims every lock line. Same runtime
+        // helpers as codegen, so comptime and runtime agree byte for byte.
+        if method == "trim" or method == "to_upper" or method == "upper" or method == "to_lower" or method == "lower":
+            if arg_count != 0:
+                return self.fail(node, "str." ++ method ++ "() takes no arguments")
+            if method == "trim":
+                return comptime_control_value(comptime_value_str(with_str_trim_ref(text)))
+            if method == "to_upper" or method == "upper":
+                return comptime_control_value(comptime_value_str(with_str_to_upper_ref(text)))
+            return comptime_control_value(comptime_value_str(with_str_to_lower_ref(text)))
+        if method == "index_of":
+            if arg_count != 1:
+                return self.fail(node, "str.index_of() expects exactly one argument")
+            let needle_signal = self.eval_expr(self.ast.get_extra(extra_start))
+            if needle_signal.kind != ComptimeControlKind.CTL_VALUE:
+                return needle_signal
+            if needle_signal.value.kind != ComptimeValueKind.CV_STR:
+                return self.fail(node, "str.index_of() argument must be a string")
+            return comptime_control_value(comptime_value_int(self.node_type_or(node, self.sema.ty_i64 as i32), with_str_index_of_ref(text, needle_signal.value.text)))
+        if method == "repeat":
+            if arg_count != 1:
+                return self.fail(node, "str.repeat() expects exactly one argument")
+            let count_signal = self.eval_expr(self.ast.get_extra(extra_start))
+            if count_signal.kind != ComptimeControlKind.CTL_VALUE:
+                return count_signal
+            if comptime_value_is_intlike(count_signal.value) == 0:
+                return self.fail(node, "str.repeat() count must be an integer")
+            let count = comptime_value_intlike(count_signal.value)
+            if count < 0:
+                return self.fail(node, "str.repeat() count is negative in comptime")
+            return comptime_control_value(comptime_value_str(with_str_repeat_ref(text, count)))
         self.fail(node, "str method '" ++ method ++ "' is not comptime-evaluable yet")
 
     mut fn concrete_method_comptime_type_args(fn_sym: i32, concrete_sig: i32, node: i32) -> ComptimeGenericResolvedArgs:
@@ -7769,6 +7820,48 @@ impl ComptimeEvaluator:
         self.eval_fn_symbol_call_values_with_type_args(fn_sym, arg_values, node, empty_tp_syms, empty_tp_tys)
 
     mut fn eval_fn_symbol_call_values_with_type_args(fn_sym: i32, arg_values: &Vec[ComptimeValue], node: i32, tp_syms: &Vec[i32], tp_tys: &Vec[i32]) -> ComptimeControl:
+        if tp_syms.len() == 0:
+            let inferred = self.inferred_generic_type_args(fn_sym, arg_values, node)
+            if inferred.ok == 0:
+                return comptime_control_error()
+            if inferred.tp_syms.len() > 0:
+                return self.eval_fn_symbol_call_values_with_resolved_type_args(fn_sym, arg_values, node, inferred.tp_syms, inferred.tp_tys)
+        self.eval_fn_symbol_call_values_with_resolved_type_args(fn_sym, arg_values, node, tp_syms, tp_tys)
+
+    /// The type arguments of a generic function called without spelling them
+    /// (`print(x)` — D55's `print[T: Display]`, so every build action that
+    /// prints reaches here on the bootstrap path, #1866/#1804). Sema inferred
+    /// them from the arguments (check_generic_call) and recorded the concrete
+    /// specialization on the call node; read that, never re-derive it (D65).
+    /// `ok` with no type arguments when the callee is not generic.
+    mut fn inferred_generic_type_args(fn_sym: i32, arg_values: &Vec[ComptimeValue], node: i32) -> ComptimeGenericResolvedArgs:
+        let fn_node = self.find_fn_decl_node(fn_sym)
+        if fn_node == 0:
+            return ComptimeGenericResolvedArgs { ok: 1, tp_syms: Vec.new(), tp_tys: Vec.new() }
+        let meta = self.ast.find_fn_meta(fn_node)
+        if meta < 0 or self.ast.fn_meta_tp_count(meta) == 0:
+            return ComptimeGenericResolvedArgs { ok: 1, tp_syms: Vec.new(), tp_tys: Vec.new() }
+        var concrete_sig = -1
+        let recorded = self.sema.resolved_call_sigs.get(node)
+        if recorded.is_some():
+            concrete_sig = recorded.unwrap()
+        else:
+            // Fold-order evaluation can reach a call Sema has not checked yet:
+            // ask Sema now, as eval_user_method_value does for methods.
+            let arg_types: Vec[i32] = Vec.new()
+            let arg_nodes: Vec[i32] = Vec.new()
+            for i in 0..arg_values.len() as i32:
+                arg_types.push(self.comptime_value_semantic_type(arg_values[i]))
+            let ret_ty = self.sema.check_generic_call(fn_sym, fn_node, arg_types, arg_nodes, arg_values.len() as i32, node)
+            let checked = self.sema.resolved_call_sigs.get(node)
+            if ret_ty != 0 and checked.is_some():
+                concrete_sig = checked.unwrap()
+        if concrete_sig < 0:
+            let _ = self.fail(node, "generic comptime function '" ++ self.pool.resolve(fn_sym) ++ "' has no type arguments inferred for this call")
+            return ComptimeGenericResolvedArgs { ok: 0, tp_syms: Vec.new(), tp_tys: Vec.new() }
+        self.concrete_method_comptime_type_args(fn_sym, concrete_sig, node)
+
+    mut fn eval_fn_symbol_call_values_with_resolved_type_args(fn_sym: i32, arg_values: &Vec[ComptimeValue], node: i32, tp_syms: &Vec[i32], tp_tys: &Vec[i32]) -> ComptimeControl:
         self.last_call_has_mut_receiver = 0
         self.last_call_mut_receiver = comptime_value_invalid()
         let fn_name: str = with_str_clone_ref(self.pool.resolve(fn_sym))
