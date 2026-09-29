@@ -394,11 +394,21 @@ fn ci_object_macro_is_function_alias(type_session: i64, value: &str) -> bool:
         return false
     ci_lookup_c_function_return_type(type_session, t).len() > 0
 
+// C's unary prefix operators that keep a call a call: `~f(x)`, `-f(x)`,
+// `+f(x)`, `!f(x)`.
+fn ci_is_unary_prefix_op(c: u8) -> bool: c == '~' or c == '-' or c == '+' or c == '!'
+
 // After semantic constant translation has failed, a whole call expression
 // cannot become a global: C re-evaluates it at each use. This also applies
 // when the callee is a successfully translated function-like macro.
 fn ci_object_macro_has_call_shape(value: &str):
-    let t = ci_strip_parens(ci_trim(value))
+    var t = ci_strip_parens(ci_trim(value))
+    // A unary operator applied to a call is still a call: SDL's
+    // `#define SDL_MIN_SINT64 ~SDL_SINT64_C(0x7FFFFFFFFFFFFFFF)` must not
+    // become a global that names the function-like macro.
+    while t.len() > 1 and ci_is_unary_prefix_op(t[0]):
+        let operand = ci_strip_parens(ci_trim(t.slice(1, t.len())))
+        t = operand
     if t.len() < 3 or t[t.len() - 1] != 41:
         return false
     var open = 0
@@ -958,6 +968,18 @@ fn ci_type_name_is_emitted(name: &str) -> bool:
 
 fn ci_mark_type_name_emitted(name: &str):
     with_cimport_mark_name_emitted(ci_type_emitted_key(name))
+
+// Frontend owns `only:` selection. A discarded declaration must not reserve
+// either its value name or its type name in the translator's dedup table.
+pub fn ci_forget_filtered_name(name: &str):
+    cimport_forget_emitted_name(name)
+    cimport_forget_emitted_name(ci_type_emitted_key(name))
+    // The AST carries the escaped With name; the bridge carries the C name.
+    if name.ends_with("_"):
+        let raw_name = name.slice(0, name.len() - 1)
+        if ci_escape_reserved(raw_name) == name:
+            cimport_forget_emitted_name(raw_name)
+            cimport_forget_emitted_name(ci_type_emitted_key(raw_name))
 
 fn ci_type_decl_name_exists(session: i64, name: &str) -> bool: ci_decl_name_has(session, name, CI_NAME_TYPE)
 
@@ -2418,7 +2440,6 @@ pub fn ci_default_for_type(ty: &str) -> str:
     // But NOT struct types — those need struct-literal defaults, not integer 0.
     // Check: if the type resolves to a primitive int alias, use 0.
     // Otherwise leave empty (no default) for struct/union/opaque types.
-    if ci_starts_with(ty, "Vector("): return ""
     // Array types [N]T → emit [0 as T; N]
     if ty.len() > 0 and ty[0] == 91:
         // Parse [N]T to get element type and count
@@ -3367,6 +3388,26 @@ pub fn ci_translate_macros(session: i64, type_session: i64, macro_source: &str) 
             if not ci_migrate_shared_decl_add("let", safe_name, let_line):
                 output = output ++ let_line ++ "\n"
         else:
+            // A macro naming a declared type is a type alias, not a value:
+            // MSVC's <stdlib.h> `#define onexit_t _onexit_t` must not become
+            // `let onexit_t = _onexit_t`. One meaning is forced, so the alias
+            // is emitted as `type X = T` when this import emits T; a target
+            // it does not emit (dropped by `only:`, omitted as opaque) makes
+            // the macro untranslated, so a use names the omission. This runs
+            // before the type-like skip below, which would otherwise swallow
+            // every typedef-named target (`g_macro_type_names`).
+            let alias_target = ci_trim(stripped)
+            if ci_is_c_ident(alias_target) and (ci_type_name_is_emitted(alias_target) or ci_type_decl_name_exists(type_session, alias_target)):
+                if ci_type_name_is_emitted(alias_target):
+                    let safe_name = ci_escape_reserved(name)
+                    let type_line = "type " ++ safe_name ++ " = " ++ ci_escape_reserved(alias_target)
+                    if not ci_migrate_shared_decl_add("type", safe_name, type_line):
+                        output = output ++ type_line ++ "\n"
+                    with_cimport_mark_name_emitted(name)
+                    ci_mark_type_name_emitted(name)
+                else:
+                    ci_record_untranslated_object_macro(name, macro_is_system)
+                continue
             if ci_object_macro_value_is_type_like(stripped):
                 continue
             // A comma-list object macro (e.g. `#define OP_NAME_LIST "End",
