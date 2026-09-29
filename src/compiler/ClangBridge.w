@@ -10,7 +10,7 @@ extern fn with_alloc(size: i64) -> *mut u8
 extern fn with_free(ptr: *mut u8) -> Unit
 extern fn with_memcpy(dst: *mut u8, src: *const u8, len: i64) -> *mut u8
 extern fn with_memset(dst: *mut u8, val: i32, len: i64) -> *mut u8
-extern fn rt_write(fd: i32, buf: *const u8, len: u64) -> i64
+extern fn rt_write(fd: i32, buf: *const u8, len: i64) -> i64
 extern fn rt_close(fd: i32) -> i32
 
 // ── libSystem extern fns ────────────────────────────────────────
@@ -1981,8 +1981,8 @@ pub fn with_cimport_parse(header_code: &str) -> i64:
             return s as i64
 
         let src_ptr = *(header_code as *const str as *const *const u8)
-        let _ = rt_write(fd, src_ptr, header_code.len() as u64)
-        let _ = rt_write(fd, "\n\0" as *const u8, 1 as u64)
+        let _ = rt_write(fd, src_ptr, header_code.len())
+        let _ = rt_write(fd, "\n\0" as *const u8, 1)
         let _ = rt_close(fd)
         (*s).tmp_path = c_strdup(&template_path as *const [4096]u8 as *const u8)
 
@@ -3117,8 +3117,8 @@ unsafe fn cimport_collect_macros_from_libclang(ms: *mut MacroSession, header_cod
         with_cimport_dispose(s as i64)
         return 0
     let src_ptr = *(header_code as *const str as *const *const u8)
-    let _ = rt_write(fd, src_ptr, header_code.len() as u64)
-    let _ = rt_write(fd, "\n\0" as *const u8, 1 as u64)
+    let _ = rt_write(fd, src_ptr, header_code.len())
+    let _ = rt_write(fd, "\n\0" as *const u8, 1)
     let _ = rt_close(fd)
     (*s).tmp_path = c_strdup(&template_path as *const [4096]u8 as *const u8)
 
@@ -3200,8 +3200,8 @@ pub fn with_cimport_collect_object_macro_types(header_code: &str, macro_names: &
             return ""
 
         let src_ptr = *(header_code as *const str as *const *const u8)
-        let _ = rt_write(fd, src_ptr, header_code.len() as u64)
-        let _ = rt_write(fd, "\n\0" as *const u8, 1 as u64)
+        let _ = rt_write(fd, src_ptr, header_code.len())
+        let _ = rt_write(fd, "\n\0" as *const u8, 1)
 
         var pos: i32 = 0
         while pos < macro_names.len() as i32:
@@ -3214,7 +3214,7 @@ pub fn with_cimport_collect_object_macro_types(header_code: &str, macro_names: &
                 let name = macro_names.slice(start as i64, pos as i64)
                 let probe_line = "__typeof__(" ++ name ++ ") __with_macro_probe_" ++ name ++ ";\n"
                 let probe_ptr = *(&probe_line as *const *const u8)
-                let _ = rt_write(fd, probe_ptr, probe_line.len() as u64)
+                let _ = rt_write(fd, probe_ptr, probe_line.len())
         let _ = rt_close(fd)
         (*s).tmp_path = c_strdup(&template_path as *const [4096]u8 as *const u8)
 
@@ -3309,13 +3309,13 @@ pub fn with_cimport_parse_macro_probe(header_code: &str, macro_names: &str) -> i
             return 0
 
         let src_ptr = *(header_code as *const str as *const *const u8)
-        let _ = rt_write(fd, src_ptr, header_code.len() as u64)
-        let _ = rt_write(fd, "\n\0" as *const u8, 1 as u64)
+        let _ = rt_write(fd, src_ptr, header_code.len())
+        let _ = rt_write(fd, "\n\0" as *const u8, 1)
         for name in macro_names.split("|"):
             if name.len() == 0: continue
             let probe_line = "__typeof__(" ++ name ++ ") __with_macro_probe_" ++ name ++ " = " ++ name ++ ";\n"
             let probe_ptr = *(&probe_line as *const *const u8)
-            let _ = rt_write(fd, probe_ptr, probe_line.len() as u64)
+            let _ = rt_write(fd, probe_ptr, probe_line.len())
         let _ = rt_close(fd)
         (*s).tmp_path = c_strdup(&template_path as *const [4096]u8 as *const u8)
 
@@ -4194,6 +4194,23 @@ pub fn with_ci_type_is_pointer(session: i64, cursor_idx: i32) -> i32:
         let ty = clang_getCursorType(cursor)
         let canonical = clang_getCanonicalType(ty)
         if canonical.kind == CXType_Pointer: return 1
+        0
+
+// The width in bits of the arithmetic type of a cursor's value as c_import
+// models it (`long` is c_long, i64, on every target), or 0 for any other
+// type — an enum, a bool, a pointer. Reads the canonical kind only, never
+// clang_Type_getSizeOf, which crashes on some incomplete types.
+pub fn with_ci_scalar_type_bits(session: i64, cursor_idx: i32) -> i32:
+    unsafe:
+        let s = session as *mut CImportSession
+        if s as i64 == 0 or cursor_idx < 0 or cursor_idx >= (*s).cursor_count: return 0
+        let cursor = *(((*s).cursors as i64 + cursor_idx as i64 * 32) as *const CXCursor)
+        let k = clang_getCanonicalType(clang_getCursorType(cursor)).kind
+        if k == CXType_Char_S or k == CXType_Char_U or k == CXType_SChar or k == CXType_UChar: return 8
+        if k == CXType_Short or k == CXType_UShort or k == CXType_Half or k == CXType_Float16: return 16
+        if k == CXType_Int or k == CXType_UInt or k == CXType_Float: return 32
+        if k == CXType_Long or k == CXType_ULong or k == CXType_LongLong or k == CXType_ULongLong or k == CXType_Double or k == CXType_LongDouble: return 64
+        if k == CXType_Int128 or k == CXType_UInt128 or k == CXType_Float128: return 128
         0
 
 pub fn with_ci_type_is_float(session: i64, cursor_idx: i32) -> i32:

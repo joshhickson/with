@@ -19,6 +19,8 @@ use SemaDecl
 use FnAbi
 use TargetSpec
 
+use Overflow
+
 extern fn with_str_clone_ref(s: &str) -> str
 extern fn with_write(s: &str) -> Unit
 extern fn with_eprint(s: &str) -> Unit
@@ -741,6 +743,15 @@ impl Sema:
         let rhs_resolved = self.resolve_alias(rhs as TypeId)
         if lhs_resolved == rhs_resolved:
             return lhs_resolved as i32
+        // Two numeric arms meet where an operator's operands meet (§4.2.6,
+        // implicit_numeric_join): the type one widens into losslessly, and
+        // none for i32 beside u32 or an integer beside a float.
+        // arithmetic_result_type took the left arm at equal width, so
+        // `if c: 0 else: n as u32` was i32 and the u32 arm changed sign
+        // silently, while the arms the other way round joined at u32.
+        if self.is_plain_numeric_type(lhs) and self.is_plain_numeric_type(rhs):
+            return self.implicit_numeric_join(lhs as TypeId, rhs as TypeId) as i32
+        // A `repr` enum beside a number joins as it did before the rule above.
         let arithmetic = self.arithmetic_result_type(lhs as TypeId, rhs as TypeId)
         if arithmetic != 0:
             return arithmetic as i32
@@ -832,6 +843,26 @@ impl Sema:
         var owned_candidate = 0
         var reference_candidate = 0
 
+        // §4.2.1, as at an operator (contextualize the literal to its peer):
+        // with no enclosing demand, an untyped literal arm — a bare unsuffixed
+        // literal or arithmetic of them — takes its type from the typed
+        // numeric arms, in either arm order, and anchors the join only when
+        // every arm is one. Checked in value context it was i32 and joined
+        // as an i32 arm: `if c: 0 else: n as u32` was i32 with the u32 arm
+        // changed sign silently, and `Sleep(ms)` then refused the i32.
+        var literal_arm_count = 0
+        var typed_numeric_arm = 0
+        if expected == 0:
+            for ai in 0..arm_count:
+                let arm_ty = resolved_arm_types[ai]
+                if arm_ty == 0 or arm_nodes[ai] <= 0 or not self.is_plain_numeric_type(arm_ty):
+                    continue
+                if self.expr_is_untyped_literal_arith(arm_nodes[ai]):
+                    literal_arm_count = literal_arm_count + 1
+                else if self.body_can_fall_through(arm_nodes[ai]) != 0:
+                    typed_numeric_arm = 1
+        let literal_arms_adapt = literal_arm_count > 0 and typed_numeric_arm != 0
+
         for ai in 0..arm_count:
             let arm_ty = resolved_arm_types[ai]
             if arm_ty == 0:
@@ -846,8 +877,14 @@ impl Sema:
             if reach_node > 0 and self.body_can_fall_through(reach_node) == 0:
                 continue
             reaching_count = reaching_count + 1
+            if literal_arms_adapt and self.expr_is_untyped_literal_arith(reach_node):
+                continue
             if self.get_type_kind(resolved) == TypeKind.TY_REF:
+                let prior_reference = reference_candidate
                 reference_candidate = self.merge_contextual_reference_join_types(reference_candidate, arm_ty)
+                if reference_candidate == 0:
+                    self.emit_error(join_name ++ " arms view `" ++ self.type_name(prior_reference) ++ "` and `" ++ self.type_name(arm_ty) ++ "`; a reference cannot convert its pointee (§4.2.6), so every arm must view one type", report_node)
+                    return 0
             else:
                 let prior_candidate = owned_candidate
                 owned_candidate = self.merge_contextual_owned_join_types(owned_candidate, arm_ty)
@@ -869,6 +906,8 @@ impl Sema:
                         self.emit_error("cannot infer return type: " ++ join_name ++ " arms have types " ++ lhs_name ++ " and " ++ rhs_name ++ "; " ++ remedy, report_node)
                     else if report_node == self.display_join_node:
                         self.emit_display_join_mismatch(join_name, prior_candidate, arm_ty, arm_nodes[ai], report_node)
+                    else if self.is_plain_numeric_type(prior_candidate) and self.is_plain_numeric_type(arm_ty):
+                        self.emit_error(join_name ++ " arms have types `" ++ self.type_name(prior_candidate) ++ "` and `" ++ self.type_name(arm_ty) ++ "`; no implicit conversion joins them (§4.2.6), so spell one arm with `as`", report_node)
                     else:
                         self.emit_error(join_name ++ " expressions do not establish one compatible owned result type", report_node)
                     return 0
@@ -911,6 +950,17 @@ impl Sema:
         if final_type == 0:
             self.emit_error(join_name ++ " expressions do not establish one compatible result type", report_node)
             return 0
+
+        // The untyped literal arms take the typed arms' type, checked again
+        // under that demand so their recorded type and constant fold agree
+        // with the join (a literal that does not fit reports here).
+        if literal_arms_adapt and self.is_plain_numeric_type(final_type):
+            for ai in 0..arm_count:
+                let arm_node = arm_nodes[ai]
+                if resolved_arm_types[ai] != 0 and arm_node > 0 and self.expr_is_untyped_literal_arith(arm_node):
+                    let retyped = self.check_expr_with_expected(arm_node, final_type as TypeId)
+                    if retyped != 0:
+                        resolved_arm_types[ai] = retyped as i32
 
         // Complete context-dependent variant shorthands only after the final
         // candidate is known. This preserves `Some(x) / None` ergonomics in
@@ -978,6 +1028,12 @@ impl Sema:
                     if self.contextual_join_value_accepts(final_type, arm_ty) == 0:
                         self.emit_contextual_join_mismatch(join_name, final_type, arm_ty, report_node, arm_node)
                         return 0
+                    // Under an owned expectation every arm is that demand's
+                    // value (#1803): `let y: i32 = if c: 5 else: big` with
+                    // `big: i64` narrowed the arm silently.
+                    let arm_value_node = if arm_node > 0: self.join_arm_value_node(arm_node) else: origin_node
+                    if expected != 0 and final_type == expected and arm_value_node > 0:
+                        let _ = self.reject_implicit_numeric_narrowing(arm_value_node, final_type, arm_ty)
                     arm_kind = D22_JOIN_ARM_OWNED_ANCHOR
                     owned_anchor_count = owned_anchor_count + 1
 
@@ -1196,6 +1252,7 @@ impl Sema:
             // non-Copy field reached through a view cannot satisfy it. The
             // auto-ref path above already returned for &T parameters.
             self.reject_owned_demand_from_view_projection(arg_node, expected, "call argument")
+            let _ = self.reject_implicit_numeric_narrowing(arg_node, expected, actual)
             let _ = self.record_contextual_copy_adjustment(arg_node, expected, actual)
 
     // #1627 (§3.8, D22): an enum payload is a demand like a parameter. A
@@ -3714,6 +3771,11 @@ impl Sema:
                 self.note_returned_transparent_view_effects(body)
                 self.check_returned_ephemeral_value_origins(body, body)
             self.check_returned_closure_env(body, body)
+        // The declared return type is an owned demand on the tail (#1803),
+        // as on a `return` (check_return).
+        if body_expected_ret != 0 and body_expected_ret != self.ty_void and body_ty != 0 and body_ty != self.ty_void and body_ty != self.ty_never:
+            let tail_block = if self.ast.kind(source_body) == NodeKind.NK_BLOCK: self.ast.get_data2(source_body) else: source_body
+            let _ = self.reject_implicit_numeric_narrowing(if tail_block != 0: tail_block else: body, body_expected_ret as i32, body_ty as i32)
         if body_expected_ret != 0 and body_expected_ret != self.ty_void and body_ty != 0 and body_ty != self.ty_void and body_ty != self.ty_never and self.body_has_explicit_value_result(body, 1) != 0:
             if self.return_value_type_compatible(body_expected_ret as i32, body_ty as i32) == 0 and body_materializes_copy == 0:
                 self.emit_error("return type mismatch", body)
@@ -10552,6 +10614,12 @@ fn sema_operator_primitive_name(op: i32) -> str:
     if op == BinaryOp.OP_LT or op == BinaryOp.OP_GT or op == BinaryOp.OP_LTE or op == BinaryOp.OP_GTE: return "cmp"
     ""
 
+// §4.2.2/§4.2.3: the arithmetic operators, checked, wrapping and saturating.
+fn sema_binary_op_is_arithmetic(op: i32) -> bool:
+    op == BinaryOp.OP_ADD or op == BinaryOp.OP_SUB or op == BinaryOp.OP_MUL or op == BinaryOp.OP_DIV or op == BinaryOp.OP_MOD or
+        op == BinaryOp.OP_ADD_WRAP or op == BinaryOp.OP_SUB_WRAP or op == BinaryOp.OP_MUL_WRAP or
+        op == BinaryOp.OP_ADD_SAT or op == BinaryOp.OP_SUB_SAT or op == BinaryOp.OP_MUL_SAT
+
 fn sema_operator_method_name(op: i32) -> str:
     if op == BinaryOp.OP_ADD: return "add"
     if op == BinaryOp.OP_SUB: return "sub"
@@ -10933,23 +11001,170 @@ impl Sema:
             return pointee as TypeId
         peer
 
-    // An expression whose type no operand decides: unsuffixed numeric
-    // literals, grouped, negated, or combined by arithmetic.
-    fn expr_is_untyped_literal_arith(node: i32) -> bool:
+    // Numeric literals combined by arithmetic, bitwise operators, shifts,
+    // negation, `~` and grouping. `constant` admits suffixed literals and
+    // asks for a value known here: a shift's amount must be one too. Without
+    // it, the question is whether a context decides the type, and a shift's
+    // type is its left operand's alone.
+    fn expr_is_literal_arith_of(node: i32, constant: bool) -> bool:
         if node == 0:
             return false
         let kind = self.ast.kind(node)
         if kind == NodeKind.NK_INT_LIT or kind == NodeKind.NK_FLOAT_LIT:
-            return self.literal_suffix_type(self.ast.literal_suffix(node)) == 0
+            return constant or self.literal_suffix_type(self.ast.literal_suffix(node)) == 0
         if kind == NodeKind.NK_GROUPED:
-            return self.expr_is_untyped_literal_arith(self.ast.get_data0(node))
-        if kind == NodeKind.NK_UNARY and self.ast.get_data0(node) == UnaryOp.UOP_NEGATE:
-            return self.expr_is_untyped_literal_arith(self.ast.get_data1(node))
+            return self.expr_is_literal_arith_of(self.ast.get_data0(node), constant)
+        if kind == NodeKind.NK_UNARY and (self.ast.get_data0(node) == UnaryOp.UOP_NEGATE or self.ast.get_data0(node) == UnaryOp.UOP_BIT_NOT):
+            return self.expr_is_literal_arith_of(self.ast.get_data1(node), constant)
         if kind == NodeKind.NK_BINARY:
             let op = self.ast.get_data0(node)
-            if op == BinaryOp.OP_ADD or op == BinaryOp.OP_SUB or op == BinaryOp.OP_MUL or op == BinaryOp.OP_DIV or op == BinaryOp.OP_MOD:
-                return self.expr_is_untyped_literal_arith(self.ast.get_data1(node)) and self.expr_is_untyped_literal_arith(self.ast.get_data2(node))
+            if sema_binary_op_is_arithmetic(op) or op == BinaryOp.OP_BIT_AND or op == BinaryOp.OP_BIT_OR or op == BinaryOp.OP_BIT_XOR:
+                return self.expr_is_literal_arith_of(self.ast.get_data1(node), constant) and self.expr_is_literal_arith_of(self.ast.get_data2(node), constant)
+            if op == BinaryOp.OP_SHL or op == BinaryOp.OP_SHR:
+                return self.expr_is_literal_arith_of(self.ast.get_data1(node), constant) and (not constant or self.expr_is_literal_arith_of(self.ast.get_data2(node), true))
         false
+
+    // An expression whose type no operand decides: unsuffixed numeric
+    // literals, grouped, negated, or combined by arithmetic. §4.2.1's
+    // context reaches through it to every literal (#1820), as it reaches a
+    // bare literal.
+    fn expr_is_untyped_literal_arith(node: i32): self.expr_is_literal_arith_of(node, false)
+
+    // A constant made of numeric literals alone, suffixed or not.
+    fn expr_is_literal_arith(node: i32): self.expr_is_literal_arith_of(node, true)
+
+    // The numeric type an enclosing context demands of an untyped literal
+    // expression (§4.2.1), or 0 when the context demands none.
+    fn untyped_literal_context_type() -> TypeId:
+        if self.has_expected_type == 0 or self.expected_expr_type == 0:
+            return 0 as TypeId
+        if self.is_numeric_type(self.expected_expr_type as i32): self.expected_expr_type else: 0 as TypeId
+
+    // The integer type an enclosing context demands of an untyped operand of
+    // a bitwise operator or a shift, or 0.
+    fn untyped_literal_int_context_type() -> TypeId:
+        let context = self.untyped_literal_context_type()
+        if context != 0 and self.get_type_kind(self.resolve_alias(self.numeric_operand_type(context as i32) as TypeId)) == TypeKind.TY_INT: context else: 0 as TypeId
+
+    // An untyped operand of `& | ^` checked at `ty`: a bare literal by its
+    // bit pattern (§4.2.4 rule 1), literal arithmetic as a value.
+    mut fn check_untyped_bitwise_operand(node: i32, ty: TypeId) -> TypeId:
+        if sema_node_is_bitwise_adaptable_literal(self.ast, node): self.check_bitwise_literal_with_expected(node, ty) else: self.check_expr_with_expected(node, ty)
+
+    // §4.2.3: arithmetic is checked, and a literal expression is
+    // evaluated at the type its context gave it. Its value is known here, so
+    // an overflow is a compile error at the operator that overflows, not a
+    // panic at run time (#1820: `let x: u8 = 200 + 100`). Reports only the
+    // node whose own operation overflows; an operand that already failed was
+    // reported when it was checked.
+    mut fn check_literal_arith_fits(node: i32, result: TypeId):
+        let resolved = self.resolve_alias(self.numeric_operand_type(result as i32) as TypeId)
+        if self.get_type_kind(resolved) != TypeKind.TY_INT:
+            return
+        let folded = self.fold_literal_int_arith(node)
+        if folded.ok != 0 and folded.overflow != 0:
+            self.emit_error(f"constant arithmetic overflows `{self.type_name(result as i32)}`: its literals have that type (§4.2.1) and arithmetic is checked (§4.2.3)", node)
+
+    mut fn emit_mixed_arithmetic_error(node: i32, lhs: TypeId, rhs: TypeId):
+        let l = self.type_name(lhs as i32)
+        let r = self.type_name(rhs as i32)
+        let lk = self.get_type_kind(self.resolve_alias(self.numeric_operand_type(lhs as i32) as TypeId))
+        let rk = self.get_type_kind(self.resolve_alias(self.numeric_operand_type(rhs as i32) as TypeId))
+        if lk != rk:
+            self.emit_error(f"arithmetic on `{l}` and `{r}` needs an explicit `as` on one operand (§4.2.6: no implicit integer-to-float conversion)", node)
+        else:
+            self.emit_error(f"arithmetic on `{l}` and `{r}` needs an explicit `as` on one operand (§4.2.6: no implicit sign change)", node)
+
+    // A wrapping or saturating operator computes at its left operand's type
+    // (§4.2.3); the right operand converts to it implicitly or not at all.
+    mut fn wrapping_operands_agree(node: i32, lhs: TypeId, rhs: TypeId) -> bool:
+        let join = self.implicit_numeric_join(lhs, rhs)
+        let lhs_numeric = self.resolve_alias(self.numeric_operand_type(lhs as i32) as TypeId)
+        let rk = self.get_type_kind(self.resolve_alias(self.numeric_operand_type(rhs as i32) as TypeId))
+        if rk != TypeKind.TY_INT and rk != TypeKind.TY_FLOAT:
+            return true
+        if join != 0 and self.resolve_alias(join) == lhs_numeric:
+            return true
+        self.emit_error(f"the right operand of a wrapping or saturating operator is `{self.type_name(rhs as i32)}`, which does not convert to the left operand's `{self.type_name(lhs as i32)}` implicitly; use an explicit `as` (§4.2.6)", node)
+        false
+
+    // §4.2.3 (Go, Rust, Zig and Swift alike): an integer division or
+    // remainder by a divisor known to be zero always panics, so it is a
+    // compile error at the expression.
+    mut fn reject_constant_zero_divisor(node: i32, op: i32, divisor: i32):
+        let folded = self.fold_literal_int_arith(divisor)
+        if folded.ok != 0 and folded.overflow == 0 and folded.value == 0:
+            let what = if op == BinaryOp.OP_DIV: "division" else: "remainder"
+            self.emit_error(f"{what} by zero: the divisor is a constant 0, so this always panics (§4.2.3)", node)
+
+    // The value of an integer literal expression at the types Sema
+    // recorded for its nodes. `ok == 0` when an operand cannot be folded or
+    // itself overflowed (already reported); `overflow != 0` when this node's
+    // own operation overflows.
+    fn fold_literal_int_arith(node: i32) -> IntArithmeticResult:
+        let failed = IntArithmeticResult { ok: 0, overflow: 0, value: 0 }
+        if node == 0:
+            return failed
+        let kind = self.ast.kind(node)
+        if kind == NodeKind.NK_GROUPED:
+            return self.fold_literal_int_arith(self.ast.get_data0(node))
+        let ty = if self.typed_expr_types.contains(node): self.typed_expr_types.get(node).unwrap() else: 0
+        let resolved = self.resolve_alias(self.numeric_operand_type(ty) as TypeId)
+        if ty == 0 or self.get_type_kind(resolved) != TypeKind.TY_INT:
+            return failed
+        let bits = self.get_type_d0(resolved)
+        let signed = self.get_type_d1(resolved)
+        if bits > 64:
+            return failed
+        if kind == NodeKind.NK_INT_LIT:
+            let words = self.ast.int_literal_expr_bits(node, bits, signed)
+            if words.ok == 0 or words.overflow != 0:
+                return failed
+            return IntArithmeticResult { ok: 1, overflow: 0, value: int_truncate_to_width(words.lo, bits, signed == 0) }
+        if kind == NodeKind.NK_UNARY:
+            let inner = self.fold_literal_int_arith(self.ast.get_data1(node))
+            if inner.ok == 0 or inner.overflow != 0:
+                return failed
+            if self.ast.get_data0(node) == UnaryOp.UOP_BIT_NOT:
+                return IntArithmeticResult { ok: 1, overflow: 0, value: int_truncate_to_width(~inner.value, bits, signed == 0) }
+            if self.ast.get_data0(node) != UnaryOp.UOP_NEGATE:
+                return failed
+            return int_eval_unary_neg(inner.value, bits, self.overflow_mode)
+        if kind != NodeKind.NK_BINARY:
+            return failed
+        let lhs = self.fold_literal_int_arith(self.ast.get_data1(node))
+        let rhs = self.fold_literal_int_arith(self.ast.get_data2(node))
+        if lhs.ok == 0 or lhs.overflow != 0 or rhs.ok == 0 or rhs.overflow != 0:
+            return failed
+        let op = self.ast.get_data0(node)
+        if op == BinaryOp.OP_BIT_AND or op == BinaryOp.OP_BIT_OR or op == BinaryOp.OP_BIT_XOR:
+            let bitwise = if op == BinaryOp.OP_BIT_AND: lhs.value & rhs.value else if op == BinaryOp.OP_BIT_OR: lhs.value | rhs.value else: lhs.value ^ rhs.value
+            return IntArithmeticResult { ok: 1, overflow: 0, value: int_truncate_to_width(bitwise, bits, signed == 0) }
+        if op == BinaryOp.OP_SHL or op == BinaryOp.OP_SHR:
+            // §4.2.4: a shift by the width or more is 0, or -1 for a negative
+            // value shifted right; below it, the usual meaning.
+            let amount_type = self.typed_expr_types.get(self.ast.get_data2(node)) ?? 0
+            let amount_unsigned = self.is_unsigned_int_type(amount_type)
+            let wide = rhs.value < 0 or rhs.value >= bits as i64
+            if not amount_unsigned:
+                return failed
+            if op == BinaryOp.OP_SHL:
+                return IntArithmeticResult { ok: 1, overflow: 0, value: if wide: 0 else: int_truncate_to_width(lhs.value << (rhs.value as u32), bits, signed == 0) }
+            if wide:
+                return IntArithmeticResult { ok: 1, overflow: 0, value: if signed != 0 and lhs.value < 0: -1 else: 0 }
+            let shifted = if signed != 0: lhs.value >> (rhs.value as u32) else: ((int_truncate_to_width(lhs.value, bits, true) as u64) >> (rhs.value as u32)) as i64
+            return IntArithmeticResult { ok: 1, overflow: 0, value: int_truncate_to_width(shifted, bits, signed == 0) }
+        if op == BinaryOp.OP_DIV or op == BinaryOp.OP_MOD:
+            // Division by zero is not an overflow; it panics where it runs.
+            if rhs.value == 0:
+                return failed
+            if int_div_overflows(lhs.value, rhs.value, bits, signed == 0):
+                return IntArithmeticResult { ok: 1, overflow: if self.overflow_mode == OVERFLOW_MODE_WRAP() or self.overflow_mode == OVERFLOW_MODE_SATURATE(): 0 else: 1, value: 0 }
+            if signed == 0:
+                let q = ((lhs.value as u64) / (rhs.value as u64)) as i64
+                return IntArithmeticResult { ok: 1, overflow: 0, value: if op == BinaryOp.OP_DIV: q else: lhs.value -% q *% rhs.value }
+            return IntArithmeticResult { ok: 1, overflow: 0, value: if op == BinaryOp.OP_DIV: lhs.value / rhs.value else: lhs.value % rhs.value }
+        int_eval_binary_arithmetic(op, lhs.value, rhs.value, bits, signed == 0, self.overflow_mode)
 
     mut fn check_binary(node: i32) -> i32:
         let op = self.ast.get_data0(node)
@@ -10962,8 +11177,11 @@ impl Sema:
         self.operator_method_reversed.remove(node)
         self.operator_method_derived.remove(node)
         let rhs_node = self.ast.get_data2(node)
-        let lhs_is_num_lit = sema_node_is_numeric_literal(self.ast, lhs_node)
-        let rhs_is_num_lit = sema_node_is_numeric_literal(self.ast, rhs_node)
+        // §4.2.1: an untyped literal operand — a bare unsuffixed literal, or
+        // arithmetic of them (#1820) — takes its type from the peer operand
+        // (rule 3), or, when both are untyped, from the enclosing context.
+        let lhs_is_num_lit = self.expr_is_untyped_literal_arith(lhs_node)
+        let rhs_is_num_lit = self.expr_is_untyped_literal_arith(rhs_node)
         var lhs: TypeId = 0 as TypeId
         var rhs: TypeId = 0 as TypeId
         if op == BinaryOp.OP_DEFAULT:
@@ -10993,6 +11211,11 @@ impl Sema:
                 dj_arms.push(rhs_node)
                 self.d32_check_owned_join_arms(dj, &dj_arms, "`??` operand")
             return dj
+        // A negation's operand is a magnitude (#943) only when it is the
+        // literal itself: in `-(128 + 0)` the 128 is an i8 value, not the
+        // magnitude of i8::MIN.
+        let saved_negated: i32 = self.in_negated_literal_context
+        self.in_negated_literal_context = 0
         // Variant shorthand in comparisons must be typed against the opposite side,
         // not whatever outer expected type is active (for example `bool` from assert()).
         // A payload variant-constructor call (`e == Ok(5)`) needs the same peer
@@ -11029,15 +11252,22 @@ impl Sema:
                     if rhs == 0:
                         rhs = self.check_expr_value_context(rhs_node)
         else if op == BinaryOp.OP_SHL or op == BinaryOp.OP_SHR:
-            lhs = self.check_expr_value_context(lhs_node)
+            // A shift's type is its left operand's: an untyped left operand
+            // takes the context's integer type (§4.2.1, as Rust and Swift
+            // type `let x: u8 = 1 << 3`); the amount types on its own.
+            let shift_context = if lhs_is_num_lit: self.untyped_literal_int_context_type() else: 0 as TypeId
+            lhs = if shift_context != 0: self.check_expr_with_expected(lhs_node, shift_context) else: self.check_expr_value_context(lhs_node)
             let shift_count_ty = if rhs_is_num_lit: self.shift_count_literal_type(rhs_node) else: 0
             rhs = self.check_expr_with_expected(rhs_node, shift_count_ty as TypeId)
         else if op == BinaryOp.OP_BIT_AND or op == BinaryOp.OP_BIT_OR or op == BinaryOp.OP_BIT_XOR:
-            let lhs_is_bit_lit = sema_node_is_bitwise_adaptable_literal(self.ast, lhs_node)
-            let rhs_is_bit_lit = sema_node_is_bitwise_adaptable_literal(self.ast, rhs_node)
+            let lhs_is_bit_lit = sema_node_is_bitwise_adaptable_literal(self.ast, lhs_node) or lhs_is_num_lit
+            let rhs_is_bit_lit = sema_node_is_bitwise_adaptable_literal(self.ast, rhs_node) or rhs_is_num_lit
             if lhs_is_bit_lit and rhs_is_bit_lit:
-                lhs = self.check_expr_value_context(lhs_node)
-                rhs = self.check_expr_value_context(rhs_node)
+                // Both untyped: the context's integer type reaches both
+                // (§4.2.1; Rust and Swift type `let y: u8 = 1 | 2` so).
+                let bit_context = self.untyped_literal_int_context_type()
+                lhs = if bit_context != 0: self.check_untyped_bitwise_operand(lhs_node, bit_context) else: self.check_expr_value_context(lhs_node)
+                rhs = if bit_context != 0: self.check_untyped_bitwise_operand(rhs_node, bit_context) else: self.check_expr_value_context(rhs_node)
             else:
                 if lhs_is_bit_lit:
                     rhs = self.check_expr_value_context(rhs_node)
@@ -11046,7 +11276,7 @@ impl Sema:
                     let rhs_peer = self.literal_peer_type(rhs as i32)
                     let rhs_num = self.numeric_operand_type(rhs_peer)
                     if self.get_type_kind(self.resolve_alias(rhs_num as TypeId)) == TypeKind.TY_INT:
-                        lhs = self.check_bitwise_literal_with_expected(lhs_node, rhs_num as TypeId)
+                        lhs = self.check_untyped_bitwise_operand(lhs_node, rhs_num as TypeId)
                     else:
                         lhs = self.check_expr_value_context(lhs_node)
                 else:
@@ -11055,7 +11285,7 @@ impl Sema:
                     let lhs_peer = self.literal_peer_type(lhs as i32)
                     let lhs_num = self.numeric_operand_type(lhs_peer)
                     if rhs_is_bit_lit and self.get_type_kind(self.resolve_alias(lhs_num as TypeId)) == TypeKind.TY_INT:
-                        rhs = self.check_bitwise_literal_with_expected(rhs_node, lhs_num as TypeId)
+                        rhs = self.check_untyped_bitwise_operand(rhs_node, lhs_num as TypeId)
                     else:
                         rhs = self.check_expr_value_context(rhs_node)
                 if lhs == 0:
@@ -11064,8 +11294,11 @@ impl Sema:
            op == BinaryOp.OP_ADD_WRAP or op == BinaryOp.OP_SUB_WRAP or op == BinaryOp.OP_MUL_WRAP or
            op == BinaryOp.OP_ADD_SAT or op == BinaryOp.OP_SUB_SAT or op == BinaryOp.OP_MUL_SAT:
             if lhs_is_num_lit and rhs_is_num_lit:
-                lhs = self.check_expr_value_context(lhs_node)
-                rhs = self.check_expr_value_context(rhs_node)
+                // §4.2.1 rule 1 reaches through the operator (#1820): in
+                // `let x: u8 = 1 + 2` both literals are u8, as a bare `3` is.
+                let context = self.untyped_literal_context_type()
+                lhs = if context != 0: self.check_expr_with_expected(lhs_node, context) else: self.check_expr_value_context(lhs_node)
+                rhs = if context != 0: self.check_expr_with_expected(rhs_node, context) else: self.check_expr_value_context(rhs_node)
             else:
                 if lhs_is_num_lit:
                     rhs = self.check_expr_value_context(rhs_node)
@@ -11087,6 +11320,7 @@ impl Sema:
         else:
             lhs = self.check_expr_value_context(lhs_node)
             rhs = self.check_expr_value_context(rhs_node)
+        self.in_negated_literal_context = saved_negated
 
         if lhs == 0 or rhs == 0:
             return 0
@@ -11192,21 +11426,29 @@ impl Sema:
                 return self.ty_isize as i32
             if (op == BinaryOp.OP_ADD or op == BinaryOp.OP_SUB) and lhs_k == TypeKind.TY_PTR and (rhs_k == TypeKind.TY_INT or rhs == self.ty_i32 or rhs == self.ty_i64 or rhs == self.ty_usize or rhs == self.ty_isize):
                 return lhs as i32
-            let result = self.arithmetic_result_type(lhs, rhs)
+            // §4.2.6: the operands convert to one type only by a lossless
+            // widening; an untyped literal took its peer's type already.
+            let lhs_numeric_kind = self.get_type_kind(self.resolve_alias(self.numeric_operand_type(lhs as i32) as TypeId))
+            let rhs_numeric_kind = self.get_type_kind(self.resolve_alias(self.numeric_operand_type(rhs as i32) as TypeId))
+            let both_numeric = (lhs_numeric_kind == TypeKind.TY_INT or lhs_numeric_kind == TypeKind.TY_FLOAT) and (rhs_numeric_kind == TypeKind.TY_INT or rhs_numeric_kind == TypeKind.TY_FLOAT)
+            if both_numeric and self.implicit_numeric_join(lhs, rhs) == 0:
+                self.emit_mixed_arithmetic_error(node, lhs, rhs)
+                return 0
+            let result = if both_numeric: self.implicit_numeric_join(lhs, rhs) else: self.arithmetic_result_type(lhs, rhs)
             if result != 0:
+                if (op == BinaryOp.OP_DIV or op == BinaryOp.OP_MOD) and self.expr_is_literal_arith(rhs_node):
+                    self.reject_constant_zero_divisor(node, op, rhs_node)
                 // Sema owns the type (D65): record it, so a downstream
                 // reader never derives it from context — the LLVM constant
                 // folder folded a global's `0 - K` (K: u32) at the
                 // destination element type i16 and read -1 where the same
-                // expression in a body panics (#1773). Only a type an
-                // operand decides: arithmetic of unsuffixed literals alone
-                // was typed from the literal defaults, without the
-                // destination's context (§4.2.1 rule 1 does not reach
-                // through an operator here yet, #1820) — limits.h's
-                // `ULONG_LONG_MAX` (`9223372036854775807 * 2 + 1` into
-                // c_ulonglong) is not an i64 overflow.
-                if not self.expr_is_untyped_literal_arith(node):
-                    self.typed_expr_types.insert(node, result as i32)
+                // expression in a body panics (#1773). Arithmetic of
+                // unsuffixed literals has its context's type (#1820), so
+                // limits.h's `ULONG_LONG_MAX` (`9223372036854775807 * 2 + 1`
+                // into c_ulonglong) is u64 arithmetic here, not i64.
+                self.typed_expr_types.insert(node, result as i32)
+                if self.expr_is_literal_arith(lhs_node) and self.expr_is_literal_arith(rhs_node):
+                    self.check_literal_arith_fits(node, result)
                 return result as i32
             self.emit_error("arithmetic operator requires numeric operands", node)
             return 0
@@ -11251,8 +11493,12 @@ impl Sema:
             self.typed_expr_types.insert(node, bitwise_result as i32)
             return bitwise_result as i32
 
-        // Wrapping arithmetic
+        // Wrapping arithmetic. The type is recorded like the checked
+        // operators' (D65): the constant folder reads it (#1820).
         if op == BinaryOp.OP_ADD_WRAP or op == BinaryOp.OP_SUB_WRAP or op == BinaryOp.OP_MUL_WRAP:
+            if not self.wrapping_operands_agree(node, lhs, rhs):
+                return 0
+            self.typed_expr_types.insert(node, lhs as i32)
             return lhs as i32
 
         // Saturating arithmetic — integers only
@@ -11261,6 +11507,9 @@ impl Sema:
             if self.get_type_kind(sat_resolved) == TypeKind.TY_FLOAT:
                 self.emit_error("saturating arithmetic is not defined for floating-point types", node)
                 return 0
+            if not self.wrapping_operands_agree(node, lhs, rhs):
+                return 0
+            self.typed_expr_types.insert(node, lhs as i32)
             return lhs as i32
 
         // Concat (++) — both operands must be str
@@ -11317,13 +11566,16 @@ impl Sema:
         // Only signed expectations are threaded: an unsigned one must still
         // reach "cannot negate an unsigned value" below rather than turning
         // into a fit error on the operand.
+        // A float expectation reaches the operand the same way (#1820:
+        // `let x: f32 = -1.5` is an f32 literal negated, not an f64 one).
         var negated_literal = 0
         if op == UnaryOp.UOP_NEGATE:
             negated_literal = 1
             if self.has_expected_type != 0 and self.expected_expr_type != 0:
                 let expected_neg = self.numeric_operand_type(self.expected_expr_type as i32)
                 let resolved_neg = self.resolve_alias(expected_neg as TypeId)
-                if self.get_type_kind(resolved_neg) == TypeKind.TY_INT and self.get_type_d1(resolved_neg) != 0:
+                let neg_kind = self.get_type_kind(resolved_neg)
+                if (neg_kind == TypeKind.TY_INT and self.get_type_d1(resolved_neg) != 0) or neg_kind == TypeKind.TY_FLOAT:
                     expected_operand = self.expected_expr_type as i32
         let saved_negated: i32 = self.in_negated_literal_context
         if negated_literal != 0:
@@ -11338,6 +11590,9 @@ impl Sema:
                 self.emit_error("cannot negate an unsigned value", node)
                 return 0
             if self.is_numeric_type(operand as i32):
+                // Recorded like `~` below: the constant folder reads it
+                // (D65, #1820).
+                self.typed_expr_types.insert(node, operand as i32)
                 return operand as i32
             let neg_method_sym = self.pool_intern("neg")
             if self.type_has_operator_method(operand as i32, neg_method_sym) != 0:
@@ -11823,11 +12078,12 @@ impl Sema:
             self.typed_expr_types.insert(node, result as i32)
         result as i32
 
-    // True when assigning a value of type `actual` to a slot of type `expected`
-    // loses information: a narrower integer (fewer bits), or a sign flip at equal
-    // width. Both require an explicit `as` cast. Literals are adapted to the
-    // expected type before this is consulted, so only genuinely-typed values reach
-    // here with a wider/differently-signed type.
+    // True when an integer of type `actual` does not convert to `expected`
+    // implicitly (§4.2.6): only a lossless widening does — the same
+    // signedness at a greater or equal width, or unsigned into a strictly
+    // wider signed type. A narrower integer, and signed into unsigned at any
+    // width, need an explicit `as`. Literals are adapted to the expected type
+    // before this is consulted, so only typed values reach here.
     fn int_narrowing_requires_cast(expected: TypeId, actual: TypeId) -> i32:
         if expected == 0 or actual == 0:
             return 0
@@ -11837,11 +12093,34 @@ impl Sema:
             return 0
         let ew = self.get_type_d0(er)
         let aw = self.get_type_d0(ar)
-        if ew < aw:
-            return 1
-        if ew == aw and self.get_type_d1(er) != self.get_type_d1(ar):
-            return 1
-        0
+        let e_signed = self.get_type_d1(er) != 0
+        let a_signed = self.get_type_d1(ar) != 0
+        if e_signed == a_signed:
+            return if ew < aw: 1 else: 0
+        if e_signed and ew > aw:
+            return 0
+        1
+
+    // The type both operands of a builtin arithmetic operator convert to
+    // implicitly (§4.2.6): the operand the other widens into losslessly, or
+    // 0 when neither does — the other signedness at the same or a smaller
+    // width, or an integer beside a float.
+    fn implicit_numeric_join(lhs: TypeId, rhs: TypeId) -> TypeId:
+        let lr = self.resolve_alias(self.numeric_operand_type(lhs as i32) as TypeId)
+        let rr = self.resolve_alias(self.numeric_operand_type(rhs as i32) as TypeId)
+        if lr == rr:
+            return self.numeric_operand_type(lhs as i32) as TypeId
+        let lk = self.get_type_kind(lr)
+        let rk = self.get_type_kind(rr)
+        if lk == TypeKind.TY_FLOAT and rk == TypeKind.TY_FLOAT:
+            return if self.get_type_d0(lr) >= self.get_type_d0(rr): lr else: rr
+        if lk != TypeKind.TY_INT or rk != TypeKind.TY_INT:
+            return 0 as TypeId
+        if self.int_narrowing_requires_cast(lr, rr) == 0:
+            return lr
+        if self.int_narrowing_requires_cast(rr, lr) == 0:
+            return rr
+        0 as TypeId
 
     // D22 §13.6: record a field access whose base is a SHARED VIEW and whose
     // field type is non-Copy, non-reference. The record itself is inert —
@@ -12009,12 +12288,12 @@ impl Sema:
     // aggregate cannot: no conversion reshapes a `(i32, i32)` into a
     // `(i64, i64)`, so a value whose element representation differs is a
     // mismatch here rather than an invalid-MIR failure (#1354).
+    // A numeric narrowing was refused by the owned demand that checked the
+    // value (reject_implicit_numeric_narrowing, #1803).
     mut fn check_binding_annotation(node: i32, value: i32, ann_type: TypeId, val_type: TypeId):
-        if val_type == 0:
+        if val_type == 0 or self.int_narrowing_requires_cast(ann_type, val_type) != 0:
             return
-        if self.int_narrowing_requires_cast(ann_type, val_type) != 0:
-            self.emit_error("implicit integer narrowing or sign change; use an explicit `as` cast", node)
-        else if self.types_compatible(ann_type as i32, val_type as i32) == 0 and self.has_contextual_copy_adjustment(value) == 0:
+        if self.types_compatible(ann_type as i32, val_type as i32) == 0 and self.has_contextual_copy_adjustment(value) == 0:
             if self.arithmetic_result_type(ann_type, val_type) == 0:
                 self.emit_error("type mismatch in binding", node)
         else if self.aggregate_repr_differs(ann_type, val_type, 0) != 0:
@@ -15820,6 +16099,9 @@ impl Sema:
                 self.check_expr_with_expected(elem, expected_elem as TypeId)
             else:
                 self.check_expr(elem)
+            // An element is an owned demand of the element type (#1803).
+            if expected_elem != 0 and et != 0:
+                let _ = self.reject_implicit_numeric_narrowing(elem, expected_elem, et as i32)
             self.check_ephemeral_task_storage(elem, "array")
             // #1368: an aggregate element's own elements do not convert.
             if expected_elem != 0 and self.value_aggregate_repr_differs(expected_elem, et as i32):
@@ -15988,12 +16270,11 @@ impl Sema:
                 let f_ty = self.resolve_type_expr(f_type_node)
                 if f_ty == 0 or self.get_type_kind(self.resolve_alias(f_ty)) == TypeKind.TY_ERR:
                     continue
+                // A numeric narrowing is refused by the owned demand (#1803).
                 let d_ty = self.check_expr_with_owned_demand(f_default, f_ty)
                 if d_ty == 0:
                     continue
-                if self.int_narrowing_requires_cast(f_ty, d_ty) != 0:
-                    self.emit_error("field default type mismatch for '" ++ self.pool_resolve(f_name) ++ "'; use an explicit `as` cast", f_default)
-                else if self.types_compatible(f_ty as i32, d_ty as i32) == 0 and self.arithmetic_result_type(f_ty, d_ty) == 0 and self.has_contextual_copy_adjustment(f_default) == 0:
+                if self.types_compatible(f_ty as i32, d_ty as i32) == 0 and self.arithmetic_result_type(f_ty, d_ty) == 0 and self.has_contextual_copy_adjustment(f_default) == 0:
                     self.emit_error("field default type mismatch for '" ++ self.pool_resolve(f_name) ++ "'", f_default)
 
     // #1739: a generic struct literal with no expected instance checks its
@@ -19874,6 +20155,22 @@ impl Sema:
         let end = self.ast.get_data1(node)
         let inclusive = self.ast.get_data2(node)
         var elem_type: TypeId = self.ty_i32
+        // §4.2.1 rule 3: an untyped literal bound takes its peer's type, so
+        // `0..n` with `n: i64` is a Range[i64] (#1803: the end is an owned
+        // demand of the start's type, and would otherwise narrow).
+        if start != 0 and end != 0 and self.expr_is_untyped_literal_arith(start) and not self.expr_is_untyped_literal_arith(end):
+            let end_exact = self.check_expr_value_context(end)
+            let end_value = self.shared_copy_pointee(end_exact as i32)
+            if end_value != 0:
+                let _ = self.record_contextual_copy_adjustment(end, end_value, end_exact as i32)
+            let peer = if end_value != 0: end_value as TypeId else: end_exact
+            if self.is_numeric_type(peer as i32):
+                let _ = self.check_expr_with_expected(start, peer)
+                return self.ensure_exact_type(TypeKind.TY_RANGE, peer as i32, inclusive, 0) as i32
+            elem_type = self.check_expr_value_context(start)
+            if peer != 0 and self.types_compatible(elem_type, peer) == 0:
+                self.emit_error("range bounds must have compatible types", node)
+            return self.ensure_exact_type(TypeKind.TY_RANGE, elem_type as i32, inclusive, 0) as i32
         if start != 0:
             elem_type = self.check_expr_value_context(start)
             let start_value = self.shared_copy_pointee(elem_type as i32)
@@ -21648,6 +21945,9 @@ impl Sema:
                 let payload_arg_node = if has_resolved != 0: self.get_resolved_call_arg(node, ai) else: self.ast.get_extra(resolved_extra_start + ai)
                 self.check_ephemeral_task_storage(if payload_arg_node > 0: payload_arg_node else: node, "enum payload")
                 if expected_ty != 0 and arg_ty != 0:
+                    // A payload is an owned demand like a parameter (#1803).
+                    if payload_arg_node > 0:
+                        let _ = self.reject_implicit_numeric_narrowing(payload_arg_node, expected_ty, arg_ty)
                     let payload_materializes_copy = self.record_contextual_copy_adjustment(payload_arg_node, expected_ty, arg_ty)
                     // #1368: an aggregate payload's elements do not convert.
                     if self.value_aggregate_repr_differs(expected_ty, arg_ty) or (self.types_compatible(expected_ty, arg_ty) == 0 and payload_materializes_copy == 0):
@@ -21903,9 +22203,53 @@ impl Sema:
     mut fn check_expr_with_owned_demand(node: i32, expected: TypeId) -> TypeId:
         let exact = self.check_expr_with_expected(node, expected)
         if expected != 0 and exact != 0:
+            let _ = self.reject_implicit_numeric_narrowing(node, expected as i32, exact as i32)
             if self.record_contextual_copy_adjustment(node, expected as i32, exact as i32) == 0:
                 let _ = self.record_contextual_str_clone_adjustment(node, expected as i32, exact as i32)
         exact
+
+    // §4.2.6 (#1803): a numeric demand accepts only the value's own type or
+    // a lossless widening of it. A narrower integer, one of the other
+    // signedness at equal width, a float where an integer is demanded, an
+    // integer where a float is, or an f64 where an f32 is needs an explicit
+    // `as` — one rule for every owned demand (a binding, an element, a
+    // field, a call argument, a return, an assignment, a global), which
+    // every such position reaches through check_expr_with_owned_demand or
+    // note_call_arg_coercion. Unsuffixed literals took the demanded type
+    // already (§4.2.1), so only a typed value arrives here with another. A
+    // Copy view is read as the value its demand materializes.
+    // The expression a join arm's value comes from: a block's tail.
+    fn join_arm_value_node(node: i32) -> i32:
+        if node > 0 and self.ast.kind(node) == NodeKind.NK_BLOCK and self.ast.get_data2(node) != 0:
+            return self.join_arm_value_node(self.ast.get_data2(node))
+        node
+
+    mut fn reject_implicit_numeric_narrowing(node: i32, expected: i32, actual: i32) -> bool:
+        if node <= 0 or expected == 0 or actual == 0:
+            return false
+        let er = self.resolve_alias(expected as TypeId)
+        let ek = self.get_type_kind(er)
+        if ek != TypeKind.TY_INT and ek != TypeKind.TY_FLOAT:
+            return false
+        let pointee = self.shared_copy_pointee(actual)
+        let value = if pointee != 0: pointee else: actual
+        let vr = self.resolve_alias(value as TypeId)
+        let vk = self.get_type_kind(vr)
+        let want = self.type_name(expected)
+        let got = self.type_name(value)
+        if ek == TypeKind.TY_INT and vk == TypeKind.TY_FLOAT:
+            self.emit_error(f"a float where an integer is demanded needs an explicit conversion: `x as {want}` truncates, `x.round() as {want}` rounds (§4.2.6)", node)
+            return true
+        if ek == TypeKind.TY_INT and vk == TypeKind.TY_INT and self.int_narrowing_requires_cast(expected as TypeId, value as TypeId) != 0:
+            self.emit_error(f"implicit integer narrowing or sign change from `{got}` to `{want}`; use an explicit `as` cast (§4.2.6)", node)
+            return true
+        if ek == TypeKind.TY_FLOAT and vk == TypeKind.TY_INT:
+            self.emit_error(f"an integer where a float is demanded needs an explicit `as {want}` (§4.2.6: no implicit integer-to-float conversion)", node)
+            return true
+        if ek == TypeKind.TY_FLOAT and vk == TypeKind.TY_FLOAT and self.get_type_d0(er) < self.get_type_d0(vr):
+            self.emit_error(f"implicit float narrowing from `{got}` to `{want}`; use an explicit `as` cast (§4.2.6)", node)
+            return true
+        false
 
     // #781: an EXPLICIT owned demand (annotated let, assignment into an owned
     // place, return, comprehension element) materializes a &str view as an
@@ -27158,6 +27502,9 @@ impl Sema:
                 static_payload_nodes.push(static_payload_arg_node)
                 self.check_ephemeral_task_storage(if static_payload_arg_node > 0: static_payload_arg_node else: node, "enum payload")
                 if expected_ty != 0 and arg_ty != 0:
+                    // A payload is an owned demand like a parameter (#1803).
+                    if static_payload_arg_node > 0:
+                        let _ = self.reject_implicit_numeric_narrowing(static_payload_arg_node, expected_ty, arg_ty)
                     let static_payload_materializes_copy = self.record_contextual_copy_adjustment(static_payload_arg_node, expected_ty, arg_ty)
                     // #1368: an aggregate payload's elements do not convert.
                     if self.value_aggregate_repr_differs(expected_ty, arg_ty) or (self.types_compatible(expected_ty, arg_ty) == 0 and static_payload_materializes_copy == 0):

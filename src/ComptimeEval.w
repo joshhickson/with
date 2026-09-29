@@ -66,8 +66,8 @@ extern fn with_alloc(size: i64) -> *mut u8
 extern fn with_free(ptr: *mut u8) -> Unit
 extern fn with_memcpy(dst: *mut u8, src: *const u8, len: i64) -> *mut u8
 extern fn rt_open(path: *const u8, flags: i32, mode: i32) -> i32
-extern fn rt_read(fd: i32, buf: *mut u8, len: u64) -> i64
-extern fn rt_write(fd: i32, buf: *const u8, len: u64) -> i64
+extern fn rt_read(fd: i32, buf: *mut u8, len: i64) -> i64
+extern fn rt_write(fd: i32, buf: *const u8, len: i64) -> i64
 extern fn rt_close(fd: i32) -> i32
 extern fn rt_seek(fd: i32, offset: i64, whence: i32) -> i64
 extern fn with_println_str(s: &str) -> Unit
@@ -926,7 +926,7 @@ unsafe fn comptime_open_path(path: &str, flags: i32, mode: i32) -> i32:
 unsafe fn comptime_read_exact(fd: i32, buf: *mut u8, len: i64) -> bool:
     var total: i64 = 0
     while total < len:
-        let r = rt_read(fd, (buf as i64 + total) as *mut u8, (len - total) as u64)
+        let r = rt_read(fd, (buf as i64 + total) as *mut u8, len - total)
         if r <= 0:
             return false
         total = total + r
@@ -935,7 +935,7 @@ unsafe fn comptime_read_exact(fd: i32, buf: *mut u8, len: i64) -> bool:
 unsafe fn comptime_write_exact(fd: i32, buf: *const u8, len: i64) -> bool:
     var total: i64 = 0
     while total < len:
-        let r = rt_write(fd, (buf as i64 + total) as *const u8, (len - total) as u64)
+        let r = rt_write(fd, (buf as i64 + total) as *const u8, len - total)
         if r <= 0:
             return false
         total = total + r
@@ -8316,9 +8316,12 @@ impl Sema:
         let value = unsafe { comptime_force_eval_expr(self as *mut Sema, self.ast, self.pool, node) }
         comptime_value_is_valid(value)
 
+    // Every global's initializer is checked and typed, whatever failed
+    // before it: a global left untyped after another's error made each later
+    // use of it a false diagnostic ("missing return", "bitwise operator
+    // requires integer operands"; #1836). A comptime value is evaluated only
+    // when its own check found no error.
     mut fn check_top_level_let_values():
-        if self.diags.has_errors():
-            return
         for di in 0..self.ast.decl_count():
             self.update_decl_source_context(di)
             let decl = self.ast.get_decl(di)
@@ -8338,6 +8341,7 @@ impl Sema:
                 let t_ak = if t_an != 0: self.ast.kind(t_an) as i32 else: -1
                 let t_asym = if t_an != 0 and t_ak == NodeKind.NK_TYPE_NAMED as i32: self.pool_resolve(self.ast.get_data0(t_an)) ++ "" else: "?".to_owned()
                 with_eprint(f"[tll] di={di} decl={decl} name='{self.pool_resolve(name)}' value={value} vkind={self.ast.kind(value) as i32} ann_extra={t_ae} ann_node={t_an} ann_kind={t_ak} ann_name='{t_asym}' resolved={self.resolve_type_expr(t_an) as i32}")
+            let errors_before = self.diags.count_by_severity(DiagSeverity.Error)
             let is_comptime_value = if self.ast.kind(value) == NodeKind.NK_COMPTIME: 1 else: 0
             // #643: every top-level initializer must be checked, including a
             // plain annotated `let`/`var`. Skipping an initializer merely
@@ -8351,7 +8355,8 @@ impl Sema:
             let ann_extra = self.top_level_let_type_ann_extra(flags)
             let ann_type = if ann_extra >= 0: self.resolve_type_expr(self.ast.get_extra(ann_extra)) else: 0 as TypeId
             let val_type = if ann_type != 0: self.check_expr_with_expected(type_value, ann_type) else: self.check_expr(type_value)
-            if ann_type != 0 and val_type != 0:
+            // The annotation is an owned demand like a local one's (#1803).
+            if ann_type != 0 and val_type != 0 and not self.reject_implicit_numeric_narrowing(type_value, ann_type as i32, val_type as i32):
                 if self.types_compatible(ann_type as i32, val_type as i32) == 0:
                     if self.arithmetic_result_type(ann_type, val_type) == 0:
                         self.emit_error("type mismatch in binding", decl)
@@ -8368,9 +8373,5 @@ impl Sema:
                 // ordinary literal/identifier, data0 is a symbol, not a node.
                 if type_value != value:
                     self.typed_expr_types.insert(type_value, final_type as i32)
-            if self.diags.has_errors():
-                return
-            if is_comptime_value != 0:
+            if is_comptime_value != 0 and self.diags.count_by_severity(DiagSeverity.Error) == errors_before:
                 let _ = self.force_eval_comptime_expr(value)
-                if self.diags.has_errors():
-                    return
