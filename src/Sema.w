@@ -961,6 +961,10 @@ pub type Sema {
     generator_fn_receiver_views: HashMap[i32, i32],
     generator_mir_only_fns: HashMap[i32, i32],
     generator_state_yield_types: HashMap[i32, i32],
+    // §13.6a: an NK_FOR whose iterable is an Option or Result is the
+    // one-clause comprehension the parser recorded beside it: the NK_FOR
+    // node -> that match node, which Sema checked and MIR lowers instead.
+    for_carrier_matches: HashMap[i32, i32],
     // D69 (§13.4): `for x in g` over a Gen[T] runs its body as the `body`
     // closure of `g.each(body)`. Keyed by the NK_FOR node: the element type
     // T, the closure's type fn(T) -> bool, and the `each` callee (its
@@ -971,6 +975,10 @@ pub type Sema {
     gen_for_each_syms: HashMap[i32, i32],
     gen_for_each_sigs: HashMap[i32, i32],
     gen_for_each_monos: HashMap[i32, i32],
+    // D65 (§13.5): the element type Sema bound each loop's pattern to — keyed
+    // by the NK_FOR node, and a comprehension clause's by its iterable node.
+    // MIR reads it; it re-derived one from the iterable's type.
+    for_elem_types: HashMap[i32, i32],
     mutable_global_syms: HashMap[i32, i32],
     // docs/completed/mut.md Rev 8 §12 / §15.12 — symbols declared via `global X = ...`
     // (stable) recorded here. Used by check_assign to emit a specific
@@ -1402,6 +1410,7 @@ pub type Sema {
     // call and `audit:resolution` verifies the MIR callee and argument count
     // against this fact. Absent for a call Sema resolved to a function symbol.
     call_callable_types: HashMap[i32, i32],
+
     // C11 6.5.2.2p6-7: the type each argument of a call to a C function is
     // passed as after the default argument promotions, keyed by the call
     // node: `[count, t0, t1, ...]` from the start. Every argument of an
@@ -1414,6 +1423,12 @@ pub type Sema {
     // NK_EXTERN_FN carries flag bit 1): C calls them with the promoted arguments
     // and the fixed-argument convention, never the variadic one (#1831).
     unprototyped_sigs: HashMap[i32, i32],
+
+    // D65 (§12): an identifier naming a function, used as a value and typed
+    // its With callable `fn(...)` (not an `extern "C" fn`): node -> 1.
+    // MirLower marks its constant, and codegen builds the callable adapter.
+    fn_callable_values: HashMap[i32, i32],
+
     // D51 stage 2: facade facts (SemaFacade.w).
     facade_resource_index: HashMap[i32, i32],   // resource sym -> facade_resources index
     facade_resources: Vec[FacadeResource],
@@ -1564,7 +1579,6 @@ pub type Sema {
     is_copy_cache: HashMap[i32, i32],
     needs_drop_result_cache: HashMap[i32, i32],
     unwrapped_type_cache: HashMap[i32, i32],
-    for_element_type_cache: HashMap[i32, i32],
     generic_struct_field_type_cache: HashMap[i64, i32],
     generic_struct_field_index_type_cache: HashMap[i64, i32],
     generic_enum_payload_cache_starts: HashMap[i64, i32],
@@ -1706,7 +1720,21 @@ pub type Sema {
     body_order_lower: Vec[i32],
     body_typed_decls: HashMap[i32, i32],
     body_typed_next: Vec[i32],
-    current_for_comprehension_carrier: i32,
+    // §13.6a: one for-comprehension's desugar (AstPool.build_comprehension_match)
+    // is a chain from its outermost clause match (the root): the inner clause
+    // matches and the yield wrap `_Payload(E)` map to the root, and the root to
+    // its carrier family (1 Option, 2 Result) and, for Result, the Err type
+    // every clause shares. A failure arm's `___fail_i` value re-wraps the
+    // clause's failure in the comprehension's carrier: that node -> family.
+    comprehension_chain_roots: HashMap[i32, i32],
+    comprehension_root_carriers: HashMap[i32, i32],
+    comprehension_root_err_types: HashMap[i32, i32],
+    comprehension_failure_rewraps: HashMap[i32, i32],
+    // §13.6a: check_for typed this match subject (the NK_FOR's iterable)
+    // before choosing the comprehension reading; check_match_expr takes the
+    // type instead of checking the node a second time.
+    prechecked_match_subject: i32,
+    prechecked_match_subject_type: i32,
     in_comptime_fn: i32,
     in_concrete_generic_body: i32,
     in_async_fn: i32,
@@ -2204,7 +2232,6 @@ impl Sema:
         self.is_copy_cache = sema_new_map_i32_i32()
         self.needs_drop_result_cache = sema_new_map_i32_i32()
         self.unwrapped_type_cache = sema_new_map_i32_i32()
-        self.for_element_type_cache = sema_new_map_i32_i32()
         self.generic_struct_field_type_cache = sema_new_map_i64_i32()
         self.generic_struct_field_index_type_cache = sema_new_map_i64_i32()
         self.generic_enum_payload_cache_starts = sema_new_map_i64_i32()
@@ -2517,11 +2544,13 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
     let generator_fn_receiver_views = sema_new_map_i32_i32()
     let generator_mir_only_fns = sema_new_map_i32_i32()
     let generator_state_yield_types = sema_new_map_i32_i32()
+    let for_carrier_matches = sema_new_map_i32_i32()
     let gen_for_elem_types = sema_new_map_i32_i32()
     let gen_for_body_types = sema_new_map_i32_i32()
     let gen_for_each_syms = sema_new_map_i32_i32()
     let gen_for_each_sigs = sema_new_map_i32_i32()
     let gen_for_each_monos = sema_new_map_i32_i32()
+    let for_elem_types = sema_new_map_i32_i32()
     let mutable_global_syms = sema_new_map_i32_i32()
     let stable_global_syms = sema_new_map_i32_i32()
     let global_value_decl_kinds = sema_new_map_i32_i32()
@@ -2554,6 +2583,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
     let typed_expr_types = sema_new_map_i32_i32()
     let typed_binding_types = sema_new_map_i32_i32()
     let call_callable_types = sema_new_map_i32_i32()
+    let fn_callable_values = sema_new_map_i32_i32()
     let view_projection_exprs = sema_new_map_i32_i32()
     let join_field_view_arms = sema_new_map_i32_i32()
     let drop_consumed_binding_values = sema_new_map_i32_i32()
@@ -2571,7 +2601,6 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
     let is_copy_cache = sema_new_map_i32_i32()
     let needs_drop_result_cache = sema_new_map_i32_i32()
     let unwrapped_type_cache = sema_new_map_i32_i32()
-    let for_element_type_cache = sema_new_map_i32_i32()
     let generic_struct_field_type_cache = sema_new_map_i64_i32()
     let generic_struct_field_index_type_cache = sema_new_map_i64_i32()
     let generic_enum_payload_cache_starts = sema_new_map_i64_i32()
@@ -2754,11 +2783,13 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         generator_fn_receiver_views,
         generator_mir_only_fns,
         generator_state_yield_types,
+        for_carrier_matches,
         gen_for_elem_types,
         gen_for_body_types,
         gen_for_each_syms,
         gen_for_each_sigs,
         gen_for_each_monos,
+        for_elem_types,
         mutable_global_syms,
         stable_global_syms,
         global_value_decl_kinds,
@@ -3027,9 +3058,13 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         typed_expr_types,
         typed_binding_types,
         call_callable_types,
+
         c_promoted_arg_starts: sema_new_map_i32_i32(),
         c_promoted_arg_data: Vec.new(),
         unprototyped_sigs: sema_new_map_i32_i32(),
+
+        fn_callable_values,
+
         view_projection_exprs,
         join_field_view_arms,
         drop_consumed_binding_values,
@@ -3076,7 +3111,6 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         is_copy_cache,
         needs_drop_result_cache,
         unwrapped_type_cache,
-        for_element_type_cache,
         generic_struct_field_type_cache,
         generic_struct_field_index_type_cache,
         generic_enum_payload_cache_starts,
@@ -3141,7 +3175,12 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         body_order_lower: Vec.new(),
         body_typed_decls: sema_new_map_i32_i32(),
         body_typed_next: Vec.new(),
-        current_for_comprehension_carrier: 0,
+        comprehension_chain_roots: sema_new_map_i32_i32(),
+        comprehension_root_carriers: sema_new_map_i32_i32(),
+        comprehension_root_err_types: sema_new_map_i32_i32(),
+        comprehension_failure_rewraps: sema_new_map_i32_i32(),
+        prechecked_match_subject: 0,
+        prechecked_match_subject_type: 0,
         in_comptime_fn: 0,
         in_concrete_generic_body: 0,
         in_async_fn: 0,
@@ -5381,7 +5420,10 @@ impl Sema:
                     let lt_cp = self.is_copy(lti as TypeId)
                     let lt_nd = self.type_needs_drop(lti)
                     let lt_uw = self.try_unwrapped_type(lti)
-                    let lt_fe = self.infer_for_element_type(lti)
+                    // A loop over this type binds these element views (`&T`, a map
+                    // traversal tuple); build them while types are mutable. Each
+                    // loop's element type itself is for_elem_types (D65).
+                    self.infer_for_element_type(lti)
                     if self.type_kinds[lti] == TypeKind.TY_GENERIC_INST:
                         self.preregister_generic_struct_fields(lti)
                         self.preregister_generic_enum_payloads(lti)
@@ -5390,7 +5432,6 @@ impl Sema:
                     self.is_copy_cache.insert(lti, lt_cp)
                     self.needs_drop_result_cache.insert(lti, lt_nd)
                     self.unwrapped_type_cache.insert(lti, lt_uw)
-                    self.for_element_type_cache.insert(lti, lt_fe)
                     let field_count = self.type_reflection_field_count(lti)
                     for fi in 0..field_count:
                         self.layout_field_offset_cache.insert(sema_pair_key(lti, fi), self.type_layout_struct_field_offset(lti, fi))

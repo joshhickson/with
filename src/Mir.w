@@ -203,6 +203,8 @@ pub fn dump_mir_body(body: &MirBody, pool: &InternPool, sema: &Sema) -> str:
             line = line ++ f"  // sym{name_sym}"
         if body.local_is_global[li] != 0:
             line = line ++ " [global]"
+        if body.local_is_caller_place[li] != 0:
+            line = line ++ " [caller-place]"
         if body.local_mutables[li] != 0:
             line = line ++ " [mut]"
         out = out ++ line ++ "\n"
@@ -502,6 +504,8 @@ fn mir_const_text(body: &MirBody, const_id: i32, pool: &InternPool, sema: &Sema)
         return "const zst(" ++ ty_name ++ ")"
 
     if k == ConstKind.CK_FN:
+        if d0 != 0 and body.const_d1[const_id] == 1:
+            return f"const callable fn sym{d0}"
         if d0 != 0:
             return f"const fn sym{d0}"
         return "const fn <unknown>"

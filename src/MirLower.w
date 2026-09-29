@@ -2609,19 +2609,11 @@ impl MirBuilder:
                 vs_sym = self.sema.comp_resolved.get(node).unwrap()
             if self.sema.variant_lookup.contains(vs_sym):
                 return self.sema.variant_type_ids.get(vs_sym).unwrap() as i32
+        // D65: Sema records every range's type (check_expr). Rebuilding it
+        // from the bounds found no range over `&T` element views, answered
+        // void, and a loop counter took the old i32 for-element fallback.
         if kind == NodeKind.NK_RANGE:
-            let range_start = self.ast.get_data0(node)
-            let range_end = self.ast.get_data1(node)
-            let range_inclusive = self.ast.get_data2(node)
-            var range_elem = self.sema.ty_i32 as i32
-            if range_start != 0:
-                range_elem = self.expr_type(range_start)
-            else if range_end != 0:
-                range_elem = self.expr_type(range_end)
-            let range_found = self.sema.find_range_type(range_elem, range_inclusive) as i32
-            if range_found != 0:
-                return range_found
-            return self.sema.ty_void as i32
+            sema_phase_bug(f"BUG: range expression node {node} reached MIR with no Sema type")
         self.sema.ty_void as i32
 
     mut fn place_local_type(place_id: i32) -> i32:
@@ -2788,6 +2780,16 @@ impl MirBuilder:
 
     mut fn const_operand(kind: i32, d0: i32, type_id: i32) -> i32:
         let c = self.body.new_const(kind, d0, 0, 0, type_id)
+        self.body.new_operand(OperandKind.OK_CONSTANT, c)
+
+    // D65 (§12): a function constant. Where Sema recorded the identifier as
+    // a function used as a With callable value (fn_callable_values), the
+    // constant says so (CK_FN d1 = 1) and codegen builds that adapter; a
+    // callee and an `extern "C" fn` value are the function itself. Codegen
+    // guessed it from a pointer meeting an LLVM `{ptr, ptr}`.
+    mut fn fn_const_operand(fn_sym: i32, const_ty: i32, node: i32) -> i32:
+        let callable = node != 0 and self.sema.fn_callable_values.contains(node)
+        let c = self.body.new_const(ConstKind.CK_FN, fn_sym, if callable: 1 else: 0, 0, const_ty)
         self.body.new_operand(OperandKind.OK_CONSTANT, c)
 
     mut fn int_const_operand(value: i64, type_id: i32) -> i32:
@@ -4113,12 +4115,11 @@ impl MirBuilder:
                     let sema_fn_sym = self.sema.pool_lookup_symbol(fn_name)
                     if sema_fn_sym != 0 and self.sema.get_sig(sema_fn_sym) >= 0:
                         resolved_fn_sym = sema_fn_sym
-            let fn_ty = if type_id != 0: type_id else: self.sema.sig_type_ids[sig_idx]
-            return self.const_operand(ConstKind.CK_FN, resolved_fn_sym, fn_ty)
+            return self.fn_const_operand(resolved_fn_sym, if type_id != 0: type_id else: self.sema.sig_type_ids[sig_idx], node_id)
 
         // Generic function reference (monomorphized at codegen time)
         if self.sema.generic_fn_node_for_symbol(fn_sym) != 0:
-            return self.const_operand(ConstKind.CK_FN, fn_sym, type_id)
+            return self.fn_const_operand(fn_sym, type_id, node_id)
 
         let const_node = self.try_resolve_module_const_node(sym)
         if const_node != 0:
@@ -5563,12 +5564,15 @@ impl MirBuilder:
         self.terminate(TermKind.TK_CALL, mi_unit, mi_args_id, ret_place, mi_next_bb)
         self.switch_to(mi_next_bb)
 
-    mut fn lower_fn_address(expr: i32, type_id: i32) -> i32:
+    // `&f` on a function: its code address, or (`ref_to_callable`, #1603) the
+    // callable a reference points at — only that one is the callable value
+    // Sema recorded for the name (fn_const_operand).
+    mut fn lower_fn_address(expr: i32, type_id: i32, ref_to_callable: bool) -> i32:
         if expr == 0:
             return -1
         let kind = self.ast.kind(expr)
         if kind == NodeKind.NK_GROUPED:
-            return self.lower_fn_address(self.ast.get_data0(expr), type_id)
+            return self.lower_fn_address(self.ast.get_data0(expr), type_id, ref_to_callable)
         if kind != NodeKind.NK_IDENT:
             return -1
         let sym = self.ast.get_data0(expr)
@@ -5577,7 +5581,7 @@ impl MirBuilder:
         if self.lookup_alias_place(sym) >= 0:
             return -1
         if self.sema.get_sig(sym) >= 0 or self.sym_is_generic_fn(sym):
-            return self.lower_var(sym, type_id, expr)
+            return self.lower_var(sym, type_id, if ref_to_callable: expr else: 0)
         -1
 
     mut fn lower_un_op(op: i32, expr: i32, node: i32) -> i32:
@@ -5601,7 +5605,7 @@ impl MirBuilder:
             let expects_raw_fn_ptr = self.expected_type != 0 and self.sema.get_type_kind(expected_res) == TypeKind.TY_PTR
             let ref_to_fn = op == UnaryOp.UOP_REF and self.sema.get_type_kind(ref_res) == TypeKind.TY_REF and not expects_raw_fn_ptr
             let fn_ty = if ref_to_fn: self.sema.get_type_d0(ref_res) as i32 else: ref_ty
-            let fn_addr = self.lower_fn_address(expr, fn_ty)
+            let fn_addr = self.lower_fn_address(expr, fn_ty, ref_to_fn)
             if fn_addr >= 0:
                 if not ref_to_fn:
                     return fn_addr
@@ -7176,6 +7180,8 @@ impl MirBuilder:
             self.lower_if(self.ast.get_data0(node), self.ast.get_data1(node), self.ast.get_data2(node), node, 0)
         else if kind == NodeKind.NK_MATCH:
             self.lower_match(self.ast.get_data0(node), self.ast.get_data1(node), self.ast.get_data2(node), node, 0)
+        else if kind == NodeKind.NK_FOR and self.sema.for_carrier_matches.contains(node):
+            self.lower_for_carrier(node, 0)
         else if kind == NodeKind.NK_GROUPED or kind == NodeKind.NK_UNSAFE_BLOCK:
             self.lower_expr_discard(self.ast.get_data0(node))
         else if kind == NodeKind.NK_NO_SUSPEND:
@@ -7787,7 +7793,40 @@ impl MirBuilder:
         self.forget_string_flow_facts()
         self.unit_operand()
 
+    // §13.6a: a comprehension clause's failure (the `___fail_i` its failure
+    // arm bound, the whole clause value) re-wrapped in the comprehension's
+    // carrier, which Sema typed this node: None, or Err moving the clause's
+    // error out. The binding's payload is then gone; it is not dropped again.
+    mut fn lower_comprehension_failure(node: i32) -> i32:
+        let result_ty = self.expr_type(node)
+        let fields: Vec[i32] = Vec.new()
+        let names: Vec[i32] = Vec.new()
+        var variant = self.sema.syms.none
+        if (self.sema.comprehension_failure_rewraps.get(node) ?? 0) == 2:
+            variant = self.sema.syms.err
+            let fail_local = self.lookup_local(self.ast.get_data0(node))
+            let fail_ty = self.body.local_type_ids[fail_local]
+            let payload_tys = self.sema.enum_variant_payload_types_frozen(fail_ty, variant)
+            let err_place = self.body.new_field_place(self.body.new_downcast_place(self.place_for_local(fail_local), self.sema.enum_variant_index_for_type(fail_ty, variant)), 0, payload_tys[0])
+            fields.push(self.body.new_operand(if self.sema.is_copy_frozen(payload_tys[0]) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, err_place))
+            names.push(0)
+            self.cancel_scheduled_value_drop_for_local(fail_local)
+            self.mark_local_value_moved(fail_local)
+        let rv = self.body.new_rvalue(RvalueKind.RK_AGGREGATE, 1, self.body.new_agg_fields(fields, names), self.sema.enum_variant_index_for_type(result_ty, variant))
+        let tmp = self.new_temp(result_ty)
+        let place = self.place_for_local(tmp)
+        self.body.push_stmt(self.cur_bb, StmtKind.Assign, place, rv, self.ast.get_start(node))
+        self.body.new_operand(OperandKind.OK_COPY, place)
+
+    // §13.6a: a `for` Sema read as a one-clause comprehension lowers as the
+    // match Sema checked for it.
+    mut fn lower_for_carrier(for_node: i32, want_result: i32) -> i32:
+        let comprehension = self.sema.for_carrier_matches.get(for_node) ?? 0
+        self.lower_match(self.ast.get_data0(comprehension), self.ast.get_data1(comprehension), self.ast.get_data2(comprehension), comprehension, want_result)
+
     mut fn lower_for(for_node: i32) -> i32:
+        if self.sema.for_carrier_matches.contains(for_node):
+            return self.lower_for_carrier(for_node, 1)
         if self.sema.gen_for_elem_types.contains(for_node):
             return self.lower_for_gen(for_node)
         let pat_or_sym = self.ast.get_data0(for_node)
@@ -7934,7 +7973,7 @@ impl MirBuilder:
 
         let iter_op = self.lower_expr(iter_expr)
         let iter_place = self.materialize_operand(iter_op, iter_ty, self.ast.get_start(iter_expr))
-        let elem_ty = self.sema.infer_for_element_type_frozen(iter_ty)
+        let elem_ty = self.loop_element_type(for_node)
 
         // Determine next()'s return type (Option[T]) from the method signature.
         let resolved_iter = self.sema.resolve_alias(iter_ty)
@@ -8576,7 +8615,7 @@ impl MirBuilder:
         let start_node = self.ast.get_data0(range_node)
         let end_node = self.ast.get_data1(range_node)
         let inclusive = self.ast.get_data2(range_node)
-        let elem_ty = self.sema.infer_for_element_type_frozen(self.expr_type(range_node))
+        let elem_ty = self.clause_element_type(comp_node, clause_index)
 
         let start_op = if start_node != 0: self.lower_expr(start_node) else: self.int_const_operand(0, elem_ty)
         let end_op = self.lower_expr(end_node)
@@ -8631,7 +8670,7 @@ impl MirBuilder:
         // The same receiver, length and element binding as `for` (below): a
         // comprehension observes the sequence it traverses too.
         let iter_ty = self.sequence_iter_type(iter_expr)
-        let elem_ty = self.sema.infer_for_element_type_frozen(iter_ty)
+        let elem_ty = self.clause_element_type(comp_node, clause_index)
         let slice_place = self.lower_sequence_place(iter_expr)
 
         let len_local = self.new_temp(self.sema.ty_i64)
@@ -8689,7 +8728,7 @@ impl MirBuilder:
         // binding, and VEC_GET copied a Drop-class element into a local typed
         // as a reference.
         let iter_ty = self.expr_type(iter_expr)
-        let elem_ty = self.sema.infer_for_element_type_frozen(iter_ty)
+        let elem_ty = self.clause_element_type(comp_node, clause_index)
         let ivk = self.ast.kind(iter_expr)
         var vec_place = 0
         if ivk == NodeKind.NK_IDENT or ivk == NodeKind.NK_FIELD_ACCESS or ivk == NodeKind.NK_INDEX:
@@ -8770,7 +8809,7 @@ impl MirBuilder:
 
         let iter_op = self.lower_expr(iter_expr)
         let iter_place = self.materialize_operand(iter_op, iter_ty, self.ast.get_start(iter_expr))
-        let elem_ty = self.sema.infer_for_element_type_frozen(iter_ty)
+        let elem_ty = self.clause_element_type(comp_node, clause_index)
 
         let resolved_iter = self.sema.resolve_alias(iter_ty)
         let owner_sym = self.sema.method_owner_symbol_for_type(resolved_iter as i32)
@@ -8970,6 +9009,18 @@ impl MirBuilder:
             return self.body.new_operand(OperandKind.OK_COPY, out_place)
         self.body.new_operand(OperandKind.OK_MOVE, out_place)
 
+    // D65 (§13.5): the element type Sema bound a loop's pattern to — never
+    // re-derived here from the iterable's type, which answered differently
+    // for `v.iter()` and fell back to i32 over a `&Vec` it did not know.
+    fn loop_element_type(for_node: i32) -> i32:
+        let elem = self.sema.for_elem_types.get(for_node) ?? 0
+        if elem == 0:
+            sema_phase_bug(f"BUG: for node {for_node} reached MIR with no Sema element type")
+        elem
+
+    // A comprehension clause's, keyed by the clause's own iterable node.
+    fn clause_element_type(comp_node: i32, clause_index: i32): self.loop_element_type(self.ast.get_extra(self.comprehension_clause_start(comp_node) + clause_index * 3 + 1))
+
     mut fn lower_for_range_var(for_node: i32, pat_or_sym: i32, iter_expr: i32, body_expr: i32, range_ty: i32) -> i32:
         // for i in range_var → extract start/end/inclusive from the range struct,
         // then generate the same counter-based loop as lower_for_range.
@@ -9062,7 +9113,7 @@ impl MirBuilder:
         let start_node = self.ast.get_data0(range_node)
         let end_node = self.ast.get_data1(range_node)
         let inclusive = self.ast.get_data2(range_node)
-        let elem_ty = self.sema.infer_for_element_type_frozen(self.expr_type(range_node))
+        let elem_ty = self.loop_element_type(for_node)
 
         // Evaluate start and end
         let start_op = if start_node != 0: self.lower_expr(start_node) else: self.int_const_operand(0, elem_ty)
@@ -9206,7 +9257,7 @@ impl MirBuilder:
     mut fn lower_for_slice(for_node: i32, pat_or_sym: i32, iter_expr: i32, body_expr: i32) -> i32:
         // for x in slice → index from 0 to len
         let iter_ty = self.sequence_iter_type(iter_expr)
-        let elem_ty = self.sema.infer_for_element_type_frozen(iter_ty)
+        let elem_ty = self.loop_element_type(for_node)
         let slice_place = self.lower_sequence_place(iter_expr)
         let len_local = self.new_temp(self.sema.ty_i64)
         let len_place = self.place_for_local(len_local)
@@ -9278,7 +9329,7 @@ impl MirBuilder:
         // loop). Only rvalue receivers materialize an owning temp, which the
         // enclosing statement frame drops.
         let iter_ty = self.expr_type(iter_expr)
-        let elem_ty = self.sema.infer_for_element_type_frozen(iter_ty)
+        let elem_ty = self.loop_element_type(for_node)
 
         let ivk = self.ast.kind(iter_expr)
         var vec_place = 0
@@ -9560,8 +9611,8 @@ impl MirBuilder:
         let resolved_storage = self.sema.resolve_alias(storage_ty)
         let pair_ty = self.sema.get_generic_inst_arg(resolved_storage as i32, 0)
         if self.sema.type_needs_drop_frozen(pair_ty) != 0 and self.sema.is_copy_frozen(pair_ty) == 0:
-            return self.lower_for_iter_ref_place(for_node, pat_or_sym, entries_place, resolved_storage, self.ast.get_start(iter_expr), body_expr)
-        self.lower_for_vec_place(for_node, pat_or_sym, entries_place, pair_ty, self.ast.get_start(iter_expr), body_expr)
+            return self.lower_for_iter_ref_place(for_node, pat_or_sym, entries_place, self.ast.get_start(iter_expr), body_expr)
+        self.lower_for_vec_place(for_node, pat_or_sym, entries_place, self.loop_element_type(for_node), self.ast.get_start(iter_expr), body_expr)
 
     mut fn lower_for_hashmap(for_node: i32, pat_or_sym: i32, iter_expr: i32, body_expr: i32) -> i32:
         // for (k, v) in map → materialize map.items() then use the normal Vec loop.
@@ -9571,7 +9622,7 @@ impl MirBuilder:
         // (`m.len()` was 0, `m.get` crashed). Only an rvalue receiver
         // materializes an owning temp.
         let map_ty = self.expr_type(iter_expr)
-        let elem_ty = self.sema.infer_for_element_type_frozen(map_ty)
+        let elem_ty = self.loop_element_type(for_node)
 
         let mvk = self.ast.kind(iter_expr)
         var map_place = 0
@@ -9676,7 +9727,7 @@ impl MirBuilder:
     mut fn lower_for_iter_place(for_node: i32, pat_or_sym: i32, vec_expr: i32, body_expr: i32) -> i32:
         let vec_op = self.lower_expr(vec_expr)
         let vec_ty = self.expr_type(vec_expr)
-        let slot_ty = self.sema.infer_for_element_type_frozen(self.expr_type(self.ast.get_data1(for_node)))
+        let slot_ty = self.loop_element_type(for_node)
         let vec_place = self.materialize_operand(vec_op, vec_ty, self.ast.get_start(vec_expr))
         let len_local = self.new_temp(self.sema.ty_i64)
         let len_place = self.place_for_local(len_local)
@@ -9753,7 +9804,7 @@ impl MirBuilder:
         let rx_op = self.lower_expr(iter_expr)
         let rx_ty = self.expr_type(iter_expr)
         let rx_place = self.materialize_operand(rx_op, rx_ty, self.ast.get_start(iter_expr))
-        let elem_ty = self.sema.infer_for_element_type_frozen(self.expr_type(self.ast.get_data1(for_node)))
+        let elem_ty = self.loop_element_type(for_node)
         let opt_ty = self.sema.find_generic_inst(self.sema.syms.option, elem_ty)
         if opt_ty == 0:
             with_eprint("error: for-over-Receiver missing Option[element] instantiation")
@@ -9824,17 +9875,12 @@ impl MirBuilder:
         if self.sema.get_type_kind(resolved_vec) == TypeKind.TY_REF:
             vec_place = self.new_deref_place(vec_place)
             resolved_vec = self.sema.resolve_alias(self.sema.get_type_d0(resolved_vec))
-        self.lower_for_iter_ref_place(for_node, pat_or_sym, vec_place, resolved_vec, self.ast.get_start(vec_expr), body_expr)
+        self.lower_for_iter_ref_place(for_node, pat_or_sym, vec_place, self.ast.get_start(vec_expr), body_expr)
 
     // The borrow-iterating loop over a Vec PLACE (a binding, a field, a
     // map's storage): `&T` views of each element, the header never copied.
-    mut fn lower_for_iter_ref_place(for_node: i32, pat_or_sym: i32, vec_place: i32, resolved_vec: i32, span_start: i32, body_expr: i32) -> i32:
-        var ref_elem_ty = 0
-        if self.sema.get_type_kind(resolved_vec) == TypeKind.TY_GENERIC_INST:
-            let inner_ty = self.sema.get_generic_inst_arg(resolved_vec as i32, 0)
-            ref_elem_ty = self.sema.find_exact_type(TypeKind.TY_REF, inner_ty, 0, 0) as i32
-        if ref_elem_ty == 0:
-            ref_elem_ty = self.sema.ty_i32 as i32
+    mut fn lower_for_iter_ref_place(for_node: i32, pat_or_sym: i32, vec_place: i32, span_start: i32, body_expr: i32) -> i32:
+        let ref_elem_ty = self.loop_element_type(for_node)
         let len_local = self.new_temp(self.sema.ty_i64)
         let len_place = self.place_for_local(len_local)
         let len_args: Vec[i32] = Vec.new()
@@ -15840,6 +15886,9 @@ impl MirBuilder:
         if node == self.pipeline_receiver_override_node and self.pipeline_receiver_override_place >= 0:
             return self.body.new_operand(OperandKind.OK_COPY, self.pipeline_receiver_override_place)
 
+        if self.sema.comprehension_failure_rewraps.contains(node):
+            return self.lower_comprehension_failure(node)
+
         self.cur_node = node
         let kind = self.ast.kind(node)
 
@@ -16635,11 +16684,10 @@ impl MirBuilder:
             let range_start_node = self.ast.get_data0(node)
             let range_end_node = self.ast.get_data1(node)
             let range_inclusive = self.ast.get_data2(node)
-            var range_elem = self.sema.ty_i32 as i32
-            if range_start_node != 0:
-                range_elem = self.expr_type(range_start_node)
-            else if range_end_node != 0:
-                range_elem = self.expr_type(range_end_node)
+            let range_ty = self.expr_type(node)
+            // D65: the element type is Sema's range type's (`..n` starts at
+            // its 0); a bound's own type is `&T` over an element view.
+            let range_elem = self.sema.get_type_d0(self.sema.resolve_alias(range_ty))
             let start_op = if range_start_node != 0: self.lower_expr(range_start_node) else: self.int_const_operand(0, range_elem)
             let end_op = self.lower_expr(range_end_node)
             let incl_op = self.int_const_operand(range_inclusive, self.sema.ty_bool)
@@ -16653,7 +16701,6 @@ impl MirBuilder:
             range_names.push(0)
             let range_fid = self.body.new_agg_fields(range_fields, range_names)
             let range_rv = self.body.new_rvalue(RvalueKind.RK_AGGREGATE, 0, range_fid, 0)
-            let range_ty = self.expr_type(node)
             let range_tmp = self.new_temp(range_ty)
             let range_place = self.place_for_local(range_tmp)
             self.body.push_stmt(self.cur_bb, StmtKind.Assign, range_place, range_rv, self.ast.get_start(node))
@@ -17255,7 +17302,11 @@ fn lower_fn_with_sig(builder: MirBuilder, fn_node: i32, sig_idx: i32) -> Lowered
             // owned params (consume/escape_value → not value_ref_abi, and move-self
             // receivers) are dropped by the callee.
             let share_place_param = sig_idx >= 0 and builder.sema.sig_param_uses_value_ref_abi(sig_idx, i) != 0 and not move_self_receiver
-            if builder.sema.is_copy_frozen(p_ty) == 0 and drop_receiver_self == 0 and not borrowed_receiver and not share_place_param:
+            // #1822: the one decision that the callee does not own this
+            // parameter, recorded for the ownership validator to read.
+            if drop_receiver_self != 0 or borrowed_receiver or share_place_param:
+                builder.body.mark_caller_place_local(local_id)
+            else if builder.sema.is_copy_frozen(p_ty) == 0:
                 builder.schedule_drop(local_id, DropKind.DK_VALUE)
             param_locals.push(local_id)
         builder.body.n_params = param_count

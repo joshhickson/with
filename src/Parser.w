@@ -5094,7 +5094,7 @@ impl Parser:
                         let expr_text = content.slice(expr_start_pos as i64, colon_pos as i64)
                         expr_node = self.parse_interpolated_expr(expr_text, hole_source_start)
                         let spec_text = content.slice((colon_pos + 1) as i64, j as i64)
-                        spec_node = self.parse_format_spec_text(spec_text, start, end)
+                        spec_node = self.parse_format_spec_text(spec_text, start, end, start + 2 + colon_pos + 1)
                 else:
                     let hole_source_start = start + 2 + expr_start_pos
                     expr_node = self.parse_interpolated_expr(hole_text, hole_source_start)
@@ -5256,78 +5256,61 @@ impl Parser:
             i = i + 1
         out
 
-    fn parse_format_spec_text(spec_text: &str, start: i32, end: i32) -> NodeId:
-        // Parse format spec grammar: [[fill]align][sign]['#']['0'][width]['.' precision][mode]
-        // Returns NodeKind.NK_FSTRING_SPEC node, or 0 if empty
+    // §15.4.1: [[fill]align][sign]['#']['0'][width]['.' precision][mode].
+    // Returns the NK_FSTRING_SPEC node, or 0 for the empty spec: every field
+    // is optional and each one's default is the default display, so `{x:}`
+    // formats as `{x}`. It returned a poisoned node with no diagnostic, which
+    // the f-string lowering read as precision 0 and a str printed nothing
+    // (#1823). Text past the grammar is refused; it was silently dropped.
+    mut fn parse_format_spec_text(spec_text: &str, start: i32, end: i32, spec_start: i32) -> NodeId:
         let slen = spec_text.len() as i32
         if slen == 0:
-            return self.poisoned_expr()
-        var fill: i32 = 32  // space
-        var align: i32 = 0  // 0=default, 1=left, 2=right, 3=center
-        var sign_plus: i32 = 0
-        var alternate: i32 = 0
-        var zero_pad: i32 = 0
-        var width: i32 = 0
-        var precision: i32 = -1
-        var mode: i32 = 0
+            return 0 as NodeId
+        var fill = ' ' as i32
+        var align = 0  // 0=default, 1=left, 2=right, 3=center
+        var sign_plus = 0
+        var alternate = 0
+        var zero_pad = 0
+        var width = 0
+        var precision = -1
+        var mode = 0
         var pos = 0
-        // Check for [fill]align: if pos+1 < slen and char[pos+1] is <, >, ^
+        // [fill]align: a fill byte counts only when an align follows it.
         if pos + 1 < slen:
-            let next_ch = spec_text[(pos + 1)]
-            if next_ch == 60 or next_ch == 62 or next_ch == 94:  // <, >, ^
+            let next_align = fstring_spec_align(spec_text[pos + 1])
+            if next_align != 0:
                 fill = spec_text[pos] as i32
-                if next_ch == 60: align = 1
-                else if next_ch == 62: align = 2
-                else: align = 3
+                align = next_align
                 pos = pos + 2
-        // Check for bare align: <, >, ^
         if align == 0 and pos < slen:
-            let ch = spec_text[pos]
-            if ch == 60:
-                align = 1
-                pos = pos + 1
-            else if ch == 62:
-                align = 2
-                pos = pos + 1
-            else if ch == 94:
-                align = 3
-                pos = pos + 1
-        // Sign: + or -
-        if pos < slen:
-            let ch = spec_text[pos]
-            if ch == 43:
-                sign_plus = 1
-                pos = pos + 1
-            else if ch == 45:
-                pos = pos + 1
-        // Alternate: #
-        if pos < slen and spec_text[pos] == 35:
+            align = fstring_spec_align(spec_text[pos])
+            if align != 0: pos = pos + 1
+        if pos < slen and (spec_text[pos] == '+' or spec_text[pos] == '-'):
+            sign_plus = if spec_text[pos] == '+': 1 else: 0
+            pos = pos + 1
+        if pos < slen and spec_text[pos] == '#':
             alternate = 1
             pos = pos + 1
-        // Zero-pad: 0 (only if followed by digit for width, or is the only remaining char)
-        if pos < slen and spec_text[pos] == 48:
-            // 0 is zero-pad if next char is a digit or end of spec or mode letter
-            if pos + 1 >= slen or (spec_text[(pos + 1)] >= 48 and spec_text[(pos + 1)] <= 57) or spec_text[(pos + 1)] == 46:
+        // `0` is the zero-pad flag when a width digit, a `.` or the end follows.
+        if pos < slen and spec_text[pos] == '0':
+            if pos + 1 >= slen or fstring_spec_digit(spec_text[pos + 1]) or spec_text[pos + 1] == '.':
                 zero_pad = 1
                 pos = pos + 1
-        // Width: digits
-        while pos < slen and spec_text[pos] >= 48 and spec_text[pos] <= 57:
-            width = width * 10 + (spec_text[pos] as i32 - 48)
+        while pos < slen and fstring_spec_digit(spec_text[pos]):
+            width = width * 10 + (spec_text[pos] - '0') as i32
             pos = pos + 1
-        // Precision: . then digits
-        if pos < slen and spec_text[pos] == 46:
+        if pos < slen and spec_text[pos] == '.':
             pos = pos + 1
             precision = 0
-            while pos < slen and spec_text[pos] >= 48 and spec_text[pos] <= 57:
-                precision = precision * 10 + (spec_text[pos] as i32 - 48)
+            while pos < slen and fstring_spec_digit(spec_text[pos]):
+                precision = precision * 10 + (spec_text[pos] - '0') as i32
                 pos = pos + 1
-        // Mode: single letter at end
+        if pos < slen and fstring_spec_mode(spec_text[pos]):
+            mode = spec_text[pos] as i32
+            pos = pos + 1
         if pos < slen:
-            let ch = spec_text[pos] as i32
-            // Valid modes: d, x, X, b, o, f, e, g, s, ?
-            if ch == 100 or ch == 120 or ch == 88 or ch == 98 or ch == 111 or ch == 102 or ch == 101 or ch == 103 or ch == 115 or ch == 63:
-                mode = ch
-                pos = pos + 1
+            let rest = spec_text.slice(pos as i64, slen as i64)
+            self.emit_error_span(f"invalid format spec `{spec_text}`: `{rest}` is not part of [[fill]align][sign]['#']['0'][width]['.' precision][mode] (§15.4.1)", spec_start + pos, spec_start + slen)
         // Pack flags into d0: mode(-7), fill(8-15), align(16-17), sign_plus(18), alternate(19), zero_pad(20)
         let flags = mode | ((fill & 255) << 8) | ((align & 3) << 16) | ((sign_plus & 1) << 18) | ((alternate & 1) << 19) | ((zero_pad & 1) << 20)
         self.pool.add_node(NodeKind.NK_FSTRING_SPEC, start, end, flags, width, precision)
@@ -5339,6 +5322,14 @@ impl Parser:
         // Shared mode moved self.diags into the sub-parser; put it back.
         self.diags = move attempt.diags
         attempt.node
+
+// §15.4.1 align: 1 left `<`, 2 right `>`, 3 center `^`; 0 for any other byte.
+fn fstring_spec_align(ch: u8): if ch == '<': 1 else if ch == '>': 2 else if ch == '^': 3 else: 0
+
+fn fstring_spec_digit(ch: u8): ch >= '0' and ch <= '9'
+
+// §15.4.2 modes: d x X b o f e g s ?
+fn fstring_spec_mode(ch: u8): ch == 'd' or ch == 'x' or ch == 'X' or ch == 'b' or ch == 'o' or ch == 'f' or ch == 'e' or ch == 'g' or ch == 's' or ch == '?'
 
 fn offset_interpolated_expr_spans(pool: AstPool, first_node: i32, delta: i32):
     if delta == 0:
@@ -6992,14 +6983,25 @@ impl Parser:
             let not_flag = self.pool.add_node(NodeKind.NK_UNARY, start, start, 1, flag_read, 0)
             let if_else = self.pool.add_node(NodeKind.NK_IF_EXPR, start, self.prev_end(), not_flag, else_body, 0)
             // Build block: { flag_decl; for_node; if_else }
+            self.add_for_carrier_alt(for_node, binding_is_pat != 0, index_binding)
             let block_extra = self.pool.extra_len()
             self.pool.add_extra(flag_decl)
             self.pool.add_extra(for_node)
             for_node = self.pool.add_node(NodeKind.NK_BLOCK, start, self.prev_end(), block_extra, 2, if_else)
         else:
             self.pos = save_pos
+            self.add_for_carrier_alt(for_node, binding_is_pat != 0, index_binding)
 
         for_node
+
+    // §13.6a: `for x in opt:` over an Option or Result is a one-clause
+    // comprehension; Sema, which knows the iterable's type, chooses. A range
+    // literal is never a carrier, and a comprehension clause binds no index.
+    mut fn add_for_carrier_alt(for_node: NodeId, binding_is_pat: bool, index_binding: i32):
+        if index_binding != 0 or self.pool.kind(self.pool.get_data1(for_node)) == NodeKind.NK_RANGE:
+            return
+        let alt = self.pool.build_for_carrier_alt(for_node, binding_is_pat, self.intern.intern("_Payload"), self.intern.intern("___fail_0"))
+        self.pool.add_for_carrier_alt(for_node, alt)
 
     // For-comprehension: for x in a; y in b(x): yield f(x, y)
     // Desugars to nested match on Option (Some/None).
@@ -7062,64 +7064,15 @@ impl Parser:
         else:
             body_expr = self.parse_block_or_expr()
 
-        // Build nested match from inside out
-        // Use placeholder variant names — sema resolves to Some/None or Ok/Err
-        // based on the match subject's type (Option vs Result).
-        let some_sym = self.intern.intern("_Payload")
-        let none_sym = self.intern.intern("_Empty")
-
-        // Innermost: wrap body in Some(body) if yield
-        var inner: NodeId = body_expr
-        if has_yield != 0:
-            // Some(body_expr) — construct as a call to Some
-            let some_callee = self.pool.add_node(NodeKind.NK_IDENT, start, start, some_sym, 0, 0)
-            let some_extra = self.pool.extra_len()
-            self.pool.add_extra(body_expr)
-            inner = self.pool.add_node(NodeKind.NK_CALL, start, self.prev_end(), some_callee, some_extra, 1)
-
-        // Build nested matches from last binding to first
-        var bi = bind_syms.len() as i32 - 1
-        while bi >= 0:
-            let bkind = bind_kinds[bi]
-            if bkind == 1:
-                // Guard: if guard_expr: inner else: None (or void for imperative)
-                let guard_expr = bind_exprs[bi]
-                var guard_else: NodeId = 0 as NodeId
-                if has_yield != 0:
-                    guard_else = self.pool.add_node(NodeKind.NK_VARIANT_SHORTHAND, start, start, none_sym, 0, 0)
-                else:
-                    guard_else = self.pool.add_node(NodeKind.NK_BLOCK, start, start, 0, 0, 0)
-                inner = self.pool.add_node(NodeKind.NK_IF_EXPR, start, self.prev_end(), guard_expr, inner, guard_else)
-            else:
-                // Binding: match source: Some(sym) => inner, None => None/void
-                let source = bind_exprs[bi]
-                let bsym = bind_syms[bi]
-                // Build Some(bsym) pattern — use NK_PAT_IDENT for correct binding
-                let bind_pat = self.pool.add_node(NodeKind.NK_PAT_IDENT, start, start, bsym, 0, 0)
-                let pat_extra = self.pool.extra_len()
-                self.pool.add_extra(bind_pat)
-                let some_pat = self.pool.add_node(NodeKind.NK_PAT_VARIANT, start, start, some_sym, pat_extra, 1)
-                // Build Some arm: Some(bsym) => inner
-                let some_arm = self.pool.add_node(NodeKind.NK_MATCH_ARM, start, self.prev_end(), some_pat, inner, 0)
-                // Build failure arm: at-binding pattern (___fail @ _) captures the
-                // entire matched value. Body returns ___fail — propagating None or
-                // Err(e) unchanged regardless of which enum type it is.
-                let fail_sym = self.intern.intern(f"___fail_{bi}")
-                let wild = self.pool.add_node(NodeKind.NK_PAT_WILDCARD, start, start, 0, 0, 0)
-                let none_pat = self.pool.add_node(NodeKind.NK_PAT_AT_BINDING, start, start, fail_sym, wild, 0)
-                var none_body: NodeId = 0 as NodeId
-                if has_yield != 0:
-                    none_body = self.pool.add_node(NodeKind.NK_IDENT, start, start, fail_sym, 0, 0)
-                else:
-                    none_body = self.pool.add_node(NodeKind.NK_BLOCK, start, start, 0, 0, 0)
-                let none_arm = self.pool.add_node(NodeKind.NK_MATCH_ARM, start, self.prev_end(), none_pat, none_body, 0)
-                // Build match
-                let arms_extra = self.pool.extra_len()
-                self.pool.add_extra(some_arm)
-                self.pool.add_extra(none_arm)
-                inner = self.pool.add_node(NodeKind.NK_MATCH, start, self.prev_end(), source, arms_extra, 2)
-            bi = bi - 1
-        inner
+        // Nested matches, one per clause (AstPool.build_comprehension_match).
+        // The failure arm `___fail_i @ _` captures the whole clause value.
+        let pats: Vec[i32] = Vec.new()
+        let fail_syms: Vec[i32] = Vec.new()
+        for bi in 0..bind_syms.len() as i32:
+            let binds = bind_kinds[bi] == 0
+            pats.push(if binds: self.pool.add_node(NodeKind.NK_PAT_IDENT, start, start, bind_syms[bi], 0, 0) else: 0)
+            fail_syms.push(if binds: self.intern.intern(f"___fail_{bi}") else: 0)
+        self.pool.build_comprehension_match(start, self.prev_end(), self.intern.intern("_Payload"), self.intern.intern("_Empty"), &fail_syms, &pats, &bind_exprs, &bind_kinds, body_expr, has_yield != 0)
 
     mut fn finish_labeled_block(start: i32, label_sym: i32, body: NodeId) -> NodeId:
         if body != 0 and self.pool.kind(body) == NodeKind.NK_BLOCK:

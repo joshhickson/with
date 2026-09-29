@@ -1813,22 +1813,26 @@ impl Codegen:
             let sema_text = self.sema_symbol_text(fn_sym)
             if sema_text.len() > 0:
                 translated_sym = self.intern.intern(sema_text)
+            // D65 (§12): MirLower recorded (CK_FN d1 = 1) that Sema typed this
+            // function a With callable value; its form is the FnAbi adapter.
+            let callable_value = body.const_d1[const_id] == 1
+            let callable_ty = if callable_value: self.mir_sema_type_to_llvm(body.const_types[const_id]) else: 0
             let fv_opt = self.fn_values.get(translated_sym)
             if fv_opt.is_some():
                 if self.debug_mir_codegen_enabled():
                     let fn_name = self.function_symbol_name(translated_sym)
                     with_eprint(f"[ck-fn] sym={fn_sym} -> {fn_name}")
                 let fn_val = fv_opt.unwrap() as i64
-                if expected_ty != 0 and wl_get_type_kind(expected_ty) == wl_struct_type_kind():
-                    return self.coerce_value_to_type(fn_val, expected_ty)
+                if callable_value:
+                    return self.gen_fn_to_fat_ptr_thunk(fn_val, callable_ty)
                 return fn_val
             let fn_name = self.function_link_name_for_sym(translated_sym)
             let found = wl_get_named_function(self.llmod, fn_name)
             if found != 0:
                 if self.debug_mir_codegen_enabled():
                     with_eprint(f"[ck-fn] sym={fn_sym} -> {fn_name} (llmod)")
-                if expected_ty != 0 and wl_get_type_kind(expected_ty) == wl_struct_type_kind():
-                    return self.coerce_value_to_type(found, expected_ty)
+                if callable_value:
+                    return self.gen_fn_to_fat_ptr_thunk(found, callable_ty)
                 return found
             with_eprint(f"warning: [ck-fn] NOT FOUND sym={fn_sym} name={fn_name}")
             return wl_get_undef(fallback_ty)
@@ -2060,6 +2064,11 @@ impl Codegen:
             if self.mir_type_kind_at(place_resolved) == TypeKind.TY_GENERIC_INST:
                 self.ensure_generic_inst_trait_vtable(place_resolved, info.type_sym, trait_sym)
             return self.build_dyn_trait_value_from_ptr(ptr, info.type_sym, trait_sym)
+        // #1818: when Sema typed the destination `&dyn Trait`, a thin pointer
+        // is never right; it reached the fn-value adapter, whose abort named
+        // the wrong defect.
+        if self.mir_dyn_trait_symbol_from_sema_type(target_sema_ty) != 0 and wl_type_of(ptr) != target_ty:
+            sema_phase_bug(f"BUG: `&dyn` coercion from a place of type {self.sema.type_name(place_sema_ty)} found no concrete impl type")
         ptr
 
     fn current_method_owner_from_name() -> i32:
@@ -7227,6 +7236,22 @@ impl Codegen:
     mut fn mir_struct_sym_from_sema_type(sema_ty: i32) -> i32:
         self.mir_nominal_sym_from_sema_type(sema_ty)
 
+    // §11 (#1818): the impl-type symbol that keys the vtable of a `dyn`
+    // coercion's concrete type. A nominal type has its codegen symbol. A
+    // builtin (`str`, an integer, a float, `bool`) has none; its impl is the
+    // one Sema selected with type_symbol_for_bounds when it accepted the
+    // coercion, so that symbol names the vtable. Without it the fat pointer
+    // was never built and the thin pointer reached the fn-value adapter.
+    mut fn mir_dyn_concrete_sym_from_sema_type(sema_ty: i32) -> i32:
+        let nominal = self.mir_nominal_sym_from_sema_type(sema_ty)
+        if nominal != 0 or sema_ty <= 0:
+            return nominal
+        let kind = self.sema.get_type_kind(self.sema.resolve_alias(sema_ty as TypeId))
+        if kind != TypeKind.TY_STR and kind != TypeKind.TY_INT and kind != TypeKind.TY_FLOAT and kind != TypeKind.TY_BOOL:
+            return 0
+        let bound_sym = self.sema.type_symbol_for_bounds(sema_ty)
+        if bound_sym == 0: 0 else: self.sema_sym_to_codegen_sym(bound_sym)
+
     mut fn ensure_generic_method_owner_sym(sema_ty: i32) -> i32:
         if sema_ty <= 0:
             return 0
@@ -7433,11 +7458,11 @@ impl Codegen:
             let tk = self.mir_type_kind_at(resolved)
             if tk == TypeKind.TY_REF or tk == TypeKind.TY_PTR:
                 let inner = self.mir_type_d0_at(resolved)
-                let inner_sym = self.mir_struct_sym_from_sema_type(inner)
+                let inner_sym = self.mir_dyn_concrete_sym_from_sema_type(inner)
                 if inner_sym != 0:
                     return DynArgInfo { type_sym: inner_sym, use_ptr: 1 }
             else:
-                let value_sym = self.mir_struct_sym_from_sema_type(resolved)
+                let value_sym = self.mir_dyn_concrete_sym_from_sema_type(resolved)
                 if value_sym != 0:
                     return DynArgInfo { type_sym: value_sym, use_ptr: 0 }
 
@@ -7454,21 +7479,21 @@ impl Codegen:
             tk = self.sema.get_type_kind(live_resolved as TypeId)
             if tk == TypeKind.TY_REF or tk == TypeKind.TY_PTR:
                 let inner = self.sema.get_type_d0(live_resolved as TypeId) as i32
-                let inner_sym = self.mir_struct_sym_from_sema_type(inner)
+                let inner_sym = self.mir_dyn_concrete_sym_from_sema_type(inner)
                 if inner_sym != 0:
                     return DynArgInfo { type_sym: inner_sym, use_ptr: 1 }
             else:
-                let value_sym = self.mir_struct_sym_from_sema_type(live_resolved)
+                let value_sym = self.mir_dyn_concrete_sym_from_sema_type(live_resolved)
                 if value_sym != 0:
                     return DynArgInfo { type_sym: value_sym, use_ptr: use_ptr_if_value }
             return DynArgInfo { type_sym: 0, use_ptr: 0 }
 
         if tk == TypeKind.TY_REF or tk == TypeKind.TY_PTR:
-            let inner_sym = self.mir_struct_sym_from_sema_type(self.mir_type_d0_at(resolved))
+            let inner_sym = self.mir_dyn_concrete_sym_from_sema_type(self.mir_type_d0_at(resolved))
             if inner_sym != 0:
                 return DynArgInfo { type_sym: inner_sym, use_ptr: 1 }
 
-        let value_sym = self.mir_struct_sym_from_sema_type(resolved)
+        let value_sym = self.mir_dyn_concrete_sym_from_sema_type(resolved)
         if value_sym != 0:
             return DynArgInfo { type_sym: value_sym, use_ptr: use_ptr_if_value }
 
@@ -15897,6 +15922,13 @@ impl Codegen:
         // ConstKind.CK_FN syms are from sema pool — translate to codegen intern pool.
         var callee_fn_sym: i32 = 0
         var callee_raw_fn_sym: i32 = 0
+        // D65: a callable-marked constant (CK_FN d1 = 1; a named function
+        // MirLower placed as the callee of an inline-expanded combinator such
+        // as Option.map) is a call of that callable value — through its
+        // adapter, with the closure ABI — never a direct call of the function
+        // (whose own ABI has no context parameter: the argument counts
+        // disagreed).
+        var callee_is_callable_value = false
         if callee_operand >= 0 and callee_operand < body.operand_kinds.len() as i32:
             let co_k = body.operand_kinds[callee_operand]
             let co_d = body.operand_d0[callee_operand]
@@ -15904,6 +15936,7 @@ impl Codegen:
                 if body.const_kinds[co_d] == ConstKind.CK_FN:
                     let raw_sym = body.const_d0[co_d]
                     callee_raw_fn_sym = raw_sym
+                    callee_is_callable_value = body.const_d1[co_d] == 1
                     // Translate sema pool sym to codegen intern pool sym
                     let sym_text = self.sema_symbol_text(raw_sym)
                     if sym_text.len() > 0:
@@ -15911,7 +15944,7 @@ impl Codegen:
                     else if self.fn_values.get(raw_sym).is_some() or self.fn_fn_types.get(raw_sym).is_some() or self.fn_abi_symbols.contains(raw_sym):
                         callee_fn_sym = raw_sym
 
-        var call_abi = self.fn_abi_symbols.get(callee_fn_sym) ?? -1
+        var call_abi = if callee_is_callable_value: -1 else: self.fn_abi_symbols.get(callee_fn_sym) ?? -1
         if call_abi < 0 and callee_sema_ty > 0:
             call_abi = self.callable_fn_abi(callee_sema_ty, is_indirect)
         if call_abi < 0:
@@ -16359,6 +16392,14 @@ impl Codegen:
             with_eprint("===== INVALID LLVM FUNCTION " ++ name_str ++ " =====\n")
             wl_dump_value(function)
             with_eprint("===== END INVALID LLVM FUNCTION =====\n")
+            // The invalid function alone hides what it calls (a thunk's or
+            // callee's declaration); the pre/post-optimize dumps never run
+            // after a failed verify. WITH_DUMP_LLIR_ON_INVALID=1 prints the
+            // module as it stands.
+            if with_getenv_str("WITH_DUMP_LLIR_ON_INVALID").len() > 0:
+                with_eprint("===== MODULE AT INVALID FUNCTION =====\n")
+                wl_print_ir(self.llmod)
+                with_eprint("===== END MODULE =====\n")
             with_eprint("error: LLVM function verification failed after MIR cleanup for " ++ name_str ++ "\n")
             self.had_error = 1
             return
