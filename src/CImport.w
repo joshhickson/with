@@ -12,6 +12,7 @@ use compiler.ClangBridge.*
 use compiler.EmbeddedClangResource
 use std.string.StringBuilder
 use TargetSpec
+use MathBuiltins
 
 extern fn with_parse_float_ref(s: &str) -> f64
 extern fn with_str_clone_ref(s: &str) -> str
@@ -310,6 +311,36 @@ fn c_import_included_files_clear():
 /// the dependency manifest stored beside each cached translation (#553).
 pub fn c_import_included_files() -> str:
     g_cimport_included_files ++ ""
+
+// #1877: the `__c_import_<op>_overflow_<ty>` helpers this import's
+// inline bodies call (`__builtin_mul_overflow` and kin). The migrator's
+// preamble defines every width; a header import defines each one it names,
+// once, in its own translation — a name nothing defines is a dangling
+// reference, never emitted.
+var g_ci_overflow_helpers_needed: Vec[str] = Vec.new()
+
+fn ci_note_overflow_helper_needed(helper: &str, op: &str, ty: &str):
+    let entry = helper ++ "|" ++ op ++ "|" ++ ty
+    for i in 0..g_ci_overflow_helpers_needed.len() as i32:
+        if g_ci_overflow_helpers_needed[i] == entry: return
+    g_ci_overflow_helpers_needed.push(entry)
+
+fn ci_render_overflow_helpers_needed() -> str:
+    var out = ""
+    for i in 0..g_ci_overflow_helpers_needed.len() as i32:
+        let parts = g_ci_overflow_helpers_needed[i].split("|")
+        let helper = parts[0]
+        if with_cimport_is_name_emitted(helper) != 0: continue
+        with_cimport_mark_name_emitted(helper)
+        let op = parts[1]
+        let ty = parts[2]
+        let shared = ci_u128_mul_helper_name()
+        if op == "mul" and (ty == "i128" or ty == "u128") and with_cimport_is_name_emitted(shared) == 0:
+            with_cimport_mark_name_emitted(shared)
+            out = out ++ ci_migrate_render_u128_mul_would_overflow(shared)
+        out = out ++ ci_migrate_render_overflow_helper_for(op, ty)
+    g_ci_overflow_helpers_needed = Vec.new()
+    out
 
 fn ci_record_raw_function_name(name: &str):
     if name.len() == 0:
@@ -626,6 +657,7 @@ pub fn process_c_import_with_defines(header_spec: &str, defines: &Vec[str]) -> s
         return ""
     g_cimport_raw_function_names = ""
     g_cimport_unprototyped_names = ""
+    g_ci_overflow_helpers_needed = Vec.new()
     ci_record_field_caches_clear()
     g_cimport_report_untranslated_macros = ci_should_report_untranslated_macros(header_spec)
     if with_cimport_available() == 0:
@@ -806,6 +838,7 @@ pub fn process_c_import_with_defines(header_spec: &str, defines: &Vec[str]) -> s
     if macro_session != 0:
         output.push_str(ci_translate_macros(macro_session, session, include_text))
         with_cimport_dispose_macros(macro_session)
+    output.push_str(ci_render_overflow_helpers_needed())
     with_cimport_dispose(session)
     ci_fn_decl_index_reset()
     g_macro_type_names = ""
@@ -1846,7 +1879,7 @@ fn ci_translate_function(session: i64, idx: i32, known_structs: &str, demoted_ty
             if si_raw:
                 ci_record_raw_function_name(name)
             let si_ret_render = ci_unsafe_fn_ptr_type(si_ret)
-            return ci_render_generated_fn_body(fn_kw ++ safe_name ++ "(" ++ si_params ++ ") -> " ++ si_ret_render, body)
+            return ci_take_body_hoisted_decls() ++ ci_render_generated_fn_body(fn_kw ++ safe_name ++ "(" ++ si_params ++ ") -> " ++ si_ret_render, body)
         // The translator's own reason (va_arg, an unsupported builtin, a
         // record initializer it cannot resolve), not only that it failed.
         let failed_why = if g_ci_bail_message.len() > 0: "inline body translation failed: " ++ g_ci_bail_message else: "inline body translation failed"
@@ -3424,10 +3457,13 @@ pub fn ci_translate_macros(session: i64, type_session: i64, macro_source: &str) 
                         ci_migrate_set_unsafe_function_body_context(false)
                     if translated.len() > 0:
                         // Infer return type from cast expression: (x as c_int) → return c_int
+                        // A macro with no parameters infers the same way (#1879):
+                        // `#define SDL_Unsupported() SDL_SetError("...")` returns
+                        // what SDL_SetError returns, not the `i32` placeholder.
                         var inferred_ret = with_str_clone_ref(ret_type)
                         if ci_translation_is_void_statement(translated):
                             inferred_ret = "Unit"
-                        else if param_count > 0:
+                        else:
                             inferred_ret = ci_infer_macro_return_type_from_expr(type_session, translated, known_macro_returns, ret_type)
                         if ci_strip_parens(ci_trim(translated)) == "NULL" and ci_infer_cast_return_type(translated).len() == 0:
                             ci_record_untranslated_macro(name)
@@ -9862,6 +9898,9 @@ fn ci_migrate_preamble_extern_call_requires_unsafe(name: &str) -> bool:
     // Extern declarations in std modules have the compiler-implementation
     // policy. Match Sema for all std corpora; ordinary user modules still
     // require the wrapper around their manual pointer-ABI extern calls.
+    // A math builtin call is Sema's own (D42): `unsafe { acos(x) }` is refused
+    // as a block with no unsafe operation (#1876).
+    if ci_is_libm_fn(name): return false
     if ci_migrate_preamble_name_is_modeled_libc(name):
         return not (ci_migrate_shared_defs_active() and ci_migrate_shared_defs_targets_std_zone())
     // with_* compiler-ABI externs stay wrapped even in shared-defs mode: the D30
@@ -10400,7 +10439,9 @@ impl CiExprPool:
         args.push(self.cast(canonical_ptr_ty, (arg_ids.get(2)) as CiExprId) as i32)
         // The helpers return bool (C `_Bool`); typing the call is what lets an
         // `int f() { return __builtin_mul_overflow(...); }` coerce at the return.
-        let call = self.build_named_call_expr_typed("__with_builtin_" ++ op ++ "_overflow_" ++ out_ty, &args, types.named_type_from_text("bool"))
+        let helper = ci_overflow_helper_name(op, out_ty)
+        ci_note_overflow_helper_needed(helper, op, out_ty)
+        let call = self.build_named_call_expr_typed(helper, &args, types.named_type_from_text("bool"))
         self.unsafe_expr(call)
 
     fn build_libc_call_value_expr(session: i64, cursor: i32, callee_text: &str, arg_ids: &Vec[i32], types: CiTypePool) -> CiExprId:
@@ -12825,6 +12866,19 @@ impl CiStmtPool:
                     return CiDeclLoweringIR { updated_scope: scope, stmt_id: 0 as CiStmtId }
                 g_ci_va_deferred_decls = g_ci_va_deferred_decls ++ va_key
                 deferred_va_list = true
+            else if with_ci_cursor_kind(session, child) == CK_STRUCT or with_ci_cursor_kind(session, child) == CK_UNION:
+                // #1878: a record with no tag declared by the local
+                // (`union { float f; Uint32 ui32; } swapper;`) is a With
+                // type of its own, declared beside the function under the
+                // bridge's name for it (§16.1); its layout is the record's,
+                // never opaque — an opaque one is a loud omission.
+                let synth = with_ci_anon_record_name(session, child)
+                if synth.len() > 0:
+                    let rendered = ci_translate_anon_record_cursor(session, child, synth)
+                    if rendered.ends_with("= opaque\n"):
+                        let _ = ci_va_bail(session, child, "local record '" ++ synth ++ "' has no With layout (§16.9)")
+                        return CiDeclLoweringIR { updated_scope: scope, stmt_id: 0 as CiStmtId }
+                    g_ci_body_hoisted_decls = g_ci_body_hoisted_decls ++ rendered
             else if with_ci_cursor_kind(session, child) == CXK_VAR_DECL:
                 let raw_name = with_ci_cursor_spelling(session, child)
                 let escaped = ci_escape_reserved(raw_name)
@@ -13005,10 +13059,21 @@ fn ci_fn_definition_cursor(session: i64, decl_idx: i32) -> i32:
 pub fn ci_try_translate_fn_body(session: i64, decl_idx: i32) -> str:
     ci_try_translate_fn_body_at(session, decl_idx, ci_fn_definition_cursor(session, decl_idx))
 
+// #1878: the module-level declarations a body's locals need (the record
+// with no tag a local declares), taken by the caller that renders the
+// function and emitted beside it.
+var g_ci_body_hoisted_decls: str = ""
+
+pub fn ci_take_body_hoisted_decls() -> str:
+    let taken = g_ci_body_hoisted_decls.clone()
+    g_ci_body_hoisted_decls = ""
+    taken
+
 fn ci_try_translate_fn_body_at(session: i64, decl_idx: i32, found_cursor: i32) -> str:
     // A record left by a body that bailed elsewhere must not be charged to
     // this one: every caller takes the records right after this returns.
     let _stale = ci_print_take_unknowns()
+    g_ci_body_hoisted_decls = ""
     ci_clear_bail_location()
     // B9: fresh per-function temp counter. This path is called
     // from ci_translate_function's static-inline branch — which
@@ -17352,14 +17417,11 @@ fn ci_builtin_bit_operand_type(name: &str) -> str:
     if name.ends_with("l") or name == "__builtin_bswap64": return "u64"
     "u32"
 
-fn ci_is_libm_fn(name: &str) -> bool:
-    if name == "sqrt" or name == "pow": return true
-    if name == "floor" or name == "ceil" or name == "round": return true
-    if name == "sin" or name == "cos" or name == "tan": return true
-    if name == "log" or name == "log10" or name == "exp": return true
-    if name == "fabs" or name == "fmod": return true
-    if name == "asin" or name == "acos" or name == "atan" or name == "atan2": return true
-    false
+// D42: the compiler's math builtins (MathBuiltins is the one table Sema,
+// MirLower and codegen read). A C call to one of these names is the builtin
+// call — Sema types it itself and an `extern fn` of the name yields to it
+// (SemaCheck math_extern_yields) — so it is never an unsafe operation (#1876).
+fn ci_is_libm_fn(name: &str) -> bool: math_fn_lookup(name) >= 0
 
 fn ci_libc_symbol_kind_mask(name: &str) -> i32:
     if name == "rlimit": return CI_LIBC_KIND_TYPE
