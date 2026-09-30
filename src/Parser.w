@@ -8761,7 +8761,10 @@ impl Parser:
                 var args: Vec[i32] = Vec.new()
                 if self.peek() != TokenKind.TK_R_BRACKET:
                     while self.peek() != TokenKind.TK_R_BRACKET and self.peek() != TokenKind.TK_EOF:
-                        let arg = if self.intern.resolve(sym) == "FixedString":
+                        // A length argument is a value, not a type:
+                        // `FixedString[N]`, and §4.3d's `Vector[4, f32]` /
+                        // `Mask[4, 32]`.
+                        let arg = if self.intern.resolve(sym) == "FixedString" or self.peek() == TokenKind.TK_INT_LIT:
                             self.parse_expr()
                         else:
                             self.parse_type_expr()

@@ -20,7 +20,7 @@ extern fn with_getenv_str(name: &str) -> str
 
 // A label for docs/spec/abi/with-abi.md's version history, not the bundle key; it
 // becomes a frozen, normative major version at Level 1 of the roadmap.
-pub const WITH_ABI_VERSION: i32 = 8
+pub const WITH_ABI_VERSION: i32 = 9
 
 // #D6: PassMode — the per-parameter ABI classification, the SINGLE source of
 // truth. fn_abi_pass_mode computes it; both the callee prologue
@@ -93,6 +93,18 @@ pub fn fn_abi_owned_place(drop_receiver: bool, aggregate: bool) -> bool:
 // target passes aggregates by LLVM value and lets LLVM lower them.
 pub fn fn_abi_platform_aggregate_indirect(windows_x86_64: bool, is_aggregate: bool, size: i64) -> bool:
     windows_x86_64 and is_aggregate and size > 8
+
+// §4.3d / §16.1 (D78): a vector crossing a C call goes where the target's C
+// compiler puts it (clang's output on each target, checked in IR): up to 16
+// bytes in a vector register everywhere; larger, AAPCS64 (Darwin and Linux)
+// passes a pointer to a caller-made copy and returns through sret, SysV
+// x86_64 passes it in memory (byval) and returns it by value, and Windows
+// x86_64 leaves both to LLVM's vector lowering.
+pub fn fn_abi_c_vector_param_indirect(arch: &str, os: &str, size: i64) -> bool:
+    size > 16 and (arch == "aarch64" or (arch == "x86_64" and os != "Windows"))
+
+pub fn fn_abi_c_vector_return_indirect(arch: &str, size: i64) -> bool:
+    size > 16 and arch == "aarch64"
 
 // C's array typedef on SysV x86_64 (Linux and Darwin alike) decays to the
 // caller's place. Other targets keep value semantics: AAPCS64 uses the
