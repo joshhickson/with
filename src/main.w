@@ -1628,6 +1628,13 @@ fn build_runner_ensure(root: &str, options: &BuildCommandOptions) -> str:
     let key = build_cache_graph_key(root, options.target_kind, 0)
     if with_fs_file_exists(bin_path) != 0 and with_fs_read_file(key_path) == key:
         return bin_path
+    // Another project built this very runner: take its copy.
+    let shared = build_cache_runner_store_path(key)
+    if shared.len() > 0 and with_fs_file_exists(shared) != 0 and with_fs_read_file(shared ++ ".key") == key:
+        let _state = build_graph_rt_mkdir_p(resolve_join(root, "out/.build-state"))
+        if build_runner_copy(shared, bin_path):
+            let _k = with_fs_write_file(key_path, key)
+            return bin_path
     let entry_path = resolve_join(root, "__with_build_runner.w")
     let t0 = with_clock_nanos()
     var comp = Compilation.init()
@@ -1656,7 +1663,27 @@ fn build_runner_ensure(root: &str, options: &BuildCommandOptions) -> str:
         return ""
     let _k = with_fs_write_file(key_path, key)
     with_eprint("[build] runner compiled " ++ build_graph_time_fmt(with_clock_nanos() - t0))
+    // Publish it for every other project with the same key: the binary
+    // first, then its key, each through a rename, so a reader that finds the
+    // key finds the whole binary.
+    if shared.len() > 0 and build_graph_rt_mkdir_p(resolve_dirname(shared)) == 0:
+        if build_runner_copy(bin_path, shared):
+            let key_tmp = shared ++ f".key.tmp.{with_getpid()}"
+            if with_fs_write_file(key_tmp, key) == 0:
+                let _publish = build_graph_rt_rename_file(key_tmp, shared ++ ".key")
     bin_path
+
+// Copy `from` to `to` through a temporary beside `to` and a rename, so a
+// concurrent build never runs a half-written runner; the copy is executable.
+fn build_runner_copy(from: &str, to: &str) -> bool:
+    let data = with_fs_read_file(from)
+    if data.len() == 0: return false
+    let tmp = to ++ f".tmp.{with_getpid()}"
+    if with_fs_write_file(tmp, data) != 0: return false
+    if build_graph_rt_chmod(tmp, 0o755) != 0 or build_graph_rt_rename_file(tmp, to) != 0:
+        let _rm = with_fs_remove_file(tmp)
+        return false
+    true
 
 // #1797: the runner may be linked now when no runtime directory the link
 // could take belongs to another compiler generation: a complete out/lib or
@@ -4195,6 +4222,14 @@ fn test_capture_suffix(test_name: &str) -> str:
         return "." ++ test_name
     ".run"
 
+// This compiler's path as a child process can run it: argv[0], made
+// absolute when it names a path (a bare name stays for PATH to resolve).
+fn test_running_compiler_path() -> str:
+    let self_arg = with_arg_at(0)
+    if not self_arg.contains("/") or runtime_path_is_absolute(self_arg):
+        return self_arg
+    test_binary_absolute_path(self_arg)
+
 fn run_test_process(bin_path: &str, test_name: &str, quiet: bool) -> TestRunResult:
     let suffix = test_capture_suffix(test_name)
     let out_path = bin_path ++ suffix ++ ".stdout"
@@ -4207,6 +4242,12 @@ fn run_test_process(bin_path: &str, test_name: &str, quiet: bool) -> TestRunResu
         let _set_filter = build_graph_rt_setenv("WITH_TEST_FILTER", test_name)
     if quiet:
         let _set_short = build_graph_rt_setenv("WITH_TEST_SHORT", "1")
+    // A test that drives a compiler (test/behavior/lib/pre_d_build_runner.w)
+    // drives the one under test: this one. Before, it guessed a binary under
+    // out/ and, in a tree that had built only stage1, ran a path that did not
+    // exist (exit 127).
+    let old_compiler = build_graph_rt_getenv("WITH_TEST_COMPILER") ++ ""
+    let _set_compiler = build_graph_rt_setenv("WITH_TEST_COMPILER", test_running_compiler_path())
     // A test binary is never a build worker, whoever launched `with test`: a
     // lane driven by an older compiler (the pinned seed) still hands its
     // worker switches down, and a `with build` the test runs would obey them.
@@ -4222,6 +4263,7 @@ fn run_test_process(bin_path: &str, test_name: &str, quiet: bool) -> TestRunResu
         let _restore_filter = build_graph_rt_setenv("WITH_TEST_FILTER", old_filter)
     if quiet:
         let _restore_short = build_graph_rt_setenv("WITH_TEST_SHORT", old_short)
+    let _restore_compiler = build_graph_rt_setenv("WITH_TEST_COMPILER", old_compiler)
     let out_text = with_fs_read_file(out_path)
     let err_text = with_fs_read_file(err_path)
     let _cleanup_stdout = build_graph_rt_remove_file(out_path)
@@ -4501,21 +4543,6 @@ fn test_command_collect_targets(argc: i32) -> Vec[str]:
         i = i + 1
     targets
 
-fn run_test_target(target: &str, opt_level: i32, no_std: bool, alloc_mode: bool, runtime_available: bool, prelude_mode: i32, debug_info: bool, verbose: bool, quiet: bool, keep_binary: bool, filter: &str) -> i32:
-    if test_target_is_directory(target):
-        let test_files = collect_test_files(target)
-        if test_files.len() == 0:
-            with_eprint(f"error: no test sources found in '{target}'")
-            return 1
-        for ti in 0..test_files.len() as i32:
-            let test_file = test_files[ti]
-            let run_rc = run_test_file(test_file, opt_level, no_std, alloc_mode, runtime_available, prelude_mode, debug_info, verbose, quiet, keep_binary, filter)
-            if run_rc != 0:
-                with_eprint(f"error: test failed in '{test_file}'")
-                return run_rc
-        return 0
-    run_test_file(target, opt_level, no_std, alloc_mode, runtime_available, prelude_mode, debug_info, verbose, quiet, keep_binary, filter)
-
 fn run_test_command(argc: i32, opt_level: i32, no_std: bool, alloc_mode: bool, runtime_available: bool, prelude_mode: i32, debug_info: bool) -> i32:
     let verbose = cli_test_verbose(argc)
     var quiet = cli_test_quiet(argc)
@@ -4535,12 +4562,50 @@ fn run_test_command(argc: i32, opt_level: i32, no_std: bool, alloc_mode: bool, r
         var graph_options = build_graph_command_options_default()
         graph_options.selected_target = "test"
         return run_build_command(move build_options, graph_options)
+    // Two or more files run as a build.w test lane runs them: on the build
+    // graph's pool, a worker per core, every failure reported and passes
+    // cached machine-wide. Before, the files ran one after another and the
+    // first failure ended the run, so a set of tests took their sum and
+    // hid every failure after the first.
+    var files: Vec[str] = Vec.new()
     for ti in 0..targets.len() as i32:
         let target = targets[ti]
-        let rc = run_test_target(target, opt_level, no_std, alloc_mode, runtime_available, prelude_mode, debug_info, verbose, quiet, keep_binary, filter)
-        if rc != 0:
-            return rc
-    0
+        if test_target_is_directory(target):
+            let dir_files = collect_test_files(target)
+            if dir_files.len() == 0:
+                with_eprint(f"error: no test sources found in '{target}'")
+                return 1
+            for fi in 0..dir_files.len() as i32: files.push(with_str_clone_ref(dir_files[fi]))
+        else:
+            files.push(with_str_clone_ref(target))
+    if files.len() > 1:
+        var lane = empty_build_graph_target()
+        lane.name = "with-test"
+        lane.args = test_command_pass_through_args(argc)
+        return build_graph_run_test_files_pool(test_command_root(), &lane, test_running_compiler_path(), &files, true)
+    run_test_file(files[0], opt_level, no_std, alloc_mode, runtime_available, prelude_mode, debug_info, verbose, quiet, keep_binary, filter)
+
+// The options each file's run takes: every argument that is not a test file
+// or directory, a value-taking option with its value.
+fn test_command_pass_through_args(argc: i32) -> Vec[str]:
+    var args: Vec[str] = Vec.new()
+    var i = 2
+    while i < argc:
+        let arg = with_arg_at(i)
+        if test_command_option_takes_value(arg) and i + 1 < argc:
+            args.push(arg)
+            args.push(with_arg_at(i + 1))
+            i = i + 2
+            continue
+        if arg.len() > 0 and arg[0] == 45: args.push(arg)
+        i = i + 1
+    args
+
+// Where the lane keeps its per-file captures (out/test-graph/…) and how its
+// verdict keys name a file: the working directory.
+fn test_command_root() -> str:
+    let cwd = with_getenv_str("PWD")
+    if cwd.len() == 0: "." else: cwd
 
 fn run_bench_file(target: &str, opt_level: i32, no_std: bool, alloc_mode: bool, runtime_available: bool, prelude_mode: i32, debug_info: bool, filter: &str) -> i32:
     let text = with_fs_read_file(target)
