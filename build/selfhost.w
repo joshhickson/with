@@ -119,7 +119,7 @@ fn bs_host_target_triple() -> str:
     if host_os == "Linux" and comp_arch_is_aarch64(host_arch):
         return "aarch64-unknown-linux-gnu"
     if host_os == "Windows" and host_arch == "x86_64":
-        return "x86_64-pc-windows-msvc"
+        return "x86_64-w64-windows-gnu"
     if host_os == "Windows" and (host_arch == "armv8" or host_arch == "aarch64"):
         return "aarch64-pc-windows-msvc"
     ""
@@ -1809,6 +1809,10 @@ fn bs_check_declarative_manifest_config(ctx: &ActionCtx, compiler_path: &str, ca
         return bs_fail(ctx, "missing [link].libs library unexpectedly linked")
     rc = bs_assert_contains(ctx, link_bad.stderr, "with_phase1_missing_lib", "declarative_link_lib_missing")
     if rc != 0: return rc
+    // #1914: the linker's own message, not only the compiler's "build failed".
+    if os() == "Windows":
+        rc = bs_assert_contains(ctx, link_bad.stderr, "lld-link: error: could not open 'with_phase1_missing_lib.lib'", "declarative_link_lib_missing_lld_message")
+        if rc != 0: return rc
 
     let native_target_dir = bs_join(case_dir, "target_native")
     rc = bs_write_fixture(ctx, bs_join(native_target_dir, "with.toml"), "[package]\nname = \"targetnative\"\nversion = \"0.1.0\"\n\n[target]\ndefault = \"native\"\n", "native target default manifest")
@@ -2544,6 +2548,29 @@ fn bs_check_build_cache_tracks_declared_input(ctx: &ActionCtx, compiler_path: &s
     if second.rc != 0: return second.rc
     bs_expect_file_contains(ctx, bs_join(case_dir, "out/stamp.txt"), "second", "build cache input invalidation")
 
+// #1925: a graph whose targets are declared from what build(ctx) read with
+// BuildCtx.env_input is keyed on that environment. The SDK build declared
+// its outputs under the previous run's SDK_OUTPUT_PREFIX after a run
+// without it, until the graph cache was deleted by hand.
+fn bs_check_build_cache_tracks_env_input(ctx: &ActionCtx, compiler_path: &str, case_dir: &str) -> i32:
+    var rc = bs_write_project_manifest(ctx, case_dir, "cacheenv")
+    if rc != 0: return rc
+    rc = bs_write_fixture(ctx, bs_join(case_dir, "build.w"), "use std.build\n\nfn stamp(ctx: ActionCtx) -> i32:\n    let fs = ctx.fs()\n    if fs.mkdir_all(ctx.args().get(0)) != 0:\n        return 1\n    fs.write_text(ctx.output(), \"stamped\")\n\ncomptime with BuildCtx as ctx:\npub fn build -> Build:\n    var out = ctx.new_build()\n    let dir = \"out/\" ++ ctx.env_input(\"CACHE_ENV_DIR\")\n    var t = target_new(.Action, \"stamp\", \"\").output(dir ++ \"/stamp.txt\")\n    t.action = stamp\n    t = t.arg(dir)\n    t = t.write_scope(\"out\")\n    out = out.add_target(t)\n    out.default(\"stamp\")\n", "cache env build")
+    if rc != 0: return rc
+    let first = bs_run_cli_capture_cwd_with_env(ctx, compiler_path, "build-cache-env-first", bs_project_args("build"), 120000, case_dir, process_env().set("CACHE_ENV_DIR", "first"))
+    if first.rc != 0:
+        return bs_fail(ctx, f"build cache env first run failed with exit code {first.rc}: " ++ first.stderr)
+    rc = bs_expect_file_contains(ctx, bs_join(case_dir, "out/first/stamp.txt"), "stamped", "build cache env first output")
+    if rc != 0: return rc
+    // The stale graph declared out/first/stamp.txt while the runner wrote
+    // out/second: with the first output gone, the declaration fails.
+    if ctx.fs().remove_tree(bs_join(case_dir, "out/first")) != 0:
+        return bs_fail(ctx, "could not remove the first run's output")
+    let second = bs_run_cli_capture_cwd_with_env(ctx, compiler_path, "build-cache-env-second", bs_project_args("build"), 120000, case_dir, process_env().set("CACHE_ENV_DIR", "second"))
+    if second.rc != 0:
+        return bs_fail(ctx, f"build cache env second run failed with exit code {second.rc}: " ++ second.stderr)
+    bs_expect_file_contains(ctx, bs_join(case_dir, "out/second/stamp.txt"), "stamped", "build cache env invalidation (#1925)")
+
 fn bs_check_build_cache_tracks_embed_file(ctx: &ActionCtx, compiler_path: &str, case_dir: &str) -> i32:
     var rc = bs_write_project_manifest(ctx, case_dir, "embedcache")
     if rc != 0: return rc
@@ -2769,6 +2796,8 @@ pub fn run_cli_selfhost_project_action(ctx: ActionCtx) -> i32:
     rc = bs_check_build_cache_tracks_action_source(ctx, compiler_path, bs_join(output_dir, "build_cache_action_case"))
     if rc != 0: return rc
     rc = bs_check_build_cache_tracks_declared_input(ctx, compiler_path, bs_join(output_dir, "build_cache_input_case"))
+    if rc != 0: return rc
+    rc = bs_check_build_cache_tracks_env_input(ctx, compiler_path, bs_join(output_dir, "build_cache_env_case"))
     if rc != 0: return rc
     rc = bs_check_build_cache_tracks_embed_file(ctx, compiler_path, bs_join(output_dir, "build_cache_embed_case"))
     if rc != 0: return rc
@@ -6884,7 +6913,7 @@ fn bs_check_build_w_generated_source(ctx: &ActionCtx, compiler_path: &str, base_
     if rc != 0: return rc
     rc = bs_build_w_write_fixture(ctx, bs_join(toolfs_archive_dir, "fixtures/tree/a.txt"), "tree", ctx.target_name(), "toolfs archive fixture")
     if rc != 0: return rc
-    rc = bs_build_w_write_fixture(ctx, bs_join(toolfs_archive_dir, "build.w"), "use std.build\n\npub fn build(ctx: BuildCtx) -> Build:\n    let fs = ctx.fs()\n    assert(fs.mkdir_all(\"out/archive\") == 0)\n    let entries: Vec[ArchiveEntry] = Vec.new()\n    entries.push(archive_dir_entry(\"pkg\", 0o755))\n    entries.push(archive_dir_entry(\"pkg/nested\", 0o755))\n    entries.push(archive_file_entry(\"fixtures/tree/a.txt\", \"pkg/nested/a.txt\", 0o644))\n    entries.push(archive_symlink_entry(\"nested/a.txt\", \"pkg/link-a.txt\", 0o777))\n    assert(fs.write_tar(\"out/archive/sample.tar\", entries) == 0)\n    assert(fs.write_tar_gz(\"out/archive/sample.tar.gz\", entries) == 0)\n    let gzip = fs.read_binary(\"out/archive/sample.tar.gz\")\n    assert(gzip.len() > 10)\n    assert(gzip.get(0) == 31 as u8)\n    assert(gzip.get(1) == 139 as u8)\n    assert(fs.extract_tar(\"out/archive/sample.tar\", \"out/archive/extracted\") == 0)\n    assert(fs.read_text(\"out/archive/extracted/pkg/nested/a.txt\") == \"tree\")\n    assert(fs.read_text(\"out/archive/extracted/pkg/link-a.txt\") == \"tree\")\n    var out = ctx.new_build().executable(\"toolfs-archive\", \"src/main.w\")\n    out = out.extract_tar_gz(\"extract-gzip\", \"out/archive/sample.tar.gz\", \"out/archive/extracted-gz\")\n    var all = target_new(.Group, \"all\", \"\")\n    all = all.dep(\"toolfs-archive\")\n    all = all.dep(\"extract-gzip\")\n    out = out.add_target(all)\n    out.default(\"all\")\n", ctx.target_name(), "toolfs archive build.w")
+    rc = bs_build_w_write_fixture(ctx, bs_join(toolfs_archive_dir, "build.w"), "use std.build\n\npub fn build(ctx: BuildCtx) -> Build:\n    let fs = ctx.fs()\n    assert(fs.mkdir_all(\"out/archive\") == 0)\n    let entries: Vec[ArchiveEntry] = Vec.new()\n    entries.push(archive_dir_entry(\"pkg\", 0o755))\n    entries.push(archive_dir_entry(\"pkg/nested\", 0o755))\n    entries.push(archive_file_entry(\"fixtures/tree/a.txt\", \"pkg/nested/a.txt\", 0o644))\n    entries.push(archive_symlink_entry(\"nested/a.txt\", \"pkg/link-a.txt\", 0o777))\n    // Longer than the 100-byte name field: the USTAR prefix carries the rest,\n    // in the evaluator's writer as in std.build's.\n    entries.push(archive_dir_entry(\"pkg/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\", 0o755))\n    entries.push(archive_file_entry(\"fixtures/tree/a.txt\", \"pkg/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/a.txt\", 0o644))\n    assert(fs.write_tar(\"out/archive/sample.tar\", entries) == 0)\n    assert(fs.write_tar_gz(\"out/archive/sample.tar.gz\", entries) == 0)\n    let gzip = fs.read_binary(\"out/archive/sample.tar.gz\")\n    assert(gzip.len() > 10)\n    assert(gzip.get(0) == 31 as u8)\n    assert(gzip.get(1) == 139 as u8)\n    assert(fs.extract_tar(\"out/archive/sample.tar\", \"out/archive/extracted\") == 0)\n    assert(fs.read_text(\"out/archive/extracted/pkg/nested/a.txt\") == \"tree\")\n    assert(fs.read_text(\"out/archive/extracted/pkg/link-a.txt\") == \"tree\")\n    assert(fs.read_text(\"out/archive/extracted/pkg/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/a.txt\") == \"tree\")\n    var out = ctx.new_build().executable(\"toolfs-archive\", \"src/main.w\")\n    out = out.extract_tar_gz(\"extract-gzip\", \"out/archive/sample.tar.gz\", \"out/archive/extracted-gz\")\n    var all = target_new(.Group, \"all\", \"\")\n    all = all.dep(\"toolfs-archive\")\n    all = all.dep(\"extract-gzip\")\n    out = out.add_target(all)\n    out.default(\"all\")\n", ctx.target_name(), "toolfs archive build.w")
     if rc != 0: return rc
     let toolfs_archive = bs_build_w_expect_success(ctx, compiler_path, toolfs_archive_dir, "build-w-toolfs-archive", bs_blob_to_args(bs_argv_append("", "build")))
     if toolfs_archive.rc != 0: return toolfs_archive.rc

@@ -157,3 +157,48 @@ with_fiber_start:
         callq *%rax
         callq with_fiber_bootstrap_finish
         ud2
+
+// ── The two symbols MSVC-environment code expects the C runtime to define ──
+//
+// With's Windows x86_64 objects are x86_64-w64-windows-gnu code (#1915): their
+// stack probes call compiler-rt's ___chkstk_ms and they reference no _fltused.
+// The compiler that builds stage1 — the pinned Windows seed — still emits
+// x86_64-pc-windows-msvc objects, which call __chkstk before growing a frame
+// by more than a page and reference _fltused wherever floating point is used;
+// Visual Studio's CRT defined both, and the SDK's mingw-w64 runtime defines
+// neither. So the runtime defines them here, in the one object every Windows
+// program links, weakly (with a Visual Studio-built SDK the compiler's own
+// link takes libcmt's instead). Delete this section once seed.lock's Windows
+// seed emits windows-gnu objects: nothing will reference either symbol.
+
+        .text
+        .globl __chkstk
+        .weak __chkstk
+        .p2align 4
+// %rax = bytes the caller is about to subtract from %rsp. Touch every page
+// from the caller's stack pointer down to the new frame's lowest address,
+// top to bottom, so each touch lands on (and advances) the guard page.
+// MSVC's contract: every register but %r10, %r11 and the flags survives.
+__chkstk:
+        leaq 8(%rsp), %r10              // the caller's %rsp (above our return address)
+        movq %r10, %r11
+        subq %rax, %r11                 // the lowest address the frame reaches
+        jb 3f                           // the frame is larger than the address space below
+1:
+        subq $0x1000, %r10
+        cmpq %r11, %r10
+        jb 2f
+        testb $0, (%r10)
+        jmp 1b
+2:
+        testb $0, (%r11)
+        ret
+3:
+        ud2
+
+        .data
+        .globl _fltused
+        .weak _fltused
+        .p2align 2
+_fltused:
+        .long 0x9875

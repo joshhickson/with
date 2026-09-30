@@ -398,9 +398,12 @@ fn comp_select_libclang_path(fs: &ToolFs, llvm_prefix: &str) -> str:
 fn comp_link_path_is_dynamic(path: &str) -> bool:
     not path.ends_with(".a") and not path.ends_with(".lib")
 
+// The SDK's static libclang, the marker `:deps` installs: libclang.lib in a
+// Visual Studio-built SDK (windows-aarch64), libclang.a everywhere else,
+// the windows-gnu x86_64 SDK included (#1915).
 pub fn compiler_default_libclang_archive_path() -> str:
     let prefix = compiler_default_llvm_prefix()
-    if os() == "Windows":
+    if os() == "Windows" and comp_arch_is_aarch64(arch()):
         return prefix ++ "/lib/libclang.lib"
     prefix ++ "/lib/libclang.a"
 
@@ -2756,9 +2759,13 @@ pub fn run_generate_llvm_link_metadata_action(ctx: ActionCtx) -> i32:
         return comp_fail(ctx, "missing LLVM linker: " ++ llvm_ld)
     if libclang.len() == 0:
         return comp_fail(ctx, "missing static libclang archive: " ++ compiler_default_libclang_archive_path())
-    if os() == "Windows":
+    // #1915: a Windows SDK built since names its archives GNU-style (its
+    // LLVM is a windows-gnu build against its own libc++); the Visual
+    // Studio-built SDKs before it ship libclang.lib.
+    let windows_gnu_sdk = os() == "Windows" and libclang.ends_with("/lib/libclang.a")
+    if os() == "Windows" and not windows_gnu_sdk:
         if not libclang.ends_with(".lib"):
-            return comp_fail(ctx, "libclang must be linked statically; expected libclang.lib, got: " ++ libclang)
+            return comp_fail(ctx, "libclang must be linked statically; expected libclang.lib or libclang.a, got: " ++ libclang)
     else:
         if not libclang.ends_with(".a"):
             return comp_fail(ctx, "libclang must be linked statically; expected libclang.a, got: " ++ libclang)
@@ -2812,7 +2819,8 @@ pub fn run_generate_llvm_link_metadata_action(ctx: ActionCtx) -> i32:
         rsp = rsp ++ "-Wl,-u," ++ clang_main_itanium ++ "\n-Wl,--defsym=with_clang_main=" ++ clang_main_itanium ++ "\n"
         ld_rsp = ld_rsp ++ "-u\n" ++ clang_main_itanium ++ "\n--defsym=with_clang_main=" ++ clang_main_itanium ++ "\n"
     else if os() == "Windows":
-        let clang_main_msvc = if has_clang_main: "?clang_main@@YAHHPEAPEADAEBUToolContext@llvm@@@Z" else: "with_alloc"
+        // A windows-gnu SDK's clang_main has the Itanium spelling (#1915).
+        let clang_main_msvc = if not has_clang_main: "with_alloc" else if windows_gnu_sdk: clang_main_itanium else: "?clang_main@@YAHHPEAPEADAEBUToolContext@llvm@@@Z"
         rsp = rsp ++ "-Wl,/include:" ++ clang_main_msvc ++ "\n-Wl,/alternatename:with_clang_main=" ++ clang_main_msvc ++ "\n"
         ld_rsp = ld_rsp ++ "/include:" ++ clang_main_msvc ++ "\n/alternatename:with_clang_main=" ++ clang_main_msvc ++ "\n"
     // An SDK built without the WebAssembly backend (every SDK published before
@@ -2859,6 +2867,20 @@ pub fn run_generate_llvm_link_metadata_action(ctx: ActionCtx) -> i32:
         ld_rsp = ld_rsp ++ comp_linux_system_lib_arg(fs, "z") ++ "\n"
         ld_rsp = ld_rsp ++ comp_linux_system_lib_arg(fs, "zstd") ++ "\n"
         ld_rsp = ld_rsp ++ comp_linux_system_lib_arg(fs, "xml2") ++ "\n"
+    else if os() == "Windows" and windows_gnu_sdk:
+        // #1915: the SDK's LLVM is windows-gnu code against the SDK's own
+        // libc++ (libc++abi inside it) and libunwind; Link.w adds the libc,
+        // compiler-rt and the in-box DLLs as for every program. Nothing of
+        // Visual Studio or a Windows Kit.
+        let libc_lib = llvm_prefix ++ "/libc/windows/" ++ (if comp_arch_is_aarch64(arch()): "aarch64" else: "x86_64") ++ "-w64-mingw32/lib"
+        let cxx_libs: Vec[str] = Vec.new()
+        cxx_libs.push(libc_lib ++ "/libc++.a")
+        cxx_libs.push(libc_lib ++ "/libunwind.a")
+        for i in 0..cxx_libs.len() as i32:
+            if not fs.host_exists(cxx_libs[i]):
+                return comp_fail(ctx, "the LLVM SDK's LLVM is a windows-gnu build but its C++ runtime is missing: " ++ cxx_libs[i])
+            rsp = rsp ++ comp_rsp_path(cxx_libs[i]) ++ "\n"
+            ld_rsp = ld_rsp ++ comp_rsp_path(cxx_libs[i]) ++ "\n"
     else if os() == "Windows":
         rsp = rsp ++ comp_windows_msvc_lib("libcpmt.lib") ++ "\n"
         rsp = rsp ++ comp_windows_msvc_lib("libcmt.lib") ++ "\n"
@@ -2876,7 +2898,7 @@ pub fn run_generate_llvm_link_metadata_action(ctx: ActionCtx) -> i32:
         rsp = rsp ++ comp_windows_sdk_um_lib("psapi.lib") ++ "\n"
         rsp = rsp ++ comp_windows_sdk_um_lib("dbghelp.lib") ++ "\n"
         rsp = rsp ++ comp_windows_sdk_um_lib("ntdll.lib") ++ "\n"
-        // No CRT here: Link.w's link_stage_windows_crt_static is the one
+        // No CRT here: Link.w's link_stage_windows_is_compiler_link is the one
         // place that picks it, and a link carrying this file is a
         // static-CRT link there (#1267), as the cross rsps already are.
         ld_rsp = ld_rsp ++ comp_windows_msvc_lib("oldnames.lib") ++ "\n"

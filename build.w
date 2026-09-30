@@ -84,7 +84,7 @@ fn cross_triple(tag: &str) -> str:
     if tag == "linux_aarch64":
         return "aarch64-unknown-linux-gnu"
     if tag == "windows_x86_64":
-        return "x86_64-pc-windows-msvc"
+        return "x86_64-w64-windows-gnu"
     if tag == "windows_aarch64":
         return "aarch64-pc-windows-msvc"
     if tag == "wasm32":
@@ -1160,8 +1160,15 @@ fn sdk_ninja_target(ctx: &BuildCtx) -> Target:
     target = target.write_scope(build_root)
     target = target.write_scope("out/command/sdk-ninja")
     target = target.dep("sdk-ninja-source")
+    // Windows (#1915): ninja is a windows-gnu program against the SDK's own
+    // libc and libc++.
+    if sdk_platform_is_windows(platform):
+        target = target.dep("sdk-libcxx")
     target.timeout(1800000)
 
+// Windows builds CMake after LLVM: its version and manifest resources go
+// through the SDK's own llvm-windres (#1915). Elsewhere CMake comes first and
+// configures the LLVM build.
 fn sdk_cmake_target(ctx: &BuildCtx) -> Target:
     let platform = sdk_current_platform()
     let bootstrap_prefix = sdk_bootstrap_prefix_arg(ctx, platform)
@@ -1174,17 +1181,18 @@ fn sdk_cmake_target(ctx: &BuildCtx) -> Target:
     target = target.arg(sdk_cmake_source_dir())
     target = target.arg(build_root ++ "/cmake-" ++ sdk_host_tag_for_platform(platform))
     target = target.arg(sdk_jobs_arg(ctx))
-    // Windows: cmake's own build is MSVC-style (clang-cl, lld-link, mt.exe).
-    target = target.arg(ctx.env_input("SDK_WINDOWS_MT"))
     target = target.input(sdk_cmake_source_marker())
     target = target.input(output_prefix ++ "/bin/ninja" ++ host_exe_suffix())
     target = target.input(bootstrap_prefix)
     target = target.input("build/sdk.w")
-    target = target.write_scope(output_prefix)
+    target = target.write_scope(build_owned_text(output_prefix))
     target = target.write_scope(build_root)
     target = target.write_scope("out/command/sdk-cmake")
     target = target.dep("sdk-ninja")
     target = target.dep("sdk-cmake-source")
+    if sdk_platform_is_windows(platform):
+        target = target.input(output_prefix ++ "/lib/libclang.a")
+        target = target.dep("sdk-llvm")
     target.timeout(3600000)
 
 fn sdk_llvm_target(ctx: &BuildCtx) -> Target:
@@ -1192,7 +1200,9 @@ fn sdk_llvm_target(ctx: &BuildCtx) -> Target:
     let bootstrap_prefix = sdk_bootstrap_prefix_arg(ctx, platform)
     let output_prefix = sdk_output_prefix_arg(ctx, platform)
     let build_root = sdk_build_root_arg(ctx, platform)
-    var target = target_new(.Action, "sdk-llvm", "").output(if platform == "windows-x86_64" or platform == "windows-aarch64": output_prefix ++ "/lib/libclang.lib" else: output_prefix ++ "/lib/libclang.a")
+    // libclang.a everywhere: the Windows SDK's LLVM is a windows-gnu build
+    // since #1915, GNU-named like the others.
+    var target = target_new(.Action, "sdk-llvm", "").output(output_prefix ++ "/lib/libclang.a")
     target.action = run_sdk_llvm_action
     target = target.arg(build_owned_text(bootstrap_prefix))
     target = target.arg(build_owned_text(output_prefix))
@@ -1202,18 +1212,109 @@ fn sdk_llvm_target(ctx: &BuildCtx) -> Target:
     target = target.arg(ctx.env_input("LLVM_TARGETS_TO_BUILD"))
     target = target.arg(ctx.env_input("SDKROOT"))
     target = target.arg(ctx.env_input("MACOSX_DEPLOYMENT_TARGET"))
-    target = target.arg(ctx.env_input("SDK_WINDOWS_MT"))
     target = target.input(sdk_llvm_source_marker())
-    target = target.input(output_prefix ++ "/bin/cmake" ++ host_exe_suffix())
     target = target.input(output_prefix ++ "/bin/ninja" ++ host_exe_suffix())
     target = target.input(bootstrap_prefix)
     target = target.input("build/sdk.w")
-    target = target.write_scope(output_prefix)
+    target = target.write_scope(build_owned_text(output_prefix))
     target = target.write_scope(build_root)
     target = target.write_scope("out/command/sdk-llvm")
-    target = target.dep("sdk-cmake")
     target = target.dep("sdk-llvm-source")
+    if sdk_platform_is_windows(platform):
+        // The SDK's libc, compiler-rt and libc++ first (#1915); the
+        // bootstrap's cmake configures (sdk-cmake follows).
+        target = target.dep("sdk-libcxx")
+        target = target.dep("sdk-ninja")
+    else:
+        target = target.input(output_prefix ++ "/bin/cmake" ++ host_exe_suffix())
+        target = target.dep("sdk-cmake")
     target.timeout(21600000)
+
+// The Windows C runtime of the SDK (#1915; build/sdk.w): mingw-w64's headers,
+// UCRT startup and support libraries, and the in-box DLLs' import libraries,
+// built with the SDK's own clang into <SDK_OUTPUT_PREFIX>/libc/windows. The
+// tools are the bootstrap SDK's; the output may be that same SDK
+// (SDK_OUTPUT_PREFIX=SDK_BOOTSTRAP_PREFIX adds the libc to an installed
+// SDK). SDK_WINDOWS_LIBC_ARCH picks x86_64 or aarch64 (default: this host's
+// Windows architecture, else x86_64).
+fn sdk_windows_libc_arch(ctx: &BuildCtx) -> str:
+    let explicit = ctx.env_input("SDK_WINDOWS_LIBC_ARCH")
+    if explicit.len() > 0:
+        return explicit
+    if sdk_current_platform() == "windows-aarch64": "aarch64" else: "x86_64"
+
+fn sdk_windows_libc_target(ctx: &BuildCtx) -> Target:
+    let platform = sdk_current_platform()
+    let tools_prefix = sdk_bootstrap_prefix_arg(ctx, platform)
+    let output_prefix = sdk_output_prefix_arg(ctx, platform)
+    let build_root = sdk_build_root_arg(ctx, platform)
+    let arch_name = sdk_windows_libc_arch(ctx)
+    var target = target_new(.Action, "sdk-windows-libc", "").output(sdk_windows_libc_marker(output_prefix, arch_name))
+    target.action = run_sdk_windows_libc_action
+    target = target.arg(build_owned_text(tools_prefix))
+    target = target.arg(build_owned_text(output_prefix))
+    target = target.arg(sdk_mingw_source_dir())
+    target = target.arg(build_owned_text(arch_name))
+    target = target.arg(build_root ++ "/windows-libc")
+    target = target.input(sdk_mingw_source_marker())
+    target = target.input("build/sdk.w")
+    target = target.input("build/par.w")
+    target = target.write_scope(sdk_windows_libc_root(output_prefix))
+    target = target.write_scope(build_root ++ "/windows-libc")
+    target = target.write_scope("out/command/sdk-windows-libc")
+    target = target.dep("sdk-mingw-source")
+    target.timeout(3600000)
+
+// compiler-rt's builtins for the same Windows target, built by the tools SDK's
+// cmake/ninja/clang against the libc above, into
+// <SDK_OUTPUT_PREFIX>/lib/clang/<major>/lib/windows.
+fn sdk_compiler_rt_builtins_target(ctx: &BuildCtx) -> Target:
+    let platform = sdk_current_platform()
+    let tools_prefix = sdk_bootstrap_prefix_arg(ctx, platform)
+    let output_prefix = sdk_output_prefix_arg(ctx, platform)
+    let build_root = sdk_build_root_arg(ctx, platform)
+    let arch_name = sdk_windows_libc_arch(ctx)
+    var target = target_new(.Action, "sdk-compiler-rt-builtins", "").output(sdk_compiler_rt_builtins(output_prefix, arch_name))
+    target.action = run_sdk_compiler_rt_builtins_action
+    target = target.arg(build_owned_text(tools_prefix))
+    target = target.arg(build_owned_text(output_prefix))
+    target = target.arg(sdk_llvm_source_dir())
+    target = target.arg(build_owned_text(arch_name))
+    target = target.arg(build_root ++ "/compiler-rt-builtins")
+    target = target.input(sdk_llvm_source_marker())
+    target = target.input(sdk_windows_libc_marker(output_prefix, arch_name))
+    target = target.input("build/sdk.w")
+    target = target.write_scope(output_prefix ++ "/lib/clang")
+    target = target.write_scope(build_root ++ "/compiler-rt-builtins")
+    target = target.write_scope("out/command/sdk-compiler-rt-builtins")
+    target = target.dep("sdk-llvm-source")
+    target = target.dep("sdk-windows-libc")
+    target.timeout(3600000)
+
+// libunwind, libc++abi and libc++ for the same Windows target, into the
+// libc's <arch>-w64-mingw32 dir: the C++ runtime the SDK's LLVM is built
+// against, so the compiler's own link needs nothing outside the SDK.
+fn sdk_libcxx_target(ctx: &BuildCtx) -> Target:
+    let platform = sdk_current_platform()
+    let tools_prefix = sdk_bootstrap_prefix_arg(ctx, platform)
+    let output_prefix = sdk_output_prefix_arg(ctx, platform)
+    let build_root = sdk_build_root_arg(ctx, platform)
+    let arch_name = sdk_windows_libc_arch(ctx)
+    var target = target_new(.Action, "sdk-libcxx", "").output(sdk_windows_libc_lib_dir(output_prefix, arch_name) ++ "/libc++.a")
+    target.action = run_sdk_libcxx_action
+    target = target.arg(build_owned_text(tools_prefix))
+    target = target.arg(build_owned_text(output_prefix))
+    target = target.arg(sdk_llvm_source_dir())
+    target = target.arg(build_owned_text(arch_name))
+    target = target.arg(build_root ++ "/libcxx")
+    target = target.input(sdk_llvm_source_marker())
+    target = target.input(sdk_compiler_rt_builtins(output_prefix, arch_name))
+    target = target.input("build/sdk.w")
+    target = target.write_scope(sdk_windows_libc_root(output_prefix))
+    target = target.write_scope(build_root ++ "/libcxx")
+    target = target.write_scope("out/command/sdk-libcxx")
+    target = target.dep("sdk-compiler-rt-builtins")
+    target.timeout(3600000)
 
 fn sdk_group_target() -> Target:
     var target = target_new(.Group, "sdk", "")
@@ -2398,6 +2499,10 @@ pub fn build(ctx: BuildCtx) -> Build:
     out = out.add_target(sdk_source_target("sdk-ninja-source", sdk_ninja_source_url(), sdk_ninja_source_sha256(), sdk_ninja_archive(), sdk_source_root(), sdk_ninja_source_dir(), sdk_ninja_source_marker()))
     out = out.add_target(sdk_source_target("sdk-cmake-source", sdk_cmake_source_url(), sdk_cmake_source_sha256(), sdk_cmake_archive(), sdk_source_root(), sdk_cmake_source_dir(), sdk_cmake_source_marker()))
     out = out.add_target(sdk_source_target("sdk-llvm-source", sdk_llvm_source_url(), sdk_llvm_source_sha256(), sdk_llvm_archive(), sdk_source_root(), sdk_llvm_source_dir(), sdk_llvm_source_marker()))
+    out = out.add_target(sdk_source_target("sdk-mingw-source", sdk_mingw_source_url(), sdk_mingw_source_sha256(), sdk_mingw_archive(), sdk_source_root(), sdk_mingw_source_dir(), sdk_mingw_source_marker()))
+    out = out.add_target(sdk_windows_libc_target(ctx))
+    out = out.add_target(sdk_compiler_rt_builtins_target(ctx))
+    out = out.add_target(sdk_libcxx_target(ctx))
     out = out.add_target(sdk_ninja_target(ctx))
     out = out.add_target(sdk_cmake_target(ctx))
     out = out.add_target(sdk_llvm_target(ctx))
@@ -3060,7 +3165,7 @@ pub fn build(ctx: BuildCtx) -> Build:
     // ── Cross-target runtime (windows_x86_64) ───────────────────────
     // `with build :cross-rt-windows` builds the full windows_x86_64
     // runtime + compiler link inputs into out/lib/cross/windows_x86_64/
-    // (COFF objects, windows triple) so a `--target x86_64-pc-windows-msvc`
+    // (COFF objects, windows triple) so a `--target x86_64-w64-windows-gnu`
     // link resolves entirely from that directory (§18.5). Mirrors the
     // linux cross-rt set; fiber core/asm are the windows variants.
     out = out.add_target(cross_windows_object_target("cross-win-rt-core-object", "rt/rt_core.w", "-O2"))

@@ -327,8 +327,12 @@ extern fn rt_ucrt_configure_wide_argv(mode: i32) -> i32
 extern fn rt_ucrt_argc_ptr() -> *mut i32
 @[link_name("__p___wargv")]
 extern fn rt_ucrt_wargv_ptr() -> *mut *const *const u16
-@[link_name("_get_startup_argv_mode")]
-extern fn rt_crt_startup_argv_mode() -> i32
+// The argv mode both startups this runtime links under use: mingw-w64's
+// (the SDK's, #1915), whose wildcard.c is built with globbing off, and
+// Visual Studio's without setargv.obj. _get_startup_argv_mode, which
+// answers the same, is Visual Studio's startup code only.
+const RT_CRT_ARGV_UNEXPANDED: i32 = 1
+fn rt_crt_startup_argv_mode(): RT_CRT_ARGV_UNEXPANDED
 
 fn win_wide_arg(wargv: *const *const u16, i: i32) -> *const u16:
     unsafe *((wargv as i64 + i * 8) as *const *const u16)
@@ -1225,6 +1229,10 @@ fn win_spawn_argv(args: &str, stdout_path: &str, stderr_path: &str, stdin_path: 
     if cmd as i64 == 0:
         return -12
     let cmd_rc = win_build_command_line(data, args.len(), cmd as *mut u16, 32768)
+    // Windows' own limit on a command line; past it the spawn fails, and
+    // says why (#1916) instead of returning -1 alone.
+    if cmd_rc == -1:
+        let _ = rt_write(2, c"error: a command line longer than Windows allows (32767 UTF-16 units)\n".ptr, 70)
     if cmd_rc != 0:
         with_free(cmd)
         return cmd_rc
@@ -1734,7 +1742,6 @@ c facade win32:
     fn rt_ucrt_configure_wide_argv
     fn rt_ucrt_argc_ptr
     fn rt_ucrt_wargv_ptr
-    fn rt_crt_startup_argv_mode
     fn WSAStartup
     fn socket
     fn connect
