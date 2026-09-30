@@ -18,6 +18,7 @@ use Fmt
 use Lsp
 use CiPrint
 use CiMigrate
+use CImport
 use BuildGraphKinds
 use BuildGraphModel
 use BuildGraphMaterialize
@@ -33,6 +34,7 @@ use compiler.ClangDriver
 use compiler.LldDriver
 use compiler.FrameworkStubs
 use compiler.WindowsImportLibs
+use compiler.DlltoolDriver
 use compiler.EmbeddedSysroot
 use compiler.DsymutilDriver
 use compiler.GreenEvidence
@@ -775,6 +777,9 @@ fn run_cli(argc: i32) -> i32:
     // `with __dsymutil ...` is LLVM's dsymutil (#1915), for a debug build's
     // .dSYM: the compiler invoking itself.
     if cli_command(argc) == "__dsymutil": return with_dsymutil_cli_main()
+    // `with __dlltool ...` is LLVM's dlltool (#1915), with which `with get`
+    // writes a Windows package's in-box DLL import libraries.
+    if cli_command(argc) == "__dlltool": return with_dlltool_cli_main()
     // `with __framework-stubs <dir> <Name>...`: the framework stubs `with get`
     // writes for a package that links Apple frameworks (#1915).
     // `with __sdk-tools`: the directory of the SDK build tools this compiler
@@ -4733,6 +4738,11 @@ fn run_migrate_command(argc: i32) -> i32:
     if argc < 3:
         eprint("usage: with migrate <file.c|dir/> [-o output] [-I include_dir] [-include header] [--exclude basename]")
         return 1
+    // #1915: the migrator parses C as c_import does (compiler.Frontend): on
+    // Windows x86_64 for the windows-gnu target against the C runtime the
+    // link reads; without it no system header is found.
+    if link_stage_windows_c_target_uses_sdk_libc():
+        ci_set_windows_target(link_stage_windows_c_target(), link_stage_windows_libc_root())
 
     // Hidden developer mode: run the CiIR/CiPrint roundtrip harness
     // and exit. Used by the cli-selfhost-ir-roundtrip test.
