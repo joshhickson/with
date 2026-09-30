@@ -21,7 +21,11 @@ extern fn with_libc_realpath(path: *const i8, resolved_path: *mut i8) -> *mut i8
 unsafe fn mkstemp(template_path: *mut u8) -> i32: with_libc_mkstemp(template_path as *mut i8)
 unsafe fn realpath(path: *const u8, resolved_name: *mut u8) -> *mut u8:
     with_libc_realpath(path as *const i8, resolved_name as *mut i8) as *mut u8
-extern fn unlink(path: *const u8) -> i32
+// unlink(2) under its own name here: the pinned seed predates #1919, so an
+// `extern fn unlink` in this module still collides with std.libc's `pub fn
+// unlink` once the compiler imports std.zip (compiler.TarExtract).
+@[link_name("unlink")]
+extern fn ci_unlink(path: *const u8) -> i32
 extern fn opendir(path: *const u8) -> *mut u8
 extern fn readdir(dirp: *mut u8) -> *mut u8
 extern fn closedir(dirp: *mut u8) -> i32
@@ -691,11 +695,16 @@ var g_emitted_cap: i32 = 0
 
 var g_cimport_include_paths: [32]*mut u8 = [0 as *mut u8; 32]
 var g_cimport_include_count: i32 = 0
-// §16.1: target SDK sysroot from with.toml [c_import] sdk_path (empty = none).
+// The macOS SDK c_import parses against (empty = none), resolved by
+// compiler.EmbeddedSysroot's darwin_sdk_root (#1915): WITH_SDKROOT, SDKROOT,
+// with.toml [c_import] sdk_path (§16.1), else the embedded sysroot. This
+// object stays import-free, so the caller hands the answer in.
 var g_cimport_sdk_path: str = ""
 
 pub fn with_cimport_set_sdk_path(path: &str) -> Unit:
     g_cimport_sdk_path = with_str_clone_ref(path)
+    sdk_path_resolved = 0
+    sdk_path_buf[0] = 0
 
 var sdk_path_buf: [1024]u8 = [0 as u8; 1024]
 var sdk_path_resolved: i32 = 0
@@ -762,27 +771,8 @@ unsafe fn get_sdk_path() -> *const u8:
         return &sdk_path_buf as *const [1024]u8 as *const u8
     0 as *const u8
 
-// The macOS SDK c_import parses against, for `with cc` to compile against.
-pub fn with_cimport_sdk_path() -> str:
-    if with_sysinfo_os() != "Macos": return ""
-    unsafe { resolve_target_sdk_path() }
-
-unsafe fn resolve_target_sdk_path() -> str:
-    let with_sdkroot = with_getenv_str("WITH_SDKROOT")
-    if with_sdkroot.len() > 0:
-        return with_sdkroot
-    let sdkroot = with_getenv_str("SDKROOT")
-    if sdkroot.len() > 0:
-        return sdkroot
-    if g_cimport_sdk_path.len() > 0:
-        return with_str_clone_ref(g_cimport_sdk_path)
-    let clt = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
-    if with_fs_file_exists(clt) != 0:
-        return clt
-    let xcode = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
-    if with_fs_file_exists(xcode) != 0:
-        return xcode
-    ""
+// Never an installed Apple SDK (#1915): only what the caller resolved.
+unsafe fn resolve_target_sdk_path() -> str: with_str_clone_ref(g_cimport_sdk_path)
 
 // 1 when this is macOS and no target SDK could be resolved — used to add a
 // directional hint to a c_import header-parse failure (§16.1).
@@ -2134,7 +2124,7 @@ pub fn with_cimport_dispose(session: i64):
             with_free((*s).cursor_spellings as *mut u8)
         // Cleanup temp file
         if (*s).tmp_path as i64 != 0:
-            let _ = unlink((*s).tmp_path as *const u8)
+            let _ = ci_unlink((*s).tmp_path as *const u8)
             with_free((*s).tmp_path)
         if (*s).tu as i64 != 0: clang_disposeTranslationUnit((*s).tu)
         if (*s).index as i64 != 0: clang_disposeIndex((*s).index)

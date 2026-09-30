@@ -435,6 +435,11 @@ fn project_config_load_dep_metadata(cfg: ProjectConfig, name: &str, version: &st
     let libs = project_config_json_str_array(meta, "libs")
     for i in 0..libs.len() as i32:
         out.dep_link_libs.push(with_str_clone_ref(libs[i]))
+    // #1915: the directories of the framework stubs `with get` wrote for
+    // this package (compiler.FrameworkStubs), relative to it.
+    let framework_paths = project_config_json_str_array(meta, "framework_paths")
+    for i in 0..framework_paths.len() as i32:
+        out.dep_link_args.push("-F" ++ dep_dir ++ "/" ++ framework_paths[i])
     let link_args = project_config_json_str_array(meta, "link_args")
     for i in 0..link_args.len() as i32:
         out.dep_link_args.push(with_str_clone_ref(link_args[i]))
@@ -722,7 +727,7 @@ pub fn project_config_absolutize_path(path: &str) -> str:
         return with_str_clone_ref(path)
     if project_config_is_absolute_path(path):
         return project_config_normalize_absolute_path(path)
-    let cwd = runtime_getenv("PWD")
+    let cwd = runtime_cwd()
     if cwd.len() == 0:
         return with_str_clone_ref(path)
     project_config_normalize_absolute_path(resolve_join(cwd, path))

@@ -30,6 +30,10 @@ use InitTemplates
 use BuildGraphRuntime
 use BuildGraphCache
 use compiler.ClangDriver
+use compiler.LldDriver
+use compiler.FrameworkStubs
+use compiler.EmbeddedSysroot
+use compiler.DsymutilDriver
 use compiler.GreenEvidence
 use compiler.DriverOptions
 use compiler.AbiStamp
@@ -757,8 +761,34 @@ fn run_one_liner_command(argc: i32, one: &CliOneLiner, no_std: bool, alloc_mode:
     rc
 
 fn run_cli(argc: i32) -> i32:
+    // Run as ld64.lld (a link to this binary that `with cc` hands clang's
+    // driver, #1915): lld itself.
+    let lld_tool = lld_flavor_for_tool_name(with_arg_at(0))
+    if lld_tool.len() > 0: return with_ld_tool_main(lld_tool)
     // `with cc ...` is clang; none of With's own flags apply to it.
     if cli_command(argc) == "cc": return with_cc_main()
+    // `with __ld ...` is lld (#1915): the compiler invoking itself for every
+    // native link, as `__ar` is for an archive. Not user CLI surface until
+    // the specification lists a `with ld`.
+    if cli_command(argc) == "__ld": return with_ld_main()
+    // `with __dsymutil ...` is LLVM's dsymutil (#1915), for a debug build's
+    // .dSYM: the compiler invoking itself.
+    if cli_command(argc) == "__dsymutil": return with_dsymutil_cli_main()
+    // `with __framework-stubs <dir> <Name>...`: the framework stubs `with get`
+    // writes for a package that links Apple frameworks (#1915).
+    // `with __sdk-tools`: the directory of the SDK build tools this compiler
+    // carries (cmake, ninja; #1915), unpacked on first use.
+    if cli_command(argc) == "__sdk-tools":
+        let tools_dir = embedded_sdk_tools_dir()
+        if tools_dir.len() == 0:
+            with_eprint("error: this build of `with` carries no SDK build tools")
+            return 1
+        print(tools_dir)
+        return 0
+    if cli_command(argc) == "__framework-stubs":
+        let stub_args: Vec[str] = Vec.new()
+        for i in 2..argc: stub_args.push(with_arg_at(i))
+        return with_framework_stubs_main(&stub_args)
     // `with __ar qc lib.a a.o b.o` / `with __ranlib lib.a`: what CMake asks of
     // an archiver, so a source build needs no binutils. They are the compiler
     // invoking itself (the `__` prefix), not commands a user types. The

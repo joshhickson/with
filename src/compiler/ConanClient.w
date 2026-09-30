@@ -7,9 +7,15 @@ use compiler.Runtime
 use compiler.ConanRecipe
 use compiler.ConanPatch
 use compiler.ClangDriver
+use compiler.FrameworkStubs
+use compiler.TarExtract
+use compiler.EmbeddedSysroot
+use std.http
 use std.crypto.sha256
+use std.string.StringBuilder
 extern fn with_str_clone_ref(s: &str) -> str
 extern fn str_from_byte(b: i32) -> str
+extern fn with_fs_chmod(path: &str, mode: i32) -> i32
 
 fn CONAN_CENTER_URL -> str: "https://center2.conan.io"
 fn CONAN_INDEX_RAW -> str: "https://raw.githubusercontent.com/conan-io/conan-center-index/master/recipes"
@@ -60,7 +66,7 @@ pub fn conan_http_get(url: &str) -> str:
     let scratch = conan_scratch_dir()
     if scratch.len() == 0: return ""
     let tmp = scratch ++ "/response.json"
-    let rc = conan_curl_to_file(url, tmp, 300000)
+    let rc = conan_https_to_file(url, tmp, 300000)
     if rc != 0:
         runtime_remove_tree(scratch)
         return ""
@@ -69,7 +75,7 @@ pub fn conan_http_get(url: &str) -> str:
     body
 
 fn conan_http_download(url: &str, path: &str) -> i32:
-    conan_curl_to_file(url, path, 300000)
+    conan_https_to_file(url, path, 300000)
 
 fn conan_sha256_file(path: &str) -> str:
     if runtime_file_exists(path) == 0:
@@ -81,42 +87,58 @@ fn conan_sha256_file(path: &str) -> str:
 fn conan_argv_append(argv: &str, arg: &str) -> str:
     argv ++ arg ++ "\0"
 
-fn conan_curl_to_file(url: &str, path: &str, timeout_ms: i32) -> i32:
-    var argv = ""
-    argv = conan_argv_append(argv, "curl")
-    argv = conan_argv_append(argv, "-fsSL")
-    argv = conan_argv_append(argv, "--retry")
-    argv = conan_argv_append(argv, "2")
-    argv = conan_argv_append(argv, "--connect-timeout")
-    argv = conan_argv_append(argv, "20")
-    argv = conan_argv_append(argv, "--max-time")
-    argv = conan_argv_append(argv, "300")
-    argv = conan_argv_append(argv, "-o")
-    argv = conan_argv_append(argv, path)
-    argv = conan_argv_append(argv, url)
-    let rc = conan_run_tool(argv, timeout_ms)
-    if rc != 0:
-        runtime_eprint(f"error: Conan download failed (curl exit {rc}): " ++ url ++ " -> " ++ path)
-    rc
+// #1915: downloads are this compiler's own HTTPS client (std.http over
+// std.tls), not the host's curl. A dropped connection is retried, as
+// build/https_fetch.w does.
+// A file:// URL — a local mirror, or a test's fixture — is copied the way an
+// HTTPS fetch writes its body; an absent file is a failed download.
+fn conan_https_to_file(url: &str, path: &str, timeout_ms: i32) -> i32:
+    if url.starts_with("file://"):
+        let local = conan_file_url_path(url)
+        if runtime_file_exists(local) == 0 or runtime_is_dir(local) != 0: return 1
+        return if runtime_write_file(path, runtime_read_file(local)) == 0: 0 else: 1
+    if not url.starts_with("https://"):
+        runtime_eprint("error: Conan download needs an https:// or file:// URL: " ++ url)
+        return 1
+    for attempt in 1..4:
+        if https_download(url.to_owned(), path.to_owned()) == 0: return 0
+        if attempt < 3: let _ = runtime_nanosleep(attempt as i64 * 1000000000)
+    runtime_eprint("error: Conan download failed after 3 attempts: " ++ url ++ " -> " ++ path)
+    1
 
+// The local path a file:// URL names: percent-escapes decoded, and a Windows
+// drive path (file:///C:/…) without its leading slash.
+fn conan_file_url_path(url: &str) -> str:
+    let raw = url.slice(7, url.len())
+    var decoded = StringBuilder.new()
+    var i = 0
+    while i < raw.len() as i32:
+        if raw[i] == '%' and i + 2 < raw.len() as i32:
+            let hi = conan_hex_digit(raw[i + 1])
+            let lo = conan_hex_digit(raw[i + 2])
+            if hi >= 0 and lo >= 0:
+                decoded.push_byte((hi * 16 + lo) as u8)
+                i = i + 3
+                continue
+        decoded.push_byte(raw[i])
+        i = i + 1
+    let out = decoded.to_str()
+    if out.len() > 2 and out[0] == '/' and out[2] == ':': return out.slice(1, out.len())
+    out
+
+fn conan_hex_digit(c: u8) -> i32:
+    if c >= '0' and c <= '9': return (c - '0') as i32
+    if c >= 'a' and c <= 'f': return (c - 'a' + 10) as i32
+    if c >= 'A' and c <= 'F': return (c - 'A' + 10) as i32
+    -1
+
+// #1915: a package archive is unpacked in-process (compiler.TarExtract).
 fn conan_extract_tgz(archive: &str, dest: &str) -> i32:
-    var argv = ""
-    argv = conan_argv_append(argv, "tar")
-    argv = conan_argv_append(argv, "xzf")
-    argv = conan_argv_append(argv, archive)
-    argv = conan_argv_append(argv, "-C")
-    argv = conan_argv_append(argv, dest)
-    conan_run_tool(argv, 120000)
-
-fn conan_extract_tgz_strip1(archive: &str, dest: &str) -> i32:
-    var argv = ""
-    argv = conan_argv_append(argv, "tar")
-    argv = conan_argv_append(argv, "xzf")
-    argv = conan_argv_append(argv, archive)
-    argv = conan_argv_append(argv, "-C")
-    argv = conan_argv_append(argv, dest)
-    argv = conan_argv_append(argv, "--strip-components=1")
-    conan_run_tool(argv, 120000)
+    let problem = tar_gz_extract(archive, dest, 0)
+    if problem.len() > 0:
+        runtime_eprint("error: could not unpack " ++ problem)
+        return 1
+    0
 
 fn conan_str_compare(a: &str, b: &str) -> i32:
     let min_len = if a.len() < b.len(): a.len() else: b.len()
@@ -540,6 +562,16 @@ fn conan_write_metadata(dest_dir: &str, name: &str, version: &str, recipe_rev: &
     meta = meta ++ "  " ++ q ++ "libs" ++ q ++ ": " ++ conan_json_array(libs) ++ "," ++ nl
     meta = meta ++ "  " ++ q ++ "defines" ++ q ++ ": " ++ conan_json_array(defines) ++ "," ++ nl
     meta = meta ++ "  " ++ q ++ "link_args" ++ q ++ ": " ++ conan_json_array(link_args) ++ "," ++ nl
+    // #1915: a package that links Apple frameworks gets their link stubs,
+    // written from this machine's dyld shared cache: the toolchain reads no
+    // Apple SDK, so the stubs are the package's (compiler.FrameworkStubs).
+    let frameworks = framework_names_in_link_args(link_args)
+    if runtime_sysinfo_os() == "Macos" and frameworks.len() > 0:
+        let problem = framework_stubs_write(dest_dir ++ "/Frameworks", &frameworks)
+        if problem.len() > 0:
+            runtime_eprint("error: " ++ name ++ "/" ++ version ++ " links Apple frameworks, and their link stubs could not be written: " ++ problem)
+            return 1
+        meta = meta ++ "  " ++ q ++ "framework_paths" ++ q ++ ": [" ++ q ++ "Frameworks" ++ q ++ "]," ++ nl
     meta = meta ++ "  " ++ q ++ "requires" ++ q ++ ": " ++ conan_json_array(requires) ++ nl
     meta = meta ++ "}" ++ nl
     runtime_write_file(dest_dir ++ "/metadata.json", meta)
@@ -1173,7 +1205,7 @@ fn conan_self_exe() -> str:
 
 // CMake wants absolute paths; a relative one is relative to where we were run.
 fn conan_absolute(path: &str) -> str:
-    let cwd = runtime_getenv("PWD")
+    let cwd = runtime_cwd()
     if runtime_path_is_absolute(path) or cwd.len() == 0: path.to_owned() else: cwd ++ "/" ++ path
 
 // `name` on PATH, or "".
@@ -1185,46 +1217,45 @@ fn conan_find_program(name: &str) -> str:
         if runtime_file_exists(candidate) != 0: return candidate
     ""
 
-// A build tool: WITH_<NAME> names it outright, otherwise PATH.
+// A build tool: WITH_<NAME> names it outright; otherwise it is this
+// compiler's own (#1915, D81): the SDK's cmake and ninja, which the compiler
+// carries and unpacks to its cache (compiler.EmbeddedSysroot), never the
+// machine's. A compiler that carries none — a host whose #1915 slice has not
+// landed — still looks on PATH.
 fn conan_build_tool(name: &str, env_name: &str) -> str:
     let named = runtime_getenv(env_name)
-    if named.len() > 0: named else: conan_find_program(name)
+    if named.len() > 0: return named
+    let tools = embedded_sdk_tools_dir()
+    if tools.len() > 0:
+        let path = tools ++ "/bin/" ++ name ++ (if runtime_sysinfo_os() == "Windows": ".exe" else: "")
+        return if runtime_file_exists(path) != 0: path else: ""
+    conan_find_program(name)
 
 // `<dir>/<tool>`: a launcher that runs `<self> <tool> ...`. CMake wants one
 // program path for a compiler; `with cc` is two words.
 fn conan_write_launcher(dir: &str, tool: &str, self_exe: &str) -> str:
+    conan_write_launcher_named(dir, tool, self_exe, tool)
+
+// `<dir>/<name>`: runs `<self> <command> ...`; the command may carry its own
+// leading arguments (`cc --driver-mode=g++`).
+fn conan_write_launcher_named(dir: &str, name: &str, self_exe: &str, command: &str) -> str:
     if runtime_sysinfo_os() == "Windows":
-        let path = dir ++ "/" ++ tool ++ ".cmd"
-        let _w = runtime_write_file(path, "@\"" ++ self_exe ++ "\" " ++ tool ++ " %*\r\n")
+        let path = dir ++ "/" ++ name ++ ".cmd"
+        let _w = runtime_write_file(path, "@\"" ++ self_exe ++ "\" " ++ command ++ " %*\r\n")
         return path
-    let path = dir ++ "/" ++ tool
-    let _w = runtime_write_file(path, "#!/bin/sh\nexec \"" ++ self_exe ++ "\" " ++ tool ++ " \"$@\"\n")
-    var chmod = ""
-    chmod = conan_argv_append(chmod, "chmod")
-    chmod = conan_argv_append(chmod, "+x")
-    chmod = conan_argv_append(chmod, path)
-    let _x = conan_run_tool(chmod, 10000)
+    let path = dir ++ "/" ++ name
+    let _w = runtime_write_file(path, "#!/bin/sh\nexec \"" ++ self_exe ++ "\" " ++ command ++ " \"$@\"\n")
+    let _x = with_fs_chmod(path, 0o755)
     path
 
-// tar reads gzip, xz and bzip2 tarballs, and (bsdtar: macOS, Windows) zip; GNU
-// tar does not read zip, so `unzip` is the second try.
+// #1915: every archive is unpacked in-process (compiler.TarExtract): gzip,
+// xz and bzip2 tarballs and zips, told apart by their first bytes.
 fn conan_extract_any(archive: &str, dest: &str) -> i32:
-    var argv = ""
-    argv = conan_argv_append(argv, "tar")
-    argv = conan_argv_append(argv, "xf")
-    argv = conan_argv_append(argv, archive)
-    argv = conan_argv_append(argv, "-C")
-    argv = conan_argv_append(argv, dest)
-    if conan_run_tool(argv, 300000) == 0: return 0
-    if not archive.ends_with(".zip"): return 1
-    var unzip = ""
-    unzip = conan_argv_append(unzip, "unzip")
-    unzip = conan_argv_append(unzip, "-q")
-    unzip = conan_argv_append(unzip, "-o")
-    unzip = conan_argv_append(unzip, archive)
-    unzip = conan_argv_append(unzip, "-d")
-    unzip = conan_argv_append(unzip, dest)
-    conan_run_tool(unzip, 300000)
+    let problem = archive_extract(archive, dest)
+    if problem.len() > 0:
+        runtime_eprint("error: could not unpack " ++ problem)
+        return 1
+    0
 
 // An archive usually holds one top-level directory; the source is inside it.
 fn conan_source_root(raw_dir: &str) -> str:
@@ -1284,6 +1315,8 @@ fn conan_install_from_source(name: &str, version: &str, project_root: &str, dept
     let ninja = conan_build_tool("ninja", "WITH_NINJA")
     if cmake.len() == 0 or ninja.len() == 0:
         let missing = if cmake.len() == 0 and ninja.len() == 0: "cmake and ninja" else: if cmake.len() == 0: "cmake" else: "ninja"
+        if embedded_sdk_tools_dir().len() > 0:
+            return conan_source_fail("", "building " ++ name ++ " from source needs " ++ missing ++ ", which this compiler's SDK tools (" ++ embedded_sdk_tools_dir() ++ ") lack; set WITH_CMAKE / WITH_NINJA to name them")
         return conan_source_fail("", "building " ++ name ++ " from source needs " ++ missing ++ ", which " ++ (if missing.contains(" and "): "are" else: "is") ++ " not on PATH; install " ++ (if missing.contains(" and "): "them" else: "it") ++ " (or set WITH_CMAKE / WITH_NINJA) and run `with get` again")
     let self_exe = conan_self_exe()
     if self_exe.len() == 0: return conan_source_fail("", "could not locate this `with` executable to use as the C compiler")
@@ -1348,6 +1381,9 @@ fn conan_install_from_source(name: &str, version: &str, project_root: &str, dept
     configure = conan_argv_append(configure, "Ninja")
     configure = conan_argv_append(configure, "-DCMAKE_MAKE_PROGRAM=" ++ ninja)
     configure = conan_argv_append(configure, "-DCMAKE_C_COMPILER=" ++ conan_write_launcher(tools_dir, "cc", self_exe))
+    // #1915: a project that declares C++ (raylib's `project(raylib C CXX)`)
+    // gets clang's C++ driver too, never the host's c++.
+    configure = conan_argv_append(configure, "-DCMAKE_CXX_COMPILER=" ++ conan_write_launcher_named(tools_dir, "c++", self_exe, "cc --driver-mode=g++"))
     configure = conan_argv_append(configure, "-DCMAKE_AR=" ++ conan_write_launcher(tools_dir, "__ar", self_exe))
     configure = conan_argv_append(configure, "-DCMAKE_RANLIB=" ++ conan_write_launcher(tools_dir, "__ranlib", self_exe))
     configure = conan_argv_append(configure, "-DCMAKE_BUILD_TYPE=Release")
