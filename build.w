@@ -128,8 +128,8 @@ fn cross_platform_symbol(tag: &str) -> str:
 // target). `with build :cross-rt-wasm` populates out/lib/cross/wasm32/.
 fn add_cross_wasm_rt_targets(out0: Build, tag: &str, p: &str, group_name: &str) -> Build:
     var out = out0
-    out = out.add_target(cross_object_target(tag, p ++ "rt-core-object", "rt/rt_core.w", "-O2"))
-    out = out.add_target(cross_object_target_named(tag, p ++ "rt-platform-object", "rt/wasm.w", "rt_wasm.o", "-O2"))
+    out = out.add_target(cross_object_target(tag, p ++ "rt-core-object", "rt/rt_core.w", "-O1"))
+    out = out.add_target(cross_object_target_named(tag, p ++ "rt-platform-object", "rt/wasm.w", "rt_wasm.o", "-O1"))
     var cross_compat = cross_object_target_named(tag, p ++ "compat-runtime-object", "out/gen/compat_runtime.w", "compat_runtime.o", "-O1")
     cross_compat = cross_compat.dep("compat-runtime-source")
     out = out.add_target(cross_compat)
@@ -142,6 +142,9 @@ fn add_cross_wasm_rt_targets(out0: Build, tag: &str, p: &str, group_name: &str) 
     cross_rt = cross_rt.dep(p ++ "panic-runtime-object")
     cross_rt = cross_rt.dep(p ++ "fiber-stubs-object")
     out.add_target(cross_rt)
+
+// The target that generates an architecture's linux sysroot on this host.
+fn linux_sysroot_target_name(a: &str) -> str: if a == arch(): "linux-sysroot" else: "linux-sysroot-" ++ a
 
 fn cross_llvm_prefix(tag: &str) -> str:
     let arch_tag = if tag == "linux_aarch64": "linux-aarch64" else: "linux-x86_64"
@@ -171,8 +174,8 @@ fn add_cross_rt_targets(out0: Build, ctx: &BuildCtx, tag: &str, p: &str, group_n
     var out = out0
     let dir = cross_dir(tag)
     let triple = cross_triple(tag)
-    out = out.add_target(cross_object_target(tag, p ++ "rt-core-object", "rt/rt_core.w", "-O2"))
-    out = out.add_target(cross_object_target_named(tag, p ++ "rt-platform-object", cross_platform_source(tag), cross_platform_obj(tag), "-O2"))
+    out = out.add_target(cross_object_target(tag, p ++ "rt-core-object", "rt/rt_core.w", "-O1"))
+    out = out.add_target(cross_object_target_named(tag, p ++ "rt-platform-object", cross_platform_source(tag), cross_platform_obj(tag), "-O1"))
     out = out.add_target(cross_object_target(tag, p ++ "cimport-stubs-object", "rt/cimport_stubs.w", "-O1"))
     var cross_compat = cross_object_target_named(tag, p ++ "compat-runtime-object", "out/gen/compat_runtime.w", "compat_runtime.o", "-O1")
     cross_compat = cross_compat.dep("compat-runtime-source")
@@ -226,7 +229,26 @@ fn add_cross_rt_targets(out0: Build, ctx: &BuildCtx, tag: &str, p: &str, group_n
         out = wo_bundle_targets(move out, ctx, plans[pi], release_compiler_bin("with"), "build")
         cross_embedded = target_with_wo_blobs(move cross_embedded, plans[pi])
     out = add_empty_darwin_sysroot_blob_target(move out, p, dir)
-    cross_embedded = target_with_empty_darwin_sysroot_blob(move cross_embedded, p, dir)
+    // #1915 (D81): the target's sysroot, compiler-rt and libc++ (a pack the
+    // cross compiler embeds, and an unpacked copy the cross links read) and
+    // its SDK's cmake and ninja, from the target's SDK (cross_llvm_prefix).
+    let cross_arch = if tag == "linux_aarch64": "aarch64" else: "x86_64"
+    var cross_link_pack = target_new(.Action, p ++ "linux-link-pack", "").output(dir ++ "/linux-link.pack")
+    cross_link_pack.action = run_linux_link_pack_action
+    cross_link_pack = cross_link_pack.arg(build_owned_text(cross_arch)).arg(cross_llvm_prefix(tag)).arg(dir ++ "/sysroot")
+    cross_link_pack = cross_link_pack.input("build/sdk.w").input(sdk_linux_sysroot_pack_for(build_owned_text(cross_arch)))
+    cross_link_pack = cross_link_pack.dep(linux_sysroot_target_name(build_owned_text(cross_arch)))
+    cross_link_pack = cross_link_pack.write_scope(build_owned_text(dir)).write_scope("out/command/" ++ p ++ "linux-link-pack")
+    out = out.add_target(cross_link_pack.timeout(600000))
+    var cross_tools_pack = target_new(.Action, p ++ "sdk-tools-pack", "").output(dir ++ "/sdk-tools.pack")
+    cross_tools_pack.action = run_sdk_build_tools_pack_action
+    cross_tools_pack = cross_tools_pack.arg(cross_llvm_prefix(tag)).input("build/sdk.w")
+    cross_tools_pack = cross_tools_pack.write_scope(build_owned_text(dir)).write_scope("out/command/" ++ p ++ "sdk-tools-pack")
+    out = out.add_target(cross_tools_pack.timeout(600000))
+    cross_embedded = cross_embedded.input(dir ++ "/empty_darwin_sysroot.bin").arg("darwin_sysroot").dep(p ++ "empty-darwin-sysroot")
+    cross_embedded = cross_embedded.input(dir ++ "/empty_darwin_sysroot.bin").arg("windows_sysroot").dep(p ++ "empty-darwin-sysroot")
+    cross_embedded = cross_embedded.input(dir ++ "/sdk-tools.pack").arg("sdk_tools").dep(p ++ "sdk-tools-pack")
+    cross_embedded = cross_embedded.input(dir ++ "/linux-link.pack").arg("linux_sysroot").dep(p ++ "linux-link-pack")
     let cross_embedded_obj = embedded_objects_object(p ++ "embedded-objects-object", &cross_embedded, triple)
     out = out.add_target(cross_embedded)
     out = out.add_target(cross_embedded_obj)
@@ -234,16 +256,58 @@ fn add_cross_rt_targets(out0: Build, ctx: &BuildCtx, tag: &str, p: &str, group_n
     var cross_ld_rsp = target_new(.Action, p ++ "llvm-link-metadata", "").output(dir ++ "/llvm_ld.rsp")
     cross_ld_rsp.action = run_cross_linux_llvm_link_metadata_action
     cross_ld_rsp = cross_ld_rsp.arg(build_owned_text(tag))
-    cross_ld_rsp = cross_ld_rsp.write_scope(dir)
+    cross_ld_rsp = cross_ld_rsp.write_scope(build_owned_text(dir))
     cross_ld_rsp = cross_ld_rsp.write_scope("out/command/" ++ p ++ "llvm-link-metadata")
     out = out.add_target(cross_ld_rsp)
+
+    var objects: Vec[str] = Vec.new()
+    for suffix in "rt-core-object rt-platform-object cimport-stubs-object compat-runtime-object panic-runtime-object fiber-stubs-object channel-runtime-object fiber-runtime-object fiber-core-object fiber-asm-object llvm-bridge-object clang-bridge-object embedded-objects-object llvm-link-metadata".split(" "):
+        objects.push(p ++ suffix)
+    out = out.add_target(runtime_producer_target(p ++ "runtime-producer", release_compiler_bin("with"), dir, &objects))
 
     var cross_rt = target_new(.Group, build_owned_text(group_name), "")
     cross_rt = cross_rt.dep(p ++ "embedded-objects-object")
     cross_rt = cross_rt.dep(p ++ "llvm-bridge-object")
     cross_rt = cross_rt.dep(p ++ "clang-bridge-object")
     cross_rt = cross_rt.dep(p ++ "llvm-link-metadata")
-    out.add_target(cross_rt)
+    cross_rt = cross_rt.dep(p ++ "runtime-producer")
+    out = out.add_target(cross_rt)
+
+    // A native-verified cross bootstrap is needed when the pinned target seed
+    // predates current syntax. Build and stamp it through the same compiler
+    // actions as the native stages, with every target corpus and producer.
+    let bin_dir = "out/cross/" ++ tag ++ "/bin"
+    let bin = bin_dir ++ "/with"
+    var compiler = target_new(.Action, p ++ "link-compiler", "").output(bin ++ ".unstamped")
+    compiler.action = run_with_compiler_build_action
+    compiler = compiler.compiler(release_compiler_bin("with"))
+    compiler = compiler.input("out/gen/main.w")
+    compiler = target_with_compiler_source_inputs(move compiler, ctx)
+    compiler = compiler.arg("-O1").arg("--target=" ++ triple)
+    compiler = compiler.arg("embedded-object=" ++ dir ++ "/embedded_objects.o")
+    // Link selects cross/<target> beneath the producer's native root
+    // (link_stage_runtime_variant_dir); the target directory is for embedding.
+    compiler = compiler.arg("runtime-root=out/lib")
+    compiler = compiler.input(dir ++ "/.producer")
+    compiler = compiler.dep(build_owned_text(group_name))
+    compiler = compiler.write_scope(build_owned_text(bin_dir))
+    compiler = compiler.extra_output("out/command/" ++ p ++ "link-compiler")
+    compiler = compiler.timeout(1800000)
+    for pi in 0..plans.len() as i32:
+        compiler = target_with_link_bundle(move compiler, ctx, plans[pi])
+    out = out.add_target(compiler)
+
+    var stamp = target_new(.Action, p ++ "compiler", "").output(build_owned_text(bin))
+    stamp.action = run_patch_version_action
+    stamp = stamp.input(bin ++ ".unstamped").input("docs/with-abi.sha256")
+    stamp = stamp.arg("runtime-producer=" ++ dir ++ "/.producer")
+    stamp = stamp.input(dir ++ "/.producer")
+    stamp = stamp.dep(p ++ "link-compiler").dep("abi-hash-check")
+    stamp = target_with_generation_inputs(move stamp, ctx)
+    stamp = target_with_version_inputs(move stamp, ctx)
+    stamp = stamp.write_scope(build_owned_text(bin_dir))
+    stamp = stamp.extra_output("out/command/" ++ p ++ "compiler")
+    out.add_target(stamp)
 
 // #1815 (D30): stage1's runtime and bridge objects, compiled by stage1 into
 // out/bootstrap/lib. stage2's code is stage1's codegen, so stage2 links this
@@ -290,6 +354,7 @@ fn add_stage1_runtime_targets(out0: Build, host_runtime: &HostRuntimeSpec, corpu
     metadata = metadata.input("sdk.lock")
     // #1915: the rsp names the darwin sysroot as -syslibroot.
     metadata = metadata.dep("darwin-sysroot")
+    metadata = metadata.dep("linux-sysroot")
     metadata = metadata.input(sdk_darwin_sysroot_pack())
     metadata = metadata.input(dir ++ "/llvm_bridge.o")
     metadata = metadata.input(dir ++ "/clang_bridge.o")
@@ -382,7 +447,17 @@ fn run_cross_linux_llvm_link_metadata_action(ctx: ActionCtx) -> i32:
     let sorted_llvm = comp_sort_strings(llvm_archives)
     for i in 0..sorted_llvm.len() as i32:
         ld_rsp = ld_rsp ++ comp_rsp_path(sorted_llvm[i]) ++ "\n"
-    ld_rsp = ld_rsp ++ "-Bstatic\n-lstdc++\n-lgcc\n-lgcc_eh\n-Bdynamic\n-lpthread\n-ldl\n-lm\n-lz\n-lzstd\n-lxml2\n"
+    // #1915 (D81): the target SDK's static libc++ (libc++abi and libunwind
+    // in it); Link.w adds the target sysroot's crt objects, libc and
+    // compiler-rt. Nothing of any host's gcc, libstdc++, zlib, zstd, libxml2.
+    let cross_arch = if tag == "linux_aarch64": "aarch64" else: "x86_64"
+    let cross_libcxx = lib_dir ++ "/" ++ cross_arch ++ "-unknown-linux-gnu/libc++.a"
+    if not fs.host_exists(cross_libcxx):
+        ctx.diagnostics().error("cross-llvm-link-metadata: missing " ++ cross_libcxx ++ "; a linux SDK carries its own libc++ (build/sdk.w sdk_linux_runtimes)")
+    ld_rsp = ld_rsp ++ comp_rsp_path(cross_libcxx) ++ "\n-lpthread\n-ldl\n-lm\n"
+    if not comp_sdk_has_clang_main(fs, lib_dir):
+        ctx.diagnostics().error("cross-llvm-link-metadata: the target SDK has no clang driver archive: " ++ lib_dir ++ "/libclangMain.a")
+    ld_rsp = ld_rsp ++ comp_clang_main_link_lines(true, "Linux", false, false)
     ld_rsp = ld_rsp ++ comp_wasm_backend_alias_lines(comp_sdk_has_wasm_backend(fs, lib_dir), "Linux", false)
     // #1915: the cross SDK's lld drivers, as the host link takes its own.
     let cross_lld = comp_sdk_lld_flavors(fs, lib_dir, "Linux")
@@ -571,7 +646,11 @@ fn target_with_darwin_sysroot_blob(target: Target) -> Target:
     // and build tools (build/sdk.w run_windows_sysroot_action).
     out = out.input(sdk_windows_sysroot_pack())
     out = out.arg("windows_sysroot")
-    out.dep("windows-sysroot")
+    out = out.dep("windows-sysroot")
+    // And the linux-x86_64 sysroot (empty off linux-x86_64).
+    out = out.input(sdk_linux_link_pack())
+    out = out.arg("linux_sysroot")
+    out.dep("linux-link-pack")
 
 fn target_with_empty_darwin_sysroot_blob(target: Target, prefix: &str, dir: &str) -> Target:
     var out = target.input(dir ++ "/empty_darwin_sysroot.bin")
@@ -580,6 +659,8 @@ fn target_with_empty_darwin_sysroot_blob(target: Target, prefix: &str, dir: &str
     out = out.arg("sdk_tools")
     out = out.input(dir ++ "/empty_darwin_sysroot.bin")
     out = out.arg("windows_sysroot")
+    out = out.input(dir ++ "/empty_darwin_sysroot.bin")
+    out = out.arg("linux_sysroot")
     out.dep(prefix ++ "empty-darwin-sysroot")
 
 fn add_empty_darwin_sysroot_blob_target(out: Build, prefix: &str, dir: &str) -> Build:
@@ -1155,6 +1236,77 @@ fn sdk_build_root_arg(ctx: &BuildCtx, platform: &str) -> str:
 fn sdk_jobs_arg(ctx: &BuildCtx) -> str:
     ctx.env_input("PARALLEL_JOBS")
 
+// linux-x86_64: the SDK's own runtimes, which its ninja, cmake and LLVM link.
+fn sdk_runtimes_target(ctx: &BuildCtx) -> Target:
+    let platform = sdk_current_platform()
+    let bootstrap_prefix = sdk_bootstrap_prefix_arg(ctx, platform)
+    let output_prefix = sdk_output_prefix_arg(ctx, platform)
+    let build_root = sdk_build_root_arg(ctx, platform)
+    var target = target_new(.Action, "sdk-runtimes", "").output(output_prefix ++ "/lib/x86_64-unknown-linux-gnu/libc++.a")
+    target.action = run_sdk_runtimes_action
+    target = target.arg(build_owned_text(bootstrap_prefix))
+    target = target.arg(build_owned_text(output_prefix))
+    target = target.arg(sdk_llvm_source_dir())
+    target = target.arg(build_root ++ "/runtimes-" ++ sdk_host_tag_for_platform(platform))
+    target = target.arg(sdk_jobs_arg(ctx))
+    target = target.input(sdk_llvm_source_marker())
+    target = target.input(bootstrap_prefix)
+    target = target.input("build/sdk.w")
+    target = target.input(sdk_linux_sysroot_pack())
+    target = target.write_scope(output_prefix)
+    target = target.write_scope(build_root)
+    target = target.write_scope("out/command/sdk-runtimes")
+    target = target.dep("sdk-llvm-source")
+    target = target.dep("linux-sysroot")
+    target.timeout(7200000)
+
+// A linux-x86_64 host cross-builds the linux-aarch64 SDK (#1915): its
+// runtimes, ninja, cmake and LLVM against the aarch64 sysroot with the
+// bootstrap SDK's clang, lld, cmake and ninja, and this host's SDK build's
+// tablegens. `with build :sdk-cross-aarch64-package` packages it.
+fn add_sdk_cross_aarch64_targets(out0: Build, ctx: &BuildCtx) -> Build:
+    let host = sdk_current_platform()
+    let platform = "linux-aarch64"
+    let bootstrap = sdk_bootstrap_prefix_arg(ctx, host)
+    let prefix = sdk_output_prefix_for_platform(platform)
+    let root = sdk_output_build_root_for_platform(platform)
+    let tag = sdk_host_tag_for_platform(platform)
+    let host_tools = sdk_build_root_arg(ctx, host) ++ "/llvm-" ++ compiler_llvm_version() ++ "-" ++ sdk_host_tag_for_platform(host) ++ "/bin"
+    let llvm_build = root ++ "/llvm-" ++ compiler_llvm_version() ++ "-" ++ tag
+    var out = out0
+    var runtimes = target_new(.Action, "sdk-cross-aarch64-runtimes", "").output(prefix ++ "/lib/aarch64-unknown-linux-gnu/libc++.a")
+    runtimes.action = run_sdk_runtimes_action
+    runtimes = runtimes.arg(build_owned_text(bootstrap)).arg(build_owned_text(prefix)).arg(sdk_llvm_source_dir()).arg(root ++ "/runtimes-" ++ tag).arg(sdk_jobs_arg(ctx)).arg("aarch64")
+    runtimes = runtimes.input(sdk_llvm_source_marker()).input(build_owned_text(bootstrap)).input("build/sdk.w").input(sdk_linux_sysroot_pack_for("aarch64"))
+    runtimes = runtimes.write_scope(build_owned_text(prefix)).write_scope(build_owned_text(root)).write_scope("out/command/sdk-cross-aarch64-runtimes")
+    runtimes = runtimes.dep("sdk-llvm-source").dep("linux-sysroot-aarch64")
+    out = out.add_target(runtimes.timeout(7200000))
+    var ninja = target_new(.Action, "sdk-cross-aarch64-ninja", "").output(prefix ++ "/bin/ninja")
+    ninja.action = run_sdk_ninja_action
+    ninja = ninja.arg(build_owned_text(bootstrap)).arg(build_owned_text(prefix)).arg(sdk_ninja_source_dir()).arg(root ++ "/ninja-" ++ tag).arg(sdk_jobs_arg(ctx)).arg("aarch64")
+    ninja = ninja.input(sdk_ninja_source_marker()).input(build_owned_text(bootstrap)).input("build/sdk.w")
+    ninja = ninja.write_scope(build_owned_text(prefix)).write_scope(build_owned_text(root)).write_scope("out/command/sdk-cross-aarch64-ninja")
+    ninja = ninja.dep("sdk-ninja-source").dep("sdk-cross-aarch64-runtimes")
+    out = out.add_target(ninja.timeout(1800000))
+    var cmake = target_new(.Action, "sdk-cross-aarch64-cmake", "").output(prefix ++ "/bin/cmake")
+    cmake.action = run_sdk_cmake_action
+    cmake = cmake.arg(build_owned_text(bootstrap)).arg(build_owned_text(prefix)).arg(sdk_cmake_source_dir()).arg(root ++ "/cmake-" ++ tag).arg(sdk_jobs_arg(ctx)).arg("").arg("aarch64")
+    cmake = cmake.input(sdk_cmake_source_marker()).input(build_owned_text(bootstrap)).input("build/sdk.w")
+    cmake = cmake.write_scope(build_owned_text(prefix)).write_scope(build_owned_text(root)).write_scope("out/command/sdk-cross-aarch64-cmake")
+    cmake = cmake.dep("sdk-cmake-source").dep("sdk-cross-aarch64-ninja")
+    out = out.add_target(cmake.timeout(3600000))
+    var llvm = target_new(.Action, "sdk-cross-aarch64-llvm", "").output(prefix ++ "/lib/libclang.a")
+    llvm.action = run_sdk_llvm_action
+    llvm = llvm.arg(build_owned_text(bootstrap)).arg(build_owned_text(prefix)).arg(sdk_llvm_source_dir()).arg(build_owned_text(llvm_build)).arg(sdk_jobs_arg(ctx)).arg(ctx.env_input("LLVM_TARGETS_TO_BUILD")).arg("").arg("").arg("").arg("aarch64").arg(build_owned_text(host_tools))
+    llvm = llvm.input(sdk_llvm_source_marker()).input(build_owned_text(bootstrap)).input("build/sdk.w").input(sdk_linux_sysroot_pack_for("aarch64"))
+    llvm = llvm.write_scope(build_owned_text(prefix)).write_scope(build_owned_text(root)).write_scope("out/command/sdk-cross-aarch64-llvm")
+    // The host SDK build (sdk-llvm) supplies the tablegens the cross build runs.
+    llvm = llvm.dep("sdk-llvm-source").dep("sdk-cross-aarch64-cmake").dep("sdk-cross-aarch64-runtimes").dep("sdk-llvm")
+    out = out.add_target(llvm.timeout(21600000))
+    let package = package_llvm_sdk_platform_target("sdk-cross-aarch64-package", platform, prefix, llvm_build ++ "/CMakeCache.txt")
+    out = out.add_target(package.dep("sdk-cross-aarch64-llvm"))
+    out
+
 fn sdk_ninja_target(ctx: &BuildCtx) -> Target:
     let platform = sdk_current_platform()
     let bootstrap_prefix = sdk_bootstrap_prefix_arg(ctx, platform)
@@ -1178,6 +1330,10 @@ fn sdk_ninja_target(ctx: &BuildCtx) -> Target:
     // libc and libc++.
     if sdk_platform_is_windows(platform):
         target = target.dep("sdk-libcxx")
+    // linux-x86_64 links its ninja against the SDK's runtimes.
+    if os() == "Linux" and arch() == "x86_64":
+        target = target.dep("sdk-runtimes")
+        target = target.input(sdk_linux_sysroot_pack())
     target.timeout(1800000)
 
 // Windows builds CMake after LLVM: its version and manifest resources go
@@ -1242,6 +1398,10 @@ fn sdk_llvm_target(ctx: &BuildCtx) -> Target:
     else:
         target = target.input(output_prefix ++ "/bin/cmake" ++ host_exe_suffix())
         target = target.dep("sdk-cmake")
+    // linux-x86_64 builds its runtimes and LLVM against the With sysroot.
+    if os() == "Linux" and arch() == "x86_64":
+        target = target.dep("linux-sysroot")
+        target = target.input(sdk_linux_sysroot_pack())
     target.timeout(21600000)
 
 // The Windows C runtime of the SDK (#1915; build/sdk.w): mingw-w64's headers,
@@ -2522,6 +2682,9 @@ pub fn build(ctx: BuildCtx) -> Build:
     out = out.add_target(sdk_windows_libc_target(ctx))
     out = out.add_target(sdk_compiler_rt_builtins_target(ctx))
     out = out.add_target(sdk_libcxx_target(ctx))
+    if os() == "Linux" and arch() == "x86_64":
+        out = out.add_target(sdk_runtimes_target(ctx))
+        out = add_sdk_cross_aarch64_targets(move out, ctx)
     out = out.add_target(sdk_ninja_target(ctx))
     out = out.add_target(sdk_cmake_target(ctx))
     out = out.add_target(sdk_llvm_target(ctx))
@@ -2606,12 +2769,15 @@ pub fn build(ctx: BuildCtx) -> Build:
     windows_sysroot = windows_sysroot.timeout(1200000)
     out = out.add_target(windows_sysroot)
 
+    // The darwin and linux sysroots come from the Zig source (#1915).
+    let sysroot_host = os() == "Macos" or (os() == "Linux" and sdk_linux_arch_supported(arch()))
+    if sysroot_host:
+        out = out.add_target(sdk_source_target("sysroot-zig-source", sdk_zig_source_url(), sdk_zig_source_sha256(), sdk_zig_archive(), sdk_zig_source_root(), sdk_zig_source_dir(), sdk_zig_source_marker()))
     var darwin_sysroot = target_new(.Action, "darwin-sysroot", "").output(sdk_darwin_sysroot_pack())
     darwin_sysroot.action = run_darwin_sysroot_action
     darwin_sysroot = darwin_sysroot.input("build/sdk.w")
     if os() == "Macos":
-        out = out.add_target(sdk_source_target("darwin-sysroot-zig-source", sdk_zig_source_url(), sdk_zig_source_sha256(), sdk_zig_archive(), sdk_zig_source_root(), sdk_zig_source_dir(), sdk_zig_source_marker()))
-        darwin_sysroot = darwin_sysroot.dep("darwin-sysroot-zig-source")
+        darwin_sysroot = darwin_sysroot.dep("sysroot-zig-source")
         darwin_sysroot = darwin_sysroot.input(sdk_zig_source_marker())
         darwin_sysroot = darwin_sysroot.input("build/https_fetch.w")
         darwin_sysroot = darwin_sysroot.allow_network()
@@ -2620,6 +2786,42 @@ pub fn build(ctx: BuildCtx) -> Build:
     darwin_sysroot = darwin_sysroot.write_scope("out/command/darwin-sysroot")
     darwin_sysroot = darwin_sysroot.timeout(600000)
     out = out.add_target(darwin_sysroot)
+
+    var linux_sysroot = target_new(.Action, "linux-sysroot", "").output(sdk_linux_sysroot_pack())
+    linux_sysroot.action = run_linux_sysroot_action
+    linux_sysroot = linux_sysroot.input("build/sdk.w")
+    linux_sysroot = linux_sysroot.input("sdk.lock")
+    if os() == "Linux" and sdk_linux_arch_supported(arch()):
+        linux_sysroot = linux_sysroot.dep("sysroot-zig-source")
+        linux_sysroot = linux_sysroot.input(sdk_zig_source_marker())
+    linux_sysroot = linux_sysroot.write_scope(sdk_linux_sysroot_dir())
+    linux_sysroot = linux_sysroot.write_scope("out/command/linux-sysroot")
+    linux_sysroot = linux_sysroot.timeout(1200000)
+    out = out.add_target(linux_sysroot)
+    // Every other Linux architecture's sysroot, generated here for a cross
+    // build (the aarch64 SDK and compiler from linux-x86_64, and back).
+    for other in ["x86_64", "aarch64"]:
+        if other == arch() and os() == "Linux": continue
+        var linux_sysroot_arm = target_new(.Action, "linux-sysroot-" ++ other, "").output(sdk_linux_sysroot_pack_for(other))
+        linux_sysroot_arm.action = run_linux_sysroot_action
+        linux_sysroot_arm = linux_sysroot_arm.arg(build_owned_text(other))
+        linux_sysroot_arm = linux_sysroot_arm.input("build/sdk.w")
+        linux_sysroot_arm = linux_sysroot_arm.input("sdk.lock")
+        linux_sysroot_arm = linux_sysroot_arm.dep("sysroot-zig-source")
+        linux_sysroot_arm = linux_sysroot_arm.input(sdk_zig_source_marker())
+        linux_sysroot_arm = linux_sysroot_arm.write_scope(sdk_linux_sysroot_dir_for(other))
+        linux_sysroot_arm = linux_sysroot_arm.write_scope("out/command/linux-sysroot-" ++ other)
+        linux_sysroot_arm = linux_sysroot_arm.timeout(1200000)
+        out = out.add_target(linux_sysroot_arm)
+
+    var linux_link_pack = target_new(.Action, "linux-link-pack", "").output(sdk_linux_link_pack())
+    linux_link_pack.action = run_linux_link_pack_action
+    linux_link_pack = linux_link_pack.input("build/sdk.w")
+    linux_link_pack = linux_link_pack.input("sdk.lock")
+    linux_link_pack = linux_link_pack.input(sdk_linux_sysroot_pack())
+    linux_link_pack = linux_link_pack.dep("linux-sysroot")
+    linux_link_pack = linux_link_pack.timeout(600000)
+    out = out.add_target(linux_link_pack)
 
     var compiler_no_c_export = target_new(.Action, "compiler-no-c-export", "").output("out/.build-state/compiler-no-c-export.txt")
     compiler_no_c_export.action = run_check_compiler_no_new_c_export_action
@@ -2702,6 +2904,7 @@ pub fn build(ctx: BuildCtx) -> Build:
     bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.input("sdk.lock")
     // #1915: the rsp names the darwin sysroot as -syslibroot.
     bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.dep("darwin-sysroot")
+    bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.dep("linux-sysroot")
     bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.input(sdk_darwin_sysroot_pack())
     bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.input("out/bootstrap-lib/llvm_bridge.o")
     bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.input("out/bootstrap-lib/clang_bridge.o")
@@ -2844,6 +3047,7 @@ pub fn build(ctx: BuildCtx) -> Build:
     llvm_link_metadata = llvm_link_metadata.input("sdk.lock")
     // #1915: the rsp names the darwin sysroot as -syslibroot.
     llvm_link_metadata = llvm_link_metadata.dep("darwin-sysroot")
+    llvm_link_metadata = llvm_link_metadata.dep("linux-sysroot")
     llvm_link_metadata = llvm_link_metadata.input(sdk_darwin_sysroot_pack())
     llvm_link_metadata = llvm_link_metadata.input("out/lib/llvm_bridge.o")
     llvm_link_metadata = llvm_link_metadata.input("out/lib/clang_bridge.o")
@@ -3197,8 +3401,8 @@ pub fn build(ctx: BuildCtx) -> Build:
     // (COFF objects, windows triple) so a `--target x86_64-w64-windows-gnu`
     // link resolves entirely from that directory (§18.5). Mirrors the
     // linux cross-rt set; fiber core/asm are the windows variants.
-    out = out.add_target(cross_windows_object_target("cross-win-rt-core-object", "rt/rt_core.w", "-O2"))
-    out = out.add_target(cross_windows_object_target_named("cross-win-rt-platform-object", "rt/windows_x86_64.w", "rt_windows_x86_64.o", "-O2"))
+    out = out.add_target(cross_windows_object_target("cross-win-rt-core-object", "rt/rt_core.w", "-O1"))
+    out = out.add_target(cross_windows_object_target_named("cross-win-rt-platform-object", "rt/windows_x86_64.w", "rt_windows_x86_64.o", "-O1"))
     out = out.add_target(cross_windows_object_target("cross-win-cimport-stubs-object", "rt/cimport_stubs.w", "-O1"))
     var cross_win_compat = cross_windows_object_target_named("cross-win-compat-runtime-object", "out/gen/compat_runtime.w", "compat_runtime.o", "-O1")
     cross_win_compat = cross_win_compat.dep("compat-runtime-source")
@@ -3276,8 +3480,8 @@ pub fn build(ctx: BuildCtx) -> Build:
     // `--target aarch64-pc-windows-msvc` link resolves entirely from that
     // directory (§18.5). Mirrors the windows_x86_64 cross-rt set; fiber
     // core is the windows variant, fiber asm the arm64 windows variant.
-    out = out.add_target(cross_windows_aarch64_object_target("cross-winarm-rt-core-object", "rt/rt_core.w", "-O2"))
-    out = out.add_target(cross_windows_aarch64_object_target_named("cross-winarm-rt-platform-object", "rt/windows_aarch64.w", "rt_windows_aarch64.o", "-O2"))
+    out = out.add_target(cross_windows_aarch64_object_target("cross-winarm-rt-core-object", "rt/rt_core.w", "-O1"))
+    out = out.add_target(cross_windows_aarch64_object_target_named("cross-winarm-rt-platform-object", "rt/windows_aarch64.w", "rt_windows_aarch64.o", "-O1"))
     out = out.add_target(cross_windows_aarch64_object_target("cross-winarm-cimport-stubs-object", "rt/cimport_stubs.w", "-O1"))
     var cross_winarm_compat = cross_windows_aarch64_object_target_named("cross-winarm-compat-runtime-object", "out/gen/compat_runtime.w", "compat_runtime.o", "-O1")
     cross_winarm_compat = cross_winarm_compat.dep("compat-runtime-source")

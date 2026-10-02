@@ -236,11 +236,11 @@ jobs:
             seed_version: nightly-20260926-local-1-2e8defaa18ef
             seed_asset: with-linux-x86_64
             seed_sha256: ce5c3c4729650b215fb166ac8078fe7c7982b094bc4a1e31401e04eb7e7460d0
-            sdk_version: nightly-20260926-local-1-2e8defaa18ef
+            sdk_version: nightly-sdk-20260930-6f0394637064
             sdk_asset: with-llvm-sdk-22.1.6-linux-x86_64.tar.gz
-            sdk_sha256: 25b49ef5520cf2e94e1b80eebf019174cb313cadfee881cd6d4c9752e97aad0d
-            sdk_sidecar_sha256: e90d057082559132f7a6f192e1c58325401602c223125e81ed6184d4fcd63bdf
-            sdk_manifest_sha256: 6b218dbcfdfaf0c728c400a062171f6fa6c23e9a74ca2db587c5a0255c0af49b
+            sdk_sha256: 5d3f1a34f677185880d87bb3b9031e6c4f2967bf4fd0b5077fb3c9e702b6a47f
+            sdk_sidecar_sha256: bd9719f205d97faa5739a407fcef3fb4950f81c1dcd71ae074513c859a318a25
+            sdk_manifest_sha256: 4252f86279af1c7d1d345e649447ec6877726fc176ef58d5584224b457662850
             release_asset: with-linux-x86_64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
@@ -897,9 +897,9 @@ jobs:
       WITH_SEED_ASSET: with-linux-aarch64
       WITH_SEED_SHA256: 3e54f7839dbf9549233a19753c897fb08f493fa8cfafeeec25b62fa87a43aac3
       WITH_SDK_REPO: withlang-dev/with
-      WITH_SDK_VERSION: sdk-linux-aarch64
+      WITH_SDK_VERSION: nightly-sdk-20260930-e997223d40ce
       WITH_SDK_ASSET: with-llvm-sdk-22.1.6-linux-aarch64.tar.gz
-      WITH_SDK_SHA256: b1597fe5281c760f594235a0d5b01fe3360b8303f7615b9f87c3ff87a2740926
+      WITH_SDK_SHA256: 4fe9695ef30a05d2f15bd0095b2d8b892ae9102930ca520b382ab545a3727a2b
       # This platform's compiler does not yet embed its own runtime object (see
       # the note in selfhost-linux-aarch64.yml), so the seed resolves
       # rt_linux_aarch64.o from <bindir>/runtime/ -- here src/runtime/, since the
