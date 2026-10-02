@@ -76,6 +76,9 @@ let OPEN_ALWAYS: u32 = 4 as u32
 let FILE_ATTRIBUTE_READONLY: u32 = 1 as u32
 let FILE_ATTRIBUTE_DIRECTORY: u32 = 16 as u32
 let FILE_ATTRIBUTE_NORMAL: u32 = 128 as u32
+let FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400
+// IsReparseTagNameSurrogate (winnt.h): a junction's or a symlink's tag.
+let IO_REPARSE_TAG_NAME_SURROGATE: u32 = 0x20000000
 let FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000 as u32
 let MEM_COMMIT_RESERVE: u32 = 0x3000 as u32
 let MEM_RELEASE: u32 = 0x8000 as u32
@@ -677,6 +680,16 @@ fn win_is_dot_or_dotdot(name: *const u16) -> bool:
 // WIN32_FIND_DATAW.cFileName.
 fn win_find_name(data: *const u8) -> *const u16: (data as i64 + 44) as *const u16
 
+// WIN32_FIND_DATAW.dwFileAttributes.
+fn win_find_attrs(data: *const u8) -> u32: unsafe *(data as *const u32)
+
+// WIN32_FIND_DATAW.dwReserved0: the reparse tag of a reparse point.
+fn win_find_tag(data: *const u8) -> u32: unsafe *((data as i64 + 36) as *const u32)
+
+// A junction or a symbolic link (see windows_x86_64.w).
+fn win_is_link(attrs: u32, tag: u32) -> bool:
+    (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 and (tag & IO_REPARSE_TAG_NAME_SURROGATE) != 0
+
 fn win_is_dir(wpath: *const u16) -> bool:
     let attrs = GetFileAttributesW(wpath)
     attrs != 0xffffffff and (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0
@@ -719,37 +732,63 @@ pub fn rt_rename(old_path: *const u8, new_path: *const u8) -> i32:
         return win_neg_error()
     0
 
-// `child` holds the pattern first, then each child (see windows_x86_64.w).
-fn win_remove_tree_w(wpath: *const u16) -> i32:
-    if not win_is_dir(wpath):
+// A link is removed itself and never entered (#1798); `child` holds the
+// pattern first, then each child (see windows_x86_64.w).
+fn win_remove_tree_w(wpath: *const u16, attrs: u32, tag: u32) -> i32:
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0:
         return win_unlink_w(wpath)
+    if win_is_link(attrs, tag):
+        return win_rmdir_w(wpath)
     var star: [2]u16 = [42, 0]
     var child: [4096]u16 = [0; 4096]
-    let child_ptr = &raw mut child as *mut [4096]u16 as *mut u16
-    let join_rc = win_wpath_join(wpath, &star as *const [2]u16 as *const u16, child_ptr, 4096)
+    let child_ptr = &raw mut child as *mut u16
+    let join_rc = win_wpath_join(wpath, &star as *const u16, child_ptr, 4096)
     if join_rc != 0:
         return join_rc
     var data: [600]u8 = [0; 600]
-    let data_ptr = &raw mut data as *mut [600]u8 as *mut u8
-    let h = FindFirstFileW(child_ptr as *const u16, data_ptr)
+    let data_ptr = &raw mut data as *mut u8
+    let h = FindFirstFileW(child_ptr, data_ptr)
     if h != INVALID_HANDLE_VALUE:
         while true:
-            let name = win_find_name(data_ptr as *const u8)
+            let name = win_find_name(data_ptr)
             if not win_is_dot_or_dotdot(name):
                 let child_join = win_wpath_join(wpath, name, child_ptr, 4096)
-                let rc = if child_join != 0: child_join else: win_remove_tree_w(child_ptr as *const u16)
+                let rc = if child_join != 0: child_join else: win_remove_tree_w(child_ptr, win_find_attrs(data_ptr), win_find_tag(data_ptr))
                 if rc != 0:
-                    let _close = FindClose(h)
+                    FindClose(h)
                     return rc
             if FindNextFileW(h, data_ptr) == 0:
                 break
-        let _close = FindClose(h)
+        FindClose(h)
     win_rmdir_w(wpath)
+
+// The given path, classified as a listing would (see windows_x86_64.w).
+fn win_remove_tree_top(wpath: *const u16) -> i32:
+    let attrs = GetFileAttributesW(wpath)
+    if attrs == 0xffffffff:
+        return win_neg_error()
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0:
+        return win_remove_tree_w(wpath, attrs, 0)
+    var entry: [4096]u16 = [0; 4096]
+    let entry_ptr = &raw mut entry as *mut u16
+    var len = win_strlen16(wpath)
+    while len > 1 and (win_u16_at(wpath, len - 1) == 47 or win_u16_at(wpath, len - 1) == 92):
+        len = len - 1
+    for i in 0..len:
+        win_put_u16(entry_ptr, i, win_u16_at(wpath, i))
+    win_put_u16(entry_ptr, len, 0)
+    var data: [600]u8 = [0; 600]
+    let data_ptr = &raw mut data as *mut u8
+    let h = FindFirstFileW(entry_ptr, data_ptr)
+    if h == INVALID_HANDLE_VALUE:
+        return win_neg_error()
+    FindClose(h)
+    win_remove_tree_w(wpath, win_find_attrs(data_ptr), win_find_tag(data_ptr))
 
 pub fn rt_remove_tree(path: *const u8) -> i32:
     var wpath: [4096]u16 = [0; 4096]
-    let rc = win_utf8_to_utf16_buf(path, &raw mut wpath as *mut [4096]u16 as *mut u16, 4096)
-    if rc != 0: rc else: win_remove_tree_w(&wpath as *const [4096]u16 as *const u16)
+    let rc = win_utf8_to_utf16_buf(path, &raw mut wpath as *mut u16, 4096)
+    if rc != 0: rc else: win_remove_tree_top(&wpath as *const u16)
 
 fn win_copy_file(src: *const u16, dst: *const u16) -> i32:
     let in_fd = win_open_w(src, 0)
