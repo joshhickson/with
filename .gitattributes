@@ -26,3 +26,13 @@ docs/with-abi.sha256 text eol=lf
 # byte-exact comparison fails on every line — reddening bundle-interface-tests on
 # Windows only. Pin LF so the fixture matches emitted output on every platform.
 *.wi text eol=lf
+
+# Contract-view and UAT expectations are compared byte-for-byte as well: each
+# test/contract/*.w's contract view against its .expected file, and the UAT
+# runner's report and listing against test/uat/expected*.txt. Under
+# core.autocrlf=true a native Windows checkout rewrites them to CRLF, so every
+# line carries a "\r" the (LF) output never has, and contract-view-tests and
+# uat-tests go red on Windows only. Pin LF so they compare the same bytes on
+# every platform.
+test/contract/*.expected text eol=lf
+test/uat/**/*.txt text eol=lf
