@@ -55,7 +55,13 @@ fn analysis_with_node_location(fact: AnalysisFact, sema: &Sema, node: i32, sourc
 
 fn analysis_sig_path(sema: &Sema, sym: i32, fallback: &str) -> str:
     let found = sema.fn_decl_source_paths.get(sym)
-    if found.is_some(): with_str_clone_ref(found.unwrap()) else: with_str_clone_ref(fallback)
+    if found.is_some(): return with_str_clone_ref(found.unwrap())
+    // Generated specialization names have no source-path entry. Sema's
+    // canonical declaration still owns their source identity.
+    let decl = sema.receiver_decl_node_for_sig(sema.get_sig(sym))
+    let di = if decl > 0: sema.find_decl_index(decl) else: -1
+    if di >= 0: return sema.decl_source_path_for_index(di)
+    with_str_clone_ref(fallback)
 
 fn analysis_decl_path(sema: &Sema, decl_index: i32, fallback: &str) -> str:
     let path = sema.decl_source_path_for_index(decl_index)
@@ -320,6 +326,25 @@ fn analysis_collect_types(report: &AnalysisReport, sema: &Sema):
             field.detail = "owner=" ++ type_name ++ " field-type=" ++ sema.type_name(field_ty) ++ f" default-node={default_node}"
             report.add(move field)
 
+fn analysis_closure_details(sema: &Sema, node: i32) -> str:
+    if sema.ast.kind(node) != NodeKind.NK_CLOSURE:
+        return ""
+    var out = f" closure move={sema.ast.is_move_closure(node as NodeId)} non-escaping={sema.ast.is_non_escaping_closure(node as NodeId)}"
+    for ci in 0..sema.closure_capture_summary_count(node):
+        let sym = sema.closure_capture_summary_sym(node, ci)
+        let ty = sema.closure_capture_summary_type(node, ci)
+        let eff = sema.closure_capture_summary_eff(node, ci)
+        out = out ++ f" capture[{ci}]={sema.pool_resolve(sym)} type={sema.type_name(ty)} ephemeral={sema.type_is_ephemeral_value(ty)} effects={eff}"
+    var at = 0
+    while at + 5 < sema.deferred_closure_arg_checks.len() as i32:
+        if sema.deferred_closure_arg_checks[at] == node:
+            let sym = sema.deferred_closure_arg_checks[(at + 1)]
+            let sig = sema.deferred_closure_arg_checks[(at + 2)]
+            let pi = sema.deferred_closure_arg_checks[(at + 3)]
+            out = out ++ f" callee={sema.pool_resolve(sym)} param={pi} final-effects={sema.sig_param_effect(sig, pi)}"
+        at = at + 6
+    out
+
 fn analysis_collect_expressions(report: &AnalysisReport, sema: &Sema):
     for node in 1..sema.ast.node_count():
         if not sema.typed_expr_types.contains(node):
@@ -332,6 +357,7 @@ fn analysis_collect_expressions(report: &AnalysisReport, sema: &Sema):
         fact.type_id = tid
         fact.name = f"node:{node}"
         fact.detail = f"node-kind={fact.index} type-name={sema.type_name(tid)} start={sema.ast.get_start(node)} end={sema.ast.get_end(node)}"
+        fact.detail = fact.detail ++ analysis_closure_details(sema, node)
         report.add(move fact)
 
 fn analysis_parse_node_id(text: &str) -> i32:
@@ -426,18 +452,16 @@ fn analysis_node_subject(sema: &Sema, node: i32, fallback_path: &str, fallback_s
     let result: Vec[str] = Vec.new()
     var path = fallback_path
     var source = with_str_clone_ref(fallback_source)
-    for i in 0..sema.diags.items.len() as i32:
-        let diag = &sema.diags.items[i]
-        if diag.origin_node != node:
-            continue
-        let exact_source = sema.source_text_for_file_id(diag.primary.file)
-        if exact_source.len() > 0:
-            source = exact_source
-        for si in 0..sema.source_text_file_ids.len() as i32:
-            if sema.source_text_file_ids[si] == diag.primary.file:
-                path = sema.source_text_names[si]
-                break
-        break
+    // The parser owns a node's source identity. A diagnostic may itself
+    // have the wrong primary file; it cannot redefine the node's source.
+    let file = sema.ast.file(node as NodeId) as i32
+    let exact_source = sema.source_text_for_file_id(file)
+    if exact_source.len() > 0:
+        source = exact_source
+    for si in 0..sema.source_text_file_ids.len() as i32:
+        if sema.source_text_file_ids[si] == file:
+            path = sema.source_text_names[si]
+            break
     result.push(with_str_clone_ref(path))
     result.push(source)
     result
@@ -474,6 +498,7 @@ fn analysis_collect_ast_node_tree(report: &AnalysisReport, sema: &Sema, node: i3
     let symbol_name = if symbol != 0: with_str_clone_ref(sema.pool_resolve(symbol)) else: ""
     let type_name = if typed.is_some(): sema.type_name(typed.unwrap()) else: "<untyped>"
     fact.detail = f"role={role} kind={analysis_ast_node_kind_name(kind)} raw=[{d0},{d1},{d2}] type={type_name} resolved={if resolved.is_some(): resolved.unwrap() else: 0} symbol={symbol_name} start={sema.ast.get_start(node)} end={sema.ast.get_end(node)}"
+    fact.detail = fact.detail ++ analysis_closure_details(sema, node)
     fact = analysis_with_node_location(move fact, sema, node, path, source)
     report.add(move fact)
     if depth <= 0:
@@ -512,7 +537,9 @@ fn analysis_collect_signatures(report: &AnalysisReport, sema: &Sema, source_path
         sig.flags = if sema.sig_variadic[si] != 0: 1 else: 0
         sig.path = analysis_sig_path(sema, sym, source_path)
         sig.name = with_str_clone_ref(name)
-        sig.detail = f"params={sig.index} return={sig.type_id} variadic={sig.flags}"
+        let decl = sema.receiver_decl_node_for_sig(si)
+        sig.node = decl
+        sig.detail = f"params={sig.index} return={sig.type_id} variadic={sig.flags} decl-node={decl} name-decl-node={sema.fn_symbol_decl_node(sym)} declared-unsafe={sema.fn_decl_is_unsafe(decl)} name-unsafe={sema.fn_symbol_is_unsafe(sym)}"
         report.add(sig.owned_copy())
 
         for pi in 0..sema.sig_get_param_count(si):
@@ -571,6 +598,80 @@ fn analysis_collect_effect_edges(report: &AnalysisReport, sema: &Sema):
         report.add(move fact)
         at = at + 4
         edge = edge + 1
+
+fn analysis_global_location(fact: AnalysisFact, sema: &Sema, node: i32, source_path: &str, source_text: &str) -> AnalysisFact:
+    let subject = analysis_node_subject(sema, node, source_path, source_text)
+    var located = analysis_with_node_location(move fact, sema, node, subject[0], subject[1])
+    if node > 0 and node < sema.ast.node_count():
+        located.source_file = sema.ast.file(node as NodeId) as i32
+    located
+
+// Read the kept graph and traversal decisions; do not expand dispatchers or
+// resolve names again in the inspector, which would hide a missing edge.
+fn analysis_collect_global_effects(report: &AnalysisReport, sema: &Sema, source_path: &str, source_text: &str):
+    for wi in 0..sema.global_write_records.len() as i32 / 5:
+        let at = wi * 5
+        var fact = AnalysisFact.new(AnalysisStage.Sema, AnalysisFactKind.GlobalEffect)
+        fact.id = wi
+        fact.owner = sema.global_write_records[at]
+        fact.body_sym = if fact.owner >= 0 and fact.owner < sema.sig_names.len() as i32: sema.sig_names[fact.owner] else: 0
+        fact.symbol = sema.global_write_records[(at + 1)]
+        fact.flags = sema.global_write_records[(at + 4)]
+        fact.name = sema.pool_resolve(fact.symbol).clone()
+        fact.detail = f"write body={sema.global_effect_body_name(fact.owner)} body-id={fact.owner} kind={fact.flags}"
+        report.add(analysis_global_location(move fact, sema, sema.global_write_records[(at + 2)], source_path, source_text))
+    for ci in 0..sema.global_calls.len() as i32 / 8:
+        let at = ci * 8
+        var fact = AnalysisFact.new(AnalysisStage.Sema, AnalysisFactKind.GlobalEffect)
+        fact.id = ci
+        fact.index = 1
+        fact.owner = sema.global_calls[at]
+        fact.body_sym = if fact.owner >= 0 and fact.owner < sema.sig_names.len() as i32: sema.sig_names[fact.owner] else: 0
+        fact.parent = sema.global_calls[(at + 5)]
+        fact.flags = sema.global_calls[(at + 6)]
+        fact.symbol = sema.global_calls[(at + 7)]
+        fact.name = sema.global_effect_body_name(fact.owner)
+        let target_start = sema.global_calls[(at + 3)]
+        let target_count = sema.global_calls[(at + 4)]
+        fact.detail = f"call callee={sema.global_effect_body_name(fact.parent)} site-kind={fact.flags} subject={sema.pool_resolve(fact.symbol)}"
+        for ti in target_start..target_start + target_count:
+            let target = sema.global_call_targets[ti * 3]
+            fact.detail = fact.detail ++ f" target={target}:{sema.global_effect_body_name(target)}"
+        report.add(analysis_global_location(move fact, sema, sema.global_calls[(at + 1)], source_path, source_text))
+    for vi in 0..sema.global_view_call_checks.len() as i32 / 6:
+        let at = vi * 6
+        var fact = AnalysisFact.new(AnalysisStage.Sema, AnalysisFactKind.GlobalEffect)
+        fact.id = vi
+        fact.index = 2
+        fact.parent = sema.global_view_call_checks[at]
+        fact.symbol = sema.global_view_call_checks[(at + 1)]
+        fact.owner = sema.global_view_call_checks[(at + 2)]
+        fact.flags = sema.global_view_call_checks[(at + 5)]
+        fact.name = sema.pool_resolve(fact.symbol).clone()
+        fact.detail = f"live-view call={fact.parent} view={sema.pool_resolve(fact.owner)} last-use={sema.global_view_call_checks[(at + 4)]}"
+        report.add(analysis_global_location(move fact, sema, sema.global_view_call_checks[(at + 3)], source_path, source_text))
+    for di in 0..sema.global_drop_impl_targets.len() as i32 / 3:
+        let at = di * 3
+        let decl = sema.global_drop_impl_targets[(at + 1)]
+        var fact = AnalysisFact.new(AnalysisStage.Sema, AnalysisFactKind.GlobalEffect)
+        fact.id = di
+        fact.index = 3
+        fact.parent = sema.global_drop_impl_targets[at]
+        fact.type_id = sema.global_drop_impl_targets[(at + 2)]
+        fact.symbol = sema.ast.get_data0(decl)
+        fact.name = sema.pool_resolve(fact.symbol).clone()
+        fact.detail = f"drop-target dyn={sema.type_name(fact.parent)} target-type={sema.type_name(fact.type_id)} lookup-context={sema.global_drop_impl_contexts[di]} branch=" ++ (if fact.type_id > 0: "enqueue-target" else: "skip-target")
+        report.add(analysis_global_location(move fact, sema, decl, source_path, source_text))
+    for tid in 1..sema.type_kinds.len() as i32:
+        if not sema.global_user_drop_types.contains(tid): continue
+        var fact = AnalysisFact.new(AnalysisStage.Sema, AnalysisFactKind.GlobalEffect)
+        fact.id = tid
+        fact.index = 4
+        fact.type_id = tid
+        fact.flags = sema.global_user_drop_types.get(tid).unwrap()
+        fact.name = sema.type_name(tid)
+        fact.detail = f"drop-type user-drop={fact.flags}"
+        report.add(move fact)
 
 fn analysis_collect_specializations(report: &AnalysisReport, sema: &Sema, source_path: &str):
     for si in 0..sema.concrete_specialization_nodes.len() as i32:
@@ -671,9 +772,9 @@ fn analysis_collect_method_resolutions(report: &AnalysisReport, sema: &Sema, sou
         fact = analysis_with_node_location(move fact, sema, mres_node, source_path, source_text)
         report.add(move fact)
 
-fn analysis_collect_diagnostics(report: &AnalysisReport, sema: &Sema):
-    for i in 0..sema.diags.items.len() as i32:
-        let diag = &sema.diags.items[i]
+fn analysis_collect_diagnostics(report: &AnalysisReport, sema: &Sema, diagnostics: &DiagnosticList):
+    for i in 0..diagnostics.items.len() as i32:
+        let diag = &diagnostics.items[i]
         var fact = AnalysisFact.new(AnalysisStage.Diagnostic, AnalysisFactKind.Diagnostic)
         fact.id = i
         fact.node = diag.origin_node
@@ -697,7 +798,11 @@ fn analysis_collect_diagnostics(report: &AnalysisReport, sema: &Sema):
             fact.line = analysis_line_for_offset(subject_source, diag.primary.start)
             fact.column = analysis_column_for_offset(subject_source, diag.primary.start)
         fact.path = if subject.len() > 0: subject else: diag.origin_file.clone()
-        fact.detail = diag.origin_fn ++ ": " ++ diag.message ++ f" subject-file={diag.primary.file}"
+        let node_file = sema.ast.file(diag.origin_node as NodeId) as i32
+        fact.detail = diag.origin_fn ++ ": " ++ diag.message ++ f" subject-file={diag.primary.file} origin-node-file={node_file} emitter={diag.origin_file}:{diag.origin_line}"
+        for li in 0..diag.labels.len() as i32:
+            let span = diag.labels[li].span
+            fact.detail = fact.detail ++ f" label[{li}]={span.file}:{span.start}:{span.end}"
         report.add(move fact)
 
 fn analysis_collect_phase(report: &AnalysisReport, sema: &Sema):
@@ -718,10 +823,10 @@ fn analysis_collect_sema(report: &AnalysisReport, sema: &Sema, source_path: &str
     analysis_collect_expressions(report, sema)
     analysis_collect_signatures(report, sema, source_path)
     analysis_collect_effect_edges(report, sema)
+    analysis_collect_global_effects(report, sema, source_path, source_text)
     analysis_collect_specializations(report, sema, source_path)
     analysis_collect_resolved_calls(report, sema, source_path, source_text)
     analysis_collect_method_resolutions(report, sema, source_path, source_text)
-    analysis_collect_diagnostics(report, sema)
     analysis_collect_foreign_contracts(report, sema, source_path, source_text)
 
 fn analysis_operand_kind_name(kind: i32) -> str:
@@ -896,16 +1001,12 @@ fn analysis_audit_effects(report: &AnalysisReport, sema: &Sema):
         if caller_sig < 0 or callee_sig < 0 or caller_pi < 0 or callee_pi < 0:
             report.fail("effect edge contains a negative signature or parameter")
             continue
-        let caller_ty = sema.sig_param_type(caller_sig, caller_pi)
-        let caller_kind = if caller_ty > 0: sema.get_type_kind(sema.resolve_alias(caller_ty as TypeId)) else: TypeKind.TY_ERR
-        if caller_kind == TypeKind.TY_REF or caller_kind == TypeKind.TY_PTR:
-            continue
         // #927: the same transfer the fixpoint applies — projection edges demote
         // consume/escape to write (D17) — so the audit checks the rule, not a
         // stronger restatement of it.
         let callee_ty = sema.sig_param_type(callee_sig, callee_pi)
         let callee_is_copy = if callee_ty > 0: sema.is_copy_frozen(callee_ty as TypeId) else: 1
-        let propagated = sema.effect_edge_transfer(callee_sig, callee_pi, projection, callee_is_copy)
+        let propagated = sema.effect_edge_transfer(caller_sig, caller_pi, callee_sig, callee_pi, projection, callee_is_copy)
         let caller = sema.sig_param_effect(caller_sig, caller_pi)
         if (caller & propagated) != propagated:
             report.fail(f"effect edge sig {caller_sig}:{caller_pi} -> {callee_sig}:{callee_pi} is not at fixpoint; missing={propagated & ~caller}")
@@ -2167,13 +2268,16 @@ fn analysis_explain_effect(sema: &Sema, target: &str, source_path: &str) -> str:
             if want_pi >= 0 and pi != want_pi:
                 continue
             let eff = sema.sig_param_effect(si, pi)
-            out = out ++ f"  sig={si} param[{pi}] eff=[" ++ sema_effect_bits_text(eff) ++ "]\n"
+            let raw = if (eff & EFF_RAW_PTR_VALIDITY) != 0: "raw_ptr_validity" else: "none"
+            out = out ++ f"  sig={si} param[{pi}] eff=[" ++ sema_effect_bits_text(eff) ++ f"] internal=[{raw}]\n"
             if (eff & EFF_CONSUME) != 0:
                 out = out ++ "  consume:\n" ++ analysis_explain_effect_chain(sema, si, pi, 0, source_path)
             if (eff & EFF_ESCAPE_VALUE) != 0:
                 out = out ++ "  escape_value:\n" ++ analysis_explain_effect_chain(sema, si, pi, 1, source_path)
             if (eff & EFF_WRITE) != 0:
                 out = out ++ "  write:\n" ++ analysis_explain_effect_chain(sema, si, pi, 2, source_path)
+            if (eff & EFF_RAW_PTR_VALIDITY) != 0:
+                out = out ++ "  raw_ptr_validity:\n" ++ analysis_explain_effect_chain(sema, si, pi, 3, source_path)
     if found == 0:
         out = out ++ "  (no signature matched; use the exact finalized name, e.g. Type.method)\n"
     out
@@ -2368,9 +2472,12 @@ pub fn compiler_analysis_render(report: &AnalysisReport, request: &str) -> str:
     if request.starts_with("lldb:"): return analysis_lldb_recipe(report, analysis_slice(request, 5, request.len() as i32))
     "error: unknown analysis request '" ++ request ++ "'\n"
 
-pub fn compiler_analysis_run(sema: &Sema, mir_mod: &MirModule, pool: &InternPool, source_path: &str, source_text: &str, request: &str) -> CompilerAnalysisResult:
+pub fn compiler_analysis_run(sema: &Sema, mir_mod: &MirModule, pool: &InternPool, source_path: &str, source_text: &str, request: &str, diagnostics: &DiagnosticList) -> CompilerAnalysisResult:
     let report = AnalysisReport.init()
     analysis_collect_sema(&report, sema, source_path, source_text)
+    // The frontend moved the diagnostics out of Sema. Read the current
+    // owner's list, including when compilation failed before MIR (#1945).
+    analysis_collect_diagnostics(&report, sema, diagnostics)
     analysis_collect_requested_node(&report, sema, request, source_path, source_text)
     analysis_collect_mir(&report, mir_mod, sema, pool, source_path, source_text)
     var text = ""

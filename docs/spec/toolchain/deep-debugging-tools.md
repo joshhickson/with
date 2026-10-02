@@ -138,7 +138,15 @@ and the actual LLVM marshalling/prologue branches used for production codegen.
 ./out/stage/bin/with-stage2 analyze repro.w 'lldb:kind=call,name~target_fn'
 ./out/stage/bin/with-stage2 analyze repro.w contract
 ./out/stage/bin/with-stage2 analyze repro.w audit:contract
+./out/stage/bin/with-stage2 analyze repro.w 'select:stage=sema,kind=global-effect'
 ```
+
+The global-effect view reads recorded writes, calls and their expanded targets,
+live-view checks, cached user-drop decisions and dynamic-drop target resolution.
+Its `drop-target` rows retain the lookup context and the actual enqueue/skip
+branch; inspecting the graph does not resolve names or expand it again.
+Signature rows include the canonical declaration and name-based declaration
+lookup, with unsafe status read by the same Sema helper as acceptance checks.
 
 `contract` (D51 stage 10, ruling §63; `src/AnalysisContract.w`) prints the
 effective modeled foreign contract of every `c facade` block the program
@@ -585,6 +593,24 @@ The report names file sizes, whether the size differs, the first differing byte
 offset, and a small byte window around the mismatch. It does not yet attribute
 the difference to an object symbol; use `llvm-nm`, `otool`, or `lldb` after the
 byte offset narrows the search.
+
+## Declaration-Order Independence
+
+A function body's facts and diagnostics must not depend on which other
+bodies were checked first, except where the spec orders them (D43: a
+return type inferred from a body declared later is not known at an
+earlier call). `--sema-body-order-reverse` (or
+`WITH_SEMA_BODY_ORDER=reverse`) checks top-level bodies last to first;
+comparing a program's output with and without it shows a dependence:
+
+```sh
+with check file.w
+with check --sema-body-order-reverse file.w
+```
+
+`with build :sema-order-check` runs the comparison over every
+`test/compile_errors` fixture (tools/sema_order_check.w) and fails on a
+difference outside `test/sema_order_allowlist.txt` (#1941).
 
 ## Debug Allocator
 

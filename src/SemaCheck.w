@@ -82,6 +82,32 @@ impl Sema:
             return 0
         self.fn_signature_return_type(method_flags, ret_ty as TypeId) as i32
 
+// The caller's local lexical environment — the scope-stack family (#664:
+// all nine bind_* members and the moved_field_* satellites), the scope map
+// and the pending generic bindings — set aside while another body is
+// checked in the middle of it (a concrete generic instance, or a body
+// checked on demand for its inferred return type).
+type SemaLexicalEnv {
+    bind_names: Vec[i32],
+    bind_types: Vec[i32],
+    bind_muts: Vec[i32],
+    bind_states: Vec[i32],
+    bind_is_task: Vec[i32],
+    bind_task_used: Vec[i32],
+    bind_is_scoped_task: Vec[i32],
+    bind_is_view_bound: Vec[i32],
+    moved_field_base_syms: Vec[i32],
+    moved_field_path_starts: Vec[i32],
+    moved_field_path_counts: Vec[i32],
+    moved_field_path_syms: Vec[i32],
+    bind_provenance: Vec[BindingProvenance],
+    scope_starts: Vec[i32],
+    scope_name_map: HashMap[i32, i32],
+    pending_generic_binding_base: HashMap[i32, i32],
+    pending_generic_binding_call: HashMap[i32, i32],
+    pending_generic_binding_decl: HashMap[i32, i32],
+}
+
 type SemaTraitImplMethodContract {
     ok: i32,
     trait_sym: i32,
@@ -2002,8 +2028,14 @@ impl Sema:
     mut fn check_bodies():
         let count = self.ast.decl_count()
         self.prepare_body_order(count)
+        // WITH_SEMA_BODY_ORDER=reverse checks top-level bodies last to first
+        // (the callee-first dependencies still apply): a program whose facts
+        // or diagnostics change under it depends on declaration order.
+        let reverse = with_getenv_str("WITH_SEMA_BODY_ORDER") == "reverse"
+        self.publish_trait_contract_returns(count)
         for di in 0..count:
-            self.check_decl_body_in_order(di)
+            self.check_decl_body_in_order(if reverse: count - 1 - di else: di)
+        self.resolve_allocating_callees()
         // A call typed before its callee's body was: wrong only if that body
         // turned out to produce a value.
         let saved_file_id: i32 = self.local_file_id
@@ -2076,9 +2108,13 @@ impl Sema:
             self.body_order_state.push(0)
             self.body_order_lower.push(below)
             self.body_typed_next.push(-1)
+        self.body_decl_by_fn = sema_new_map_i32_i32()
         for di in 0..count:
             let decl = self.ast.get_decl(di)
             if self.ast.kind(decl) != NodeKind.NK_FN_DECL: continue
+            let fn_sym = self.fn_decl_semantic_symbol_at(decl, self.ast.get_data0(decl), di)
+            if fn_sym != 0 and not self.body_decl_by_fn.contains(fn_sym):
+                self.body_decl_by_fn.insert(fn_sym, di)
             let meta = self.ast.find_fn_meta(decl)
             if meta < 0 or self.ast.fn_meta_tp_count(meta) != 0 or self.fn_decl_is_entry_point(decl) != 0: continue
             if self.ast.fn_meta_ret(meta) != 0 and not self.decl_returns_view(decl, di) and not self.decl_may_store_view_into_receiver(decl, di): continue
@@ -2091,6 +2127,33 @@ impl Sema:
             let earlier: i32 = self.body_typed_decls.get(bare) ?? -1
             self.body_typed_next[di] = earlier
             self.body_typed_decls.insert(bare, di)
+
+    // D43 (§4.10): a function written without a return type has the type
+    // its body gives it, so a use of it — a call, or the function as a
+    // value — has its body checked first, whatever order bodies are
+    // otherwise checked in. Only a body still in progress (a cycle) is
+    // unknown at the use; check_bodies reports that. prepare_body_order
+    // finds the calls a body makes by name before checking it; this covers
+    // the uses it cannot see (a value, a call inside a generic instance).
+    mut fn ensure_body_typed(fn_sym: i32, sig_idx: i32):
+        if sig_idx < 0 or fn_sym == 0 or fn_sym == self.current_fn_symbol or self.body_typed_sigs.contains(sig_idx):
+            return
+        let di: i32 = self.body_decl_by_fn.get(fn_sym) ?? -1
+        if di < 0 or di >= self.body_order_state.len() as i32 or self.body_order_state[di] != 0:
+            return
+        let decl = self.ast.get_decl(di)
+        let meta = self.ast.find_fn_meta(decl)
+        if meta < 0 or self.ast.fn_meta_ret(meta) != 0 or self.ast.fn_meta_tp_count(meta) != 0 or self.fn_decl_is_entry_point(decl) != 0:
+            return
+        let saved_file_id: i32 = self.local_file_id
+        let saved_module_path = move self.current_module_path
+        let saved_module_has_ci: i32 = self.current_module_has_ci
+        let caller_env = self.enter_callee_lexical_env()
+        self.check_decl_body_in_order(di)
+        self.leave_callee_lexical_env(caller_env)
+        self.local_file_id = saved_file_id
+        self.current_module_path = move saved_module_path
+        self.current_module_has_ci = saved_module_has_ci
 
     mut fn check_decl_body_in_order(di: i32):
         if self.body_order_state[di] != 0: return
@@ -2224,8 +2287,17 @@ impl Sema:
                 self.global_race_mutated_syms.insert(sym, 1)
                 self.global_race_mutation_nodes.insert(sym, node)
         if self.in_unsafe != 0:
-            if kind == GLOBAL_RACE_ACCESS_WRITE or self.is_mutable_global(sym) != 0 or self.global_race_mutated_syms.contains(sym):
+            if kind == GLOBAL_RACE_ACCESS_WRITE or self.is_mutable_global(sym) != 0:
                 self.note_unsafe_operation()
+            else:
+                // A read's need for unsafe depends on whether any body writes
+                // this global. Keep its lexical scopes; do not read the partial
+                // mutation set while bodies are still being checked.
+                for si in 0..self.unsafe_scope_nodes.len() as i32:
+                    if self.unsafe_scope_used[si] == 0:
+                        self.unsafe_scope_used[si] = 2
+                    self.unsafe_global_scope_reads.push(self.unsafe_scope_nodes[si])
+                    self.unsafe_global_scope_reads.push(sym)
 
     mut fn record_global_place_write(place_node: i32, report_node: i32):
         let root = self.place_root_sym(place_node)
@@ -2639,7 +2711,11 @@ impl Sema:
                     if self.ast.kind(decl) != NodeKind.NK_IMPL_DECL or self.ast.get_data2(decl) != trait_sym:
                         continue
                     let target_sym = self.ast.get_data0(decl)
-                    let target = self.lookup_named_type_visible(target_sym)
+                    let target = self.impl_decl_target_types.get(decl) ?? 0
+                    self.global_drop_impl_targets.push(t)
+                    self.global_drop_impl_targets.push(decl)
+                    self.global_drop_impl_targets.push(target)
+                    self.global_drop_impl_contexts.push(self.decl_source_path_for_node(decl))
                     if target > 0:
                         work.push(self.resolve_alias(target as TypeId) as i32)
                     for ti in 1..self.type_kinds.len() as i32:
@@ -3396,6 +3472,50 @@ impl Sema:
             }
         sema_trait_impl_method_contract_missing()
 
+    // A trait impl's method written without a return type returns what the
+    // trait declares: a fact of the declarations, published before any body
+    // is checked. It was set when the method's own body finished, so a call
+    // checked earlier — `print(42)` reaching `i32.to_str` through `print[T]`
+    // when `main` is checked first — read `Unit` (#1941 class; the
+    // declaration order does not make it unknown, §4.10 D43 concerns bodies).
+    mut fn publish_trait_contract_returns(count: i32):
+        for di in 0..count:
+            let decl = self.ast.get_decl(di)
+            if self.ast.kind(decl) != NodeKind.NK_FN_DECL or self.decl_is_lazy_skipped(di) or self.ast.fn_decl_body_is_interface(decl):
+                continue
+            let meta = self.ast.find_fn_meta(decl)
+            if meta < 0 or self.ast.fn_meta_ret(meta) != 0 or self.ast.fn_meta_tp_count(meta) != 0:
+                continue
+            let fn_name = self.fn_decl_semantic_symbol_at(decl, self.ast.get_data0(decl), di)
+            let sig_idx = self.get_sig(fn_name)
+            if sig_idx < 0 or not self.method_impl_nodes.contains(fn_name):
+                continue
+            let owner_sym = self.method_decl_owner_symbol(decl, self.ast.get_data0(decl))
+            if owner_sym != 0 and self.type_decl_nodes.contains(owner_sym) and self.type_decl_tp_count(self.type_decl_nodes.get(owner_sym).unwrap()) != 0:
+                continue
+            self.update_decl_source_context(di)
+            let saved_self = if self.named_types.contains(self.syms.self_type): self.named_types.get(self.syms.self_type).unwrap() else: 0
+            let self_tid = if owner_sym != 0: self.lookup_named_type_visible(owner_sym) else: 0
+            if self_tid != 0:
+                self.named_types.insert(self.syms.self_type, self_tid)
+            self.assoc_type_bindings.clear()
+            let impl_nd: i32 = self.method_impl_nodes.get(fn_name).unwrap()
+            let impl_ex = self.ast.get_data1(impl_nd)
+            for iai in 0..self.ast.get_extra(impl_ex):
+                let at_tid = self.resolve_type_expr(self.ast.get_extra(impl_ex + 1 + iai * 2 + 1))
+                if at_tid != 0:
+                    self.assoc_type_bindings.insert(self.ast.get_extra(impl_ex + 1 + iai * 2), at_tid as i32)
+            let contract = self.trait_impl_method_contract(decl, fn_name)
+            if contract.ok != 0 and contract.ret_type != 0:
+                let contract_ret = self.fn_signature_return_type(self.ast.get_data2(decl), contract.ret_type as TypeId)
+                self.set_sig_return_type(sig_idx, contract_ret as i32)
+                self.body_typed_sigs.insert(sig_idx, 1)
+            self.assoc_type_bindings.clear()
+            if saved_self != 0:
+                self.named_types.insert(self.syms.self_type, saved_self)
+            else if self_tid != 0:
+                self.named_types.remove(self.syms.self_type)
+
     mut fn check_trait_impl_method_signature_contract(node: i32, sig_idx: i32, contract: &SemaTraitImplMethodContract, has_ret_annotation: bool):
         if contract.ok == 0 or sig_idx < 0:
             return
@@ -3454,6 +3574,15 @@ impl Sema:
         let saved_no_alloc_depth: i32 = self.current_no_alloc_depth
         let saved_fn_may_alloc: i32 = self.current_fn_may_alloc
         let saved_current_fn_symbol: i32 = self.current_fn_symbol
+        // A generic or callee-first body is checked inside its caller, but
+        // its operations do not belong to the caller's lexical unsafe block.
+        // The callee's own unsafe declaration/block establishes its context.
+        let saved_body_unsafe: i32 = self.in_unsafe
+        let saved_unsafe_scope_used = move self.unsafe_scope_used
+        let saved_unsafe_scope_nodes = move self.unsafe_scope_nodes
+        self.in_unsafe = 0
+        self.unsafe_scope_used = Vec.new()
+        self.unsafe_scope_nodes = Vec.new()
         self.current_fn_may_alloc = 0
         self.current_fn_symbol = fn_name
         if self.no_alloc_fns.contains(fn_name):
@@ -3846,7 +3975,6 @@ impl Sema:
         // For &T/*T-typed params, clamp to effects they can semantically carry.
         // References may carry returned-view origins; raw pointers carry raw
         // validity preconditions instead. Neither owns through the parameter.
-        var raw_validity_param_sym = 0
         // A facade declared this signature's summary before any body was
         // checked (facade_declare_view_of_param: a constructor's dependency
         // facts, a text/record view's `from param N`); the rendered body
@@ -3889,8 +4017,6 @@ impl Sema:
                     self.set_sig_param_view_origin(sig_idx, pi, self.current_fn_param_origins[pi] | declared_origin)
                 else:
                     self.set_sig_param_view_origin(sig_idx, pi, declared_origin)
-                if raw_validity_param_sym == 0 and (eff & EFF_RAW_PTR_VALIDITY) != 0 and pi < self.current_fn_param_syms.len() as i32:
-                    raw_validity_param_sym = self.current_fn_param_syms[pi]
             // D63 call-once: published for every parameter — a callable
             // parameter that is only invoked accrues no effect bits, so this
             // sits outside the `eff != 0` guard above.
@@ -3903,9 +4029,6 @@ impl Sema:
                     let once_name: str = with_str_clone_ref(self.pool_resolve(invoke_sym))
                     self.emit_error("`" ++ once_name ++ "` is declared `once`, but this body may invoke it more than once — a second call, or a call inside a loop (§12.4)", self.fn_param_many_nodes.get(invoke_sym) ?? node)
 
-        if raw_validity_param_sym != 0 and self.fn_symbol_is_unsafe(fn_name) == 0:
-            let param_name: str = self.pool_resolve(raw_validity_param_sym)
-            self.emit_error(f"safe function relies on caller-guaranteed raw pointer validity for parameter '{param_name}'; declare it unsafe fn or model a safe pointer contract", node)
         if self.current_fn_may_alloc != 0:
             self.fn_may_alloc.insert(fn_name, 1)
         else:
@@ -3960,6 +4083,9 @@ impl Sema:
             self.implicit_binding_types.pop()
             self.implicit_binding_syms.pop()
         self.pop_scope()
+        self.in_unsafe = saved_body_unsafe
+        self.unsafe_scope_used = move saved_unsafe_scope_used
+        self.unsafe_scope_nodes = move saved_unsafe_scope_nodes
         if body_self_tid != 0:
             if saved_body_self != 0:
                 self.named_types.insert(self.syms.self_type, saved_body_self)
@@ -5341,6 +5467,94 @@ impl Sema:
         for pi in 0..param_concrete_tys.len() as i32:
             self.concrete_specialization_param_types.push(param_concrete_tys[pi])
 
+    // Sets the caller's locals aside and leaves the module-level scope (every
+    // module's globals, below scope_starts[1]) in place: a body checked in the
+    // middle of another reads its module's `let`/`const` as any body does
+    // (#1743), never the caller's locals. Visibility is still decided per
+    // lookup against the callee's module.
+    mut fn enter_callee_lexical_env() -> SemaLexicalEnv:
+        let caller = SemaLexicalEnv {
+            bind_names: move self.bind_names,
+            bind_types: move self.bind_types,
+            bind_muts: move self.bind_muts,
+            bind_states: move self.bind_states,
+            bind_is_task: move self.bind_is_task,
+            bind_task_used: move self.bind_task_used,
+            bind_is_scoped_task: move self.bind_is_scoped_task,
+            bind_is_view_bound: move self.bind_is_view_bound,
+            moved_field_base_syms: move self.moved_field_base_syms,
+            moved_field_path_starts: move self.moved_field_path_starts,
+            moved_field_path_counts: move self.moved_field_path_counts,
+            moved_field_path_syms: move self.moved_field_path_syms,
+            bind_provenance: move self.bind_provenance,
+            scope_starts: move self.scope_starts,
+            scope_name_map: move self.scope_name_map,
+            pending_generic_binding_base: move self.pending_generic_binding_base,
+            pending_generic_binding_call: move self.pending_generic_binding_call,
+            pending_generic_binding_decl: move self.pending_generic_binding_decl,
+        }
+        self.bind_names = Vec.new()
+        self.bind_types = Vec.new()
+        self.bind_muts = Vec.new()
+        self.bind_states = Vec.new()
+        self.bind_is_task = Vec.new()
+        self.bind_task_used = Vec.new()
+        self.bind_is_scoped_task = Vec.new()
+        self.bind_is_view_bound = Vec.new()
+        self.moved_field_base_syms = Vec.new()
+        self.moved_field_path_starts = Vec.new()
+        self.moved_field_path_counts = Vec.new()
+        self.moved_field_path_syms = Vec.new()
+        self.bind_provenance = Vec.new()
+        self.scope_starts = Vec.new()
+        self.scope_starts.push(0)
+        self.scope_name_map = HashMap.new()
+        self.pending_generic_binding_base = HashMap.new()
+        self.pending_generic_binding_call = HashMap.new()
+        self.pending_generic_binding_decl = HashMap.new()
+        let module_scope_len = if caller.scope_starts.len() > 1: caller.scope_starts[1] else: caller.bind_names.len() as i32
+        for gi in 0..module_scope_len:
+            let gsym = caller.bind_names[gi]
+            self.bind_names.push(gsym)
+            self.bind_types.push(caller.bind_types[gi])
+            self.bind_muts.push(caller.bind_muts[gi])
+            self.bind_states.push(caller.bind_states[gi])
+            self.bind_is_task.push(caller.bind_is_task[gi])
+            self.bind_task_used.push(caller.bind_task_used[gi])
+            self.bind_is_scoped_task.push(caller.bind_is_scoped_task[gi])
+            self.bind_is_view_bound.push(caller.bind_is_view_bound[gi])
+            self.bind_provenance.push(caller.bind_provenance[gi])
+            let mapped = caller.scope_name_map.get(gsym)
+            if mapped.is_some() and mapped.unwrap() == gi:
+                self.scope_name_map.insert(gsym, gi)
+        // A caller local that shadows a module global hid the global's map
+        // entry; the callee does not see the caller's local.
+        for sgi in 0..self.shadowed_global_syms.len() as i32:
+            if self.shadowed_global_indices[sgi] < module_scope_len:
+                self.scope_name_map.insert(self.shadowed_global_syms[sgi], self.shadowed_global_indices[sgi])
+        caller
+
+    mut fn leave_callee_lexical_env(caller: SemaLexicalEnv):
+        var env = caller
+        self.bind_names = move env.bind_names
+        self.bind_types = move env.bind_types
+        self.bind_muts = move env.bind_muts
+        self.bind_states = move env.bind_states
+        self.bind_is_task = move env.bind_is_task
+        self.bind_task_used = move env.bind_task_used
+        self.bind_is_scoped_task = move env.bind_is_scoped_task
+        self.bind_is_view_bound = move env.bind_is_view_bound
+        self.moved_field_base_syms = move env.moved_field_base_syms
+        self.moved_field_path_starts = move env.moved_field_path_starts
+        self.moved_field_path_counts = move env.moved_field_path_counts
+        self.moved_field_path_syms = move env.moved_field_path_syms
+        self.bind_provenance = move env.bind_provenance
+        self.scope_starts = move env.scope_starts
+        self.scope_name_map = move env.scope_name_map
+        self.pending_generic_binding_base = move env.pending_generic_binding_base
+        self.pending_generic_binding_call = move env.pending_generic_binding_call
+        self.pending_generic_binding_decl = move env.pending_generic_binding_decl
+
     mut fn check_fn_body_concrete(fn_node: i32, tp_syms: &Vec[i32], tp_sema_tys: &Vec[i32], mono_sym: i32, param_concrete_tys: &Vec[i32]) -> i32:
         let fn_name = self.ast.get_data0(fn_node)
         let body = self.ast.get_data1(fn_node)
@@ -5461,74 +5675,7 @@ impl Sema:
 
         // Concrete generic validation must run in the callee's own lexical
         // environment, not inside the caller's active local scopes.
-        let saved_bind_names = move self.bind_names
-        let saved_bind_types = move self.bind_types
-        let saved_bind_muts = move self.bind_muts
-        let saved_bind_states = move self.bind_states
-        let saved_bind_is_task = move self.bind_is_task
-        let saved_bind_task_used = move self.bind_task_used
-        let saved_bind_is_scoped_task = move self.bind_is_scoped_task
-        // #664: bind_is_view_bound is the 9th member of the scope-stack
-        // family (scope_insert_at pushes all 9) and the moved_field_* vecs
-        // are its satellites; skipping them here left the inner environment
-        // pushing view-bound flags into the OUTER vec — lengths diverged and
-        // inner bindings read the caller's flags at their aligned indices.
-        let saved_bind_is_view_bound = move self.bind_is_view_bound
-        let saved_moved_field_base_syms = move self.moved_field_base_syms
-        let saved_moved_field_path_starts = move self.moved_field_path_starts
-        let saved_moved_field_path_counts = move self.moved_field_path_counts
-        let saved_moved_field_path_syms = move self.moved_field_path_syms
-        let saved_bind_provenance = move self.bind_provenance
-        let saved_scope_starts = move self.scope_starts
-        let saved_scope_name_map = move self.scope_name_map
-        let saved_pending_generic_binding_base = move self.pending_generic_binding_base
-        let saved_pending_generic_binding_call = move self.pending_generic_binding_call
-        let saved_pending_generic_binding_decl = move self.pending_generic_binding_decl
-        self.bind_names = Vec.new()
-        self.bind_types = Vec.new()
-        self.bind_muts = Vec.new()
-        self.bind_states = Vec.new()
-        self.bind_is_task = Vec.new()
-        self.bind_task_used = Vec.new()
-        self.bind_is_scoped_task = Vec.new()
-        self.bind_is_view_bound = Vec.new()
-        self.moved_field_base_syms = Vec.new()
-        self.moved_field_path_starts = Vec.new()
-        self.moved_field_path_counts = Vec.new()
-        self.moved_field_path_syms = Vec.new()
-        self.bind_provenance = Vec.new()
-        self.scope_starts = Vec.new()
-        self.scope_starts.push(0)
-        self.scope_name_map = HashMap.new()
-        self.pending_generic_binding_base = HashMap.new()
-        self.pending_generic_binding_call = HashMap.new()
-        self.pending_generic_binding_decl = HashMap.new()
-        // #1743: the callee's lexical environment is its module's, and the
-        // module-level scope (every module's globals, below scope_starts[1])
-        // is part of it: a generic body reads its module's `let`/`const`
-        // exactly as a non-generic body does. Only the caller's locals stay
-        // out. Visibility is still decided per lookup against the callee's
-        // module (update_fn_source_context above).
-        let module_scope_len = if saved_scope_starts.len() > 1: saved_scope_starts[1] else: saved_bind_names.len() as i32
-        for gi in 0..module_scope_len:
-            let gsym = saved_bind_names[gi]
-            self.bind_names.push(gsym)
-            self.bind_types.push(saved_bind_types[gi])
-            self.bind_muts.push(saved_bind_muts[gi])
-            self.bind_states.push(saved_bind_states[gi])
-            self.bind_is_task.push(saved_bind_is_task[gi])
-            self.bind_task_used.push(saved_bind_task_used[gi])
-            self.bind_is_scoped_task.push(saved_bind_is_scoped_task[gi])
-            self.bind_is_view_bound.push(saved_bind_is_view_bound[gi])
-            self.bind_provenance.push(saved_bind_provenance[gi])
-            let mapped = saved_scope_name_map.get(gsym)
-            if mapped.is_some() and mapped.unwrap() == gi:
-                self.scope_name_map.insert(gsym, gi)
-        // A caller local that shadows a module global hid the global's map
-        // entry; the callee does not see the caller's local.
-        for sgi in 0..self.shadowed_global_syms.len() as i32:
-            if self.shadowed_global_indices[sgi] < module_scope_len:
-                self.scope_name_map.insert(self.shadowed_global_syms[sgi], self.shadowed_global_indices[sgi])
+        let caller_env = self.enter_callee_lexical_env()
 
         // Type-check body with concrete substitutions installed. Generic bodies
         // may still become invalid after instantiation (for example `T + T`
@@ -5539,24 +5686,7 @@ impl Sema:
         self.in_concrete_generic_body = saved_concrete_generic_body
         self.register_concrete_specialization(fn_node, mono_sym, sig_idx, tp_syms, tp_sema_tys, param_concrete_tys)
 
-        self.bind_names = saved_bind_names
-        self.bind_types = saved_bind_types
-        self.bind_muts = saved_bind_muts
-        self.bind_states = saved_bind_states
-        self.bind_is_task = saved_bind_is_task
-        self.bind_task_used = saved_bind_task_used
-        self.bind_is_scoped_task = saved_bind_is_scoped_task
-        self.bind_is_view_bound = saved_bind_is_view_bound
-        self.moved_field_base_syms = saved_moved_field_base_syms
-        self.moved_field_path_starts = saved_moved_field_path_starts
-        self.moved_field_path_counts = saved_moved_field_path_counts
-        self.moved_field_path_syms = saved_moved_field_path_syms
-        self.bind_provenance = saved_bind_provenance
-        self.scope_starts = saved_scope_starts
-        self.scope_name_map = saved_scope_name_map
-        self.pending_generic_binding_base = saved_pending_generic_binding_base
-        self.pending_generic_binding_call = saved_pending_generic_binding_call
-        self.pending_generic_binding_decl = saved_pending_generic_binding_decl
+        self.leave_callee_lexical_env(caller_env)
 
         // Restore named_types
         for ti in 0..tp_count:
@@ -5794,11 +5924,56 @@ impl Sema:
             let label = self.alloc_construct_label(kind)
             self.emit_error(f"{label} allocates here; @[no_alloc] context forbids it", node)
 
+    // #1941: whether a callee allocates is known only once its body has been
+    // checked, which may be after this call's body. The call is recorded and
+    // judged by resolve_allocating_callees once every body is; a body checked
+    // after that (a concrete generic body MIR asks for) sees the final answer.
     mut fn note_allocating_callee(node: i32, fn_sym: i32):
         if fn_sym == 0:
             return
-        if self.fn_may_alloc.contains(fn_sym) and self.fn_may_alloc.get(fn_sym).unwrap() != 0:
-            self.note_allocation_site(node, AllocConstructKind.CALLEE, 0, 0)
+        if self.alloc_callee_calls_resolved != 0:
+            if (self.fn_may_alloc.get(fn_sym) ?? 0) != 0:
+                self.note_allocation_site(node, AllocConstructKind.CALLEE, 0, 0)
+            return
+        self.alloc_callee_calls.push(self.current_fn_symbol)
+        self.alloc_callee_calls.push(fn_sym)
+        self.alloc_callee_calls.push(node)
+        self.alloc_callee_calls.push(if self.current_no_alloc_depth != 0: 1 else: 0)
+        self.alloc_callee_calls.push(self.local_file_id)
+
+    // A function allocates when its own body does or when it calls one that
+    // does: the fixpoint over the recorded calls, then an error at each call
+    // an @[no_alloc] context makes to an allocating function.
+    mut fn resolve_allocating_callees():
+        let count = self.alloc_callee_calls.len() as i32
+        var changed = true
+        while changed:
+            changed = false
+            var ci = 0
+            while ci + 4 < count:
+                let owner = self.alloc_callee_calls[ci]
+                let callee = self.alloc_callee_calls[ci + 1]
+                if owner != 0 and (self.fn_may_alloc.get(owner) ?? 0) == 0 and (self.fn_may_alloc.get(callee) ?? 0) != 0:
+                    self.fn_may_alloc.insert(owner, 1)
+                    changed = true
+                ci = ci + 5
+        let saved_file_id: i32 = self.local_file_id
+        let saved_no_alloc_depth: i32 = self.current_no_alloc_depth
+        let saved_fn_may_alloc: i32 = self.current_fn_may_alloc
+        let saved_fn_symbol: i32 = self.current_fn_symbol
+        var ci = 0
+        while ci + 4 < count:
+            if self.alloc_callee_calls[ci + 3] != 0 and (self.fn_may_alloc.get(self.alloc_callee_calls[ci + 1]) ?? 0) != 0:
+                self.current_fn_symbol = self.alloc_callee_calls[ci]
+                self.local_file_id = self.alloc_callee_calls[ci + 4]
+                self.current_no_alloc_depth = 1
+                self.note_allocation_site(self.alloc_callee_calls[ci + 2], AllocConstructKind.CALLEE, 0, 0)
+            ci = ci + 5
+        self.local_file_id = saved_file_id
+        self.current_no_alloc_depth = saved_no_alloc_depth
+        self.current_fn_may_alloc = saved_fn_may_alloc
+        self.current_fn_symbol = saved_fn_symbol
+        self.alloc_callee_calls_resolved = 1
 
     fn no_alloc_allows_method_allocation(type_name_sym: i32, field: i32) -> i32:
         let type_name = self.pool_resolve(type_name_sym)
@@ -8086,6 +8261,27 @@ impl Sema:
         for i in 0..self.unsafe_scope_used.len() as i32:
             self.unsafe_scope_used[i] = 1
 
+    fn unsafe_scope_has_mutated_global(node: i32) -> bool:
+        var ri = 0
+        while ri + 1 < self.unsafe_global_scope_reads.len() as i32:
+            if self.unsafe_global_scope_reads[ri] == node and self.global_race_mutated_syms.contains(self.unsafe_global_scope_reads[ri + 1]):
+                return true
+            ri = ri + 2
+        false
+
+    mut fn finalize_unsafe_global_scope_checks():
+        let required: HashMap[i32, i32] = sema_new_map_i32_i32()
+        var ri = 0
+        while ri + 1 < self.unsafe_global_scope_reads.len() as i32:
+            if self.global_race_mutated_syms.contains(self.unsafe_global_scope_reads[ri + 1]):
+                required.insert(self.unsafe_global_scope_reads[ri], 1)
+            ri = ri + 2
+        self.unsafe_global_scopes_resolved = 1
+        for ni in 0..self.deferred_unsafe_global_scopes.len() as i32:
+            let node: i32 = self.deferred_unsafe_global_scopes[ni]
+            if not required.contains(node):
+                self.emit_error("unsafe block contains no unsafe operations", node)
+
     mut fn require_unsafe_operation(msg: &str, node: i32) -> i32:
         if self.in_unsafe == 0:
             self.emit_error(msg, node)
@@ -8110,25 +8306,83 @@ impl Sema:
             return
         if sema_path_is_migrated_regex_implementation(self.current_module_path) != 0:
             return
-        let root = self.place_root_sym(expr_node)
-        if root == 0:
-            return
-        self.note_raw_pointer_validity_param(root)
-        let dep_count = self.binding_view_dep_count(root)
-        for i in 0..dep_count:
-            self.note_raw_pointer_validity_param(self.binding_view_dep_at(root, i))
-        let origin_mask = self.binding_view_origin_mask(root)
-        if origin_mask != 0:
-            for pi in 0..self.current_fn_param_syms.len() as i32:
-                let bit = ((1 as i64) << (pi as u32)) as i32
-                if (origin_mask & bit) != 0:
-                    self.note_raw_pointer_validity_param(self.current_fn_param_syms[pi])
+        let origin_mask = self.raw_pointer_param_origin_mask(expr_node)
+        let saved_origin: i32 = self.effect_note_origin_node
+        self.effect_note_origin_node = expr_node
+        for pi in 0..self.current_fn_param_syms.len() as i32:
+            if (origin_mask & sema_param_origin_bit(pi)) != 0:
+                self.note_raw_pointer_validity_param(self.current_fn_param_syms[pi])
+        self.effect_note_origin_node = saved_origin
+
+    // Pointer-value origins differ from borrow origins: copying an address
+    // does not prove its pointee valid. Resolve local binding facts while
+    // checking the body, before its scope disappears.
+    fn raw_pointer_param_origin_mask(expr_node: i32) -> i32:
+        if self.current_fn_sig_idx < 0:
+            return 0
+        let expr_ty = self.typed_expr_types.get(expr_node) ?? 0
+        if expr_ty > 0 and self.type_is_raw_pointer_value(expr_ty) == 0:
+            return 0
+        var node = expr_node
+        var mask = 0
+        let seen: HashMap[i32, i32] = HashMap.new()
+        while node > 0 and not seen.contains(node):
+            seen.insert(node, 1)
+            let kind = self.ast.kind(node)
+            let root = self.place_root_sym(node)
+            if root != 0:
+                let pi = self.param_index_for_sym(root)
+                if pi >= 0 and self.type_is_raw_pointer_value(self.sig_param_type(self.current_fn_sig_idx, pi)) != 0:
+                    mask = mask | sema_param_origin_bit(pi)
+                mask = mask | self.binding_view_origin_mask(root)
+                for di in 0..self.binding_view_dep_count(root):
+                    let dep_pi = self.param_index_for_sym(self.binding_view_dep_at(root, di))
+                    if dep_pi >= 0 and self.type_is_raw_pointer_value(self.sig_param_type(self.current_fn_sig_idx, dep_pi)) != 0:
+                        mask = mask | sema_param_origin_bit(dep_pi)
+                if kind == NodeKind.NK_IDENT and pi < 0 and self.binding_value_nodes.contains(root):
+                    node = self.binding_value_nodes.get(root).unwrap()
+                    continue
+            if kind == NodeKind.NK_GROUPED or kind == NodeKind.NK_CAST:
+                node = self.ast.get_data0(node)
+            else if kind == NodeKind.NK_UNARY and self.ast.get_data0(node) == UnaryOp.UOP_DEREF:
+                node = self.ast.get_data1(node)
+            else:
+                break
+        var raw_params = 0
+        for pi in 0..self.current_fn_param_syms.len() as i32:
+            if self.type_is_raw_pointer_value(self.sig_param_type(self.current_fn_sig_idx, pi)) != 0:
+                raw_params = raw_params | sema_param_origin_bit(pi)
+        mask & raw_params
+
+    // §16.11: callers can be judged only after the transitive effects of
+    // every callee are complete. An unsafe block does not discharge a raw
+    // parameter's requirement for the caller of this function.
+    mut fn enforce_raw_pointer_contracts():
+        let seen: HashMap[i32, i32] = HashMap.new()
+        for si in 0..self.sig_names.len() as i32:
+            let node = self.receiver_decl_node_for_sig(si)
+            if node <= 0 or seen.contains(node) or self.fn_decl_is_unsafe(node) != 0:
+                continue
+            let meta = self.ast.find_fn_meta(node)
+            if meta < 0 or self.ast.get_data1(node) == 0 or self.ast.fn_decl_body_is_interface(node as NodeId):
+                continue
+            let param_start = self.ast.fn_meta_param_start(meta)
+            let param_count = self.ast.fn_meta_param_count(meta)
+            for pi in 0..self.sig_get_param_count(si):
+                if (self.sig_param_effect(si, pi) & EFF_RAW_PTR_VALIDITY) == 0 or pi >= param_count:
+                    continue
+                let param_name: str = self.pool_resolve(self.ast.fn_param_name(param_start, pi))
+                self.emit_error(f"safe function relies on caller-guaranteed raw pointer validity for parameter '{param_name}'; declare it unsafe fn or model a safe pointer contract", node)
+                seen.insert(node, 1)
+                break
 
     fn fn_decl_is_variadic_definition(fn_node: i32) -> bool:
         fn_node != 0 and self.ast.kind(fn_node) == NodeKind.NK_FN_DECL and (self.ast.get_data2(fn_node) / FnFlags.VARIADIC) % 2 == 1
 
     fn fn_symbol_is_unsafe(fn_sym: i32) -> i32:
-        let fn_node = self.fn_symbol_decl_node(fn_sym)
+        self.fn_decl_is_unsafe(self.fn_symbol_decl_node(fn_sym))
+
+    fn fn_decl_is_unsafe(fn_node: i32) -> i32:
         if fn_node == 0:
             return 0
         // D75 (§16.2b.5): a function defined with a trailing `...` is unsafe
@@ -8728,6 +8982,7 @@ impl Sema:
                 self.emit_warning("redundant unsafe prefix inside unsafe context", node)
             if tracks_use != 0:
                 self.unsafe_scope_used.push(0)
+                self.unsafe_scope_nodes.push(node)
             self.in_unsafe = 1
             let body = self.ast.get_data0(node)
             // Propagate expected type through unsafe block
@@ -8737,8 +8992,17 @@ impl Sema:
                 let used_idx = self.unsafe_scope_used.len() as i32 - 1
                 let used = if used_idx >= 0: self.unsafe_scope_used[used_idx] else: 0
                 let _ = self.unsafe_scope_used.pop()
+                let _ = self.unsafe_scope_nodes.pop()
                 if unsafe_result != 0 and used == 0:
                     self.emit_error("unsafe block contains no unsafe operations", node)
+                else if unsafe_result != 0 and used == 2:
+                    // Late generic bodies use completed facts immediately;
+                    // ordinary bodies leave this verdict to the module pass.
+                    if self.unsafe_global_scopes_resolved != 0:
+                        if not self.unsafe_scope_has_mutated_global(node):
+                            self.emit_error("unsafe block contains no unsafe operations", node)
+                    else:
+                        self.deferred_unsafe_global_scopes.push(node)
             if is_prefix and unsafe_result != 0 and self.unsafe_prefix_has_raw_access(body) == 0:
                 self.emit_error("unsafe prefix requires a raw pointer dereference or raw pointer index; use unsafe { ... } for compound unsafe expressions", node)
             return self.wrapper_tail_type(node, body, unsafe_result)
@@ -9410,6 +9674,7 @@ impl Sema:
 
         let sig_idx = self.get_visible_sig(sym)
         if sig_idx >= 0 and self.is_ci_visible(sym) != 0 and self.symbol_visible_from_current(sym) != 0:
+            self.ensure_body_typed(sym, sig_idx)
             let fn_tid: i32 = self.sig_type_ids[sig_idx]
             // An async fn referenced as a value can be called through the value
             // later; the call site no longer knows it spawns — record here.
@@ -13527,9 +13792,9 @@ impl Sema:
     mut fn emit_pull_error(msg: &str, site: i32, pull_node: i32):
         if self.suppress_errors != 0:
             return
-        let primary = Span { file: self.local_file_id, start: self.ast.get_start(site), end: self.ast.get_end(site) }
+        let primary = self.diagnostic_node_span(site)
         var diag = Diagnostic.err(msg, primary)
-        diag.add_label(Span { file: self.local_file_id, start: self.ast.get_start(pull_node), end: self.ast.get_end(pull_node) }, "pulled here")
+        diag.add_label(self.diagnostic_node_span(pull_node), "pulled here")
         diag.set_origin(__FILE__, __FN__, __LINE__ as i32, site)
         self.diags.emit(move diag)
 
@@ -13919,8 +14184,8 @@ impl Sema:
             self.recording_propagated_effect = self.recording_propagated_effect + 1
             self.note_place_effect(arg_node, trans_bits)
             self.recording_propagated_effect = self.recording_propagated_effect - 1
-        if (param_eff & EFF_RAW_PTR_VALIDITY) != 0:
-            self.note_raw_pointer_validity_precondition(arg_node)
+        // Raw validity follows recorded parameter-origin edges after every
+        // body is complete, never an order-dependent partial callee summary.
 
     mut fn propagate_method_call_param_effects(call_node: i32, sig_idx: i32, param_offset: i32, recv_node: i32, extra_start: i32, arg_count: i32, has_resolved: i32):
         if sig_idx < 0:
@@ -13952,10 +14217,9 @@ impl Sema:
                     self.note_view_store(store_target, arg_node, stored_ty, self.sig_param_type(sig_idx, param_i), call_node, "this call")
                 // #D5/P0: record caller-param → callee-param edge (method path).
                 self.record_effect_edge(sig_idx, param_i, arg_node)
-                // D5/P1 §3.8: method arguments use the same deferred ownership
-                // decision as ordinary calls. A plain value is share-place unless
-                // the callee's FINAL effect makes the parameter owned; only then
-                // does finalize_call_site_ownership require explicit move/copy.
+                // §3.8: the selected parameter type decides ownership: &T
+                // borrows and plain T consumes. Effects do not change that
+                // contract or require a redundant call-site move.
                 let arg_kind = self.ast.kind(arg_node)
                 if arg_kind == NodeKind.NK_MOVE_ARG:
                     if self.slice_coerce_args.contains(arg_node) == 0:
@@ -19230,7 +19494,7 @@ impl Sema:
                 if by_place_sym == 0 and (self.closure_capture_summary_eff(closure_node, ci) & EFF_CAPTURE_BY_PLACE) != 0:
                     by_place_sym = self.closure_capture_summary_sym(closure_node, ci)
         let consumes = self.closure_expr_consumes_capture(closure_node)
-        if by_place_sym == 0 and consumes == 0:
+        if by_place_sym == 0 and consumes == 0 and self.ast.is_non_escaping_closure(closure_node) == 0:
             return
         self.deferred_closure_arg_checks.push(closure_node)
         self.deferred_closure_arg_checks.push(callee_sym)
@@ -19257,6 +19521,22 @@ impl Sema:
             // Judged after every body: the diagnostic names the closure's own
             // file, not the one checked last.
             self.local_file_id = self.ast.file(closure_node as NodeId) as i32
+            let escapes = (self.sig_param_effect(sig_idx, param_i) & (EFF_ESCAPE_VALUE | EFF_ESCAPE_VIEW)) != 0
+            if escapes and self.ast.is_non_escaping_closure(closure_node) != 0:
+                // Direct arguments borrow captures for the call while their
+                // callee is being checked. Revoke that provisional marker and
+                // judge saved capture types only against the final effects.
+                self.ast.unmark_non_escaping_closure(closure_node)
+                var emitted_ephemeral = false
+                var emitted_capability = false
+                for ci in 0..self.closure_capture_summary_count(closure_node):
+                    let cap_ty = self.closure_capture_summary_type(closure_node, ci)
+                    if not emitted_ephemeral and self.type_is_ephemeral_value(cap_ty) != 0:
+                        self.emit_error("escaping closure cannot capture ephemeral references", closure_node)
+                        emitted_ephemeral = true
+                    if not emitted_capability and self.is_tool_capability_type(cap_ty):
+                        self.emit_error("capability-bearing closure cannot escape into runtime code", closure_node)
+                        emitted_capability = true
             if by_place_sym != 0 and (self.sig_param_effect(sig_idx, param_i) & EFF_ESCAPE_VALUE) != 0:
                 let cap_name: str = with_str_clone_ref(self.pool_resolve(by_place_sym))
                 self.emit_error("closure argument holds `" ++ cap_name ++ "` by place — a view of this frame — and `" ++ callee_name ++ "` stores or returns its parameter (§12.4); pass an owning closure: `move () => ...`", closure_node)
@@ -19649,11 +19929,10 @@ impl Sema:
 
         self.pop_scope()
 
-        var direct_arg_escapes = 0
-        if self.closure_direct_arg_escape_flags.len() > 0:
-            direct_arg_escapes = self.closure_direct_arg_escape_flags[(self.closure_direct_arg_escape_flags.len() - 1)]
-
-        let is_non_escaping = self.closure_direct_arg_depth > 0 and direct_arg_escapes == 0 and self.ast.is_move_closure(node) == 0
+        // Direct non-move arguments borrow for this call. Whether the callee
+        // lets them escape is settled after the effect fixpoint, not from a
+        // possibly empty summary during body checking.
+        let is_non_escaping = self.closure_direct_arg_depth > 0 and self.ast.is_move_closure(node) == 0
 
         // §12.4: "Captures are by place regardless of whether the type is
         // Copy; a read through a capture of a Copy value copies it. `move ||`
@@ -19687,8 +19966,8 @@ impl Sema:
         while self.borrow_kinds.len() as i32 > saved_borrow_len:
             self.remove_borrow_at(self.borrow_refs.len() as i32 - 1)
 
-        // Mark non-escaping if this closure is a direct call argument whose
-        // receiving parameter does not let the closure escape the call.
+        // Provisional for direct arguments; finalize_closure_arg_checks
+        // revokes this marker if the complete receiving contract escapes.
         if is_non_escaping:
             self.ast.mark_non_escaping_closure(node)
             // Register borrows for captured variables for the duration of
@@ -19863,9 +20142,7 @@ impl Sema:
             let arg_node = arg_nodes[ai]
             let expected = self.generic_closure_arg_expected_type(fn_node, &types, types.len() as i32, ai, call_node)
             self.closure_direct_arg_depth = self.closure_direct_arg_depth + 1
-            self.closure_direct_arg_escape_flags.push(0)
             let ty = if expected != 0: self.check_expr_with_expected(arg_node, expected as TypeId) else: self.check_expr_value_context(arg_node)
-            self.closure_direct_arg_escape_flags.pop()
             self.closure_direct_arg_depth = self.closure_direct_arg_depth - 1
             self.apply_closure_capture_consumes(arg_node, call_node)
             self.check_closure_arg_against_param(arg_node, fn_sym, -1, ai, call_node)
@@ -21618,16 +21895,8 @@ impl Sema:
                 arg_types.push(0)
                 continue
             let is_closure_arg = self.ast.kind(arg_node) == NodeKind.NK_CLOSURE
-            var closure_arg_escapes = 0
-            if is_closure_arg and sig_idx >= 0:
-                let param_i_for_effect = ai + param_offset
-                if param_i_for_effect < self.sig_get_param_count(sig_idx):
-                    let param_eff = self.sig_param_effect(sig_idx, param_i_for_effect)
-                    if (param_eff & (EFF_ESCAPE_VALUE | EFF_ESCAPE_VIEW)) != 0:
-                        closure_arg_escapes = 1
             if is_closure_arg:
                 self.closure_direct_arg_depth = self.closure_direct_arg_depth + 1
-                self.closure_direct_arg_escape_flags.push(closure_arg_escapes)
             // #1739: a generic callee's `Vec[T]` parameter names the collection
             // a literal argument builds; its elements decide T.
             if expected_ty == 0 and sig_idx < 0 and generic_hint_meta >= 0 and ai + param_offset < self.ast.fn_meta_param_count(generic_hint_meta):
@@ -21639,7 +21908,6 @@ impl Sema:
                 else: self.check_call_argument_expr(node, ai, fn_sym, arg_node, expected_ty)
             self.display_join_node = saved_display_join_node
             if is_closure_arg:
-                self.closure_direct_arg_escape_flags.pop()
                 self.closure_direct_arg_depth = self.closure_direct_arg_depth - 1
                 self.apply_closure_capture_consumes(arg_node, node)
             // A closure literal or a binding holding one (D63).
@@ -21778,6 +22046,7 @@ impl Sema:
             if self.fn_symbol_is_explicit_alloc_api(fn_sym) != 0:
                 self.note_allocation_site(node, AllocConstructKind.EXPLICIT_API, 0, 0)
             self.note_allocating_callee(node, fn_sym)
+            self.ensure_body_typed(fn_sym, sig_idx)
             var ret = self.sig_return_type(sig_idx) as i32
             // D51 stage 7 (spec §16.2b.8): a presented text-view return —
             // `returns borrow CStr …` / `returns static CStr` on a function
@@ -21868,13 +22137,9 @@ impl Sema:
                 // fixpoint_effect_flow can complete transitive consume/escape even
                 // when this callee is a forward reference (its body not yet checked).
                 self.record_effect_edge(sig_idx, param_i, trans_nd)
-                // #D5/P1 share-place (§3.8): a plain (non-move/copy) non-Copy value
-                // argument is NOT consumed — the caller keeps ownership and drops it
-                // in its own scope. Only an explicit `move`/`copy` transfers. A plain
-                // argument passed to an OWNED (consume/escape_value) parameter is a
-                // compile error requiring `move`/`copy`, enforced post-fixpoint by
-                // finalize_call_site_ownership with COMPLETE effects (recorded here so
-                // a forward-reference owned param cannot slip through as share-place).
+                // §3.8: a plain T parameter consumes a non-Copy argument;
+                // &T borrows it. Final effects validate escape requirements
+                // without changing the signature's ownership contract.
                 // Extern/C params receive a bit-copy and do not own — no transfer.
                 let eff_arg_nd = if has_resolved != 0: self.get_resolved_call_arg(node, ai) else: self.ast.get_extra(resolved_extra_start + ai)
                 let eff_arg_kind = if eff_arg_nd > 0: self.ast.kind(eff_arg_nd) else: 0
@@ -22795,6 +23060,9 @@ impl Sema:
             // closure argument needs — it was never consulted, so a generic
             // callee ran a call-once closure twice.
             if ai < arg_nodes.len() as i32:
+                // The selected concrete signature participates in the same
+                // transitive effect graph as ordinary and method calls.
+                self.record_effect_edge(sig_idx, ai, arg_nodes[ai])
                 self.check_closure_arg_against_param(arg_nodes[ai], fn_sym, sig_idx, ai, call_node)
             let expected_ty = self.sig_param_type(sig_idx, ai)
             let actual_ty = arg_types[ai]
@@ -27252,19 +27520,11 @@ impl Sema:
                 continue
 
             let mc_is_closure = self.ast.kind(mc_arg_node) == NodeKind.NK_CLOSURE
-            var mc_closure_arg_escapes = 0
             if mc_is_closure and field == self.syms.spawn_method and ai == 0:
                 if self.ast.kind(expr) == NodeKind.NK_IDENT and self.is_active_sync_scope_symbol(self.ast.get_data0(expr)) != 0:
                     self.ast.mark_by_place_closure(mc_arg_node)
-            if mc_is_closure and mc_sig_idx_for_effect >= 0:
-                let mc_param_i_for_effect = ai + 1
-                if mc_param_i_for_effect < self.sig_get_param_count(mc_sig_idx_for_effect):
-                    let mc_param_eff = self.sig_param_effect(mc_sig_idx_for_effect, mc_param_i_for_effect)
-                    if (mc_param_eff & (EFF_ESCAPE_VALUE | EFF_ESCAPE_VIEW)) != 0:
-                        mc_closure_arg_escapes = 1
             if mc_is_closure:
                 self.closure_direct_arg_depth = self.closure_direct_arg_depth + 1
-                self.closure_direct_arg_escape_flags.push(mc_closure_arg_escapes)
             var mc_expected = self.atomic_method_expected_arg_type(mc_order_type, field, ai)
             if mc_expected == 0:
                 mc_expected = self.method_expected_arg_type(obj_type as i32, field, ai)
@@ -27378,7 +27638,6 @@ impl Sema:
                     self.emit_task_sendability_error(mc_arg_node, "channel send requires Send value")
                 self.mark_moved_if_consumed(mc_arg_node)
             if mc_is_closure:
-                self.closure_direct_arg_escape_flags.pop()
                 self.closure_direct_arg_depth = self.closure_direct_arg_depth - 1
                 self.apply_closure_capture_consumes(mc_arg_node, node)
             // A closure literal or a binding holding one (D63).

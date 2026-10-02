@@ -64,7 +64,7 @@ pub enum VarState: i32:
     LIVE = 0
     MOVED = 1
 
-type BindingProvenance {
+pub type BindingProvenance {
     view_origin_mask: i32,
     view_dep_start: i32,
     view_dep_count: i32,
@@ -637,6 +637,9 @@ pub type Sema {
     trait_decl_node_cache: HashMap[i32, i32],
     // Exact type binding for each declaration node.
     type_decl_tids: HashMap[i32, i32],
+    // Impl targets resolved in the declaration's lexical module, before any
+    // body can ask which concrete destructor a dynamic value may run.
+    impl_decl_target_types: HashMap[i32, i32],
     // Temporary accumulators for cycle detection (accessed through self)
     cycle_dep_syms: Vec[i32],
     cycle_dep_nodes: Vec[i32],
@@ -1055,6 +1058,10 @@ pub type Sema {
     // #1827: how many of global_dispatchers expand_global_dispatchers has
     // given their call records; the rest are expanded on the next call.
     global_dispatchers_expanded: i32,
+    // Dynamic drop traversal decisions: [dyn type, impl declaration, target
+    // type], with the lookup context retained for the semantic inspector.
+    global_drop_impl_targets: Vec[i32],
+    global_drop_impl_contexts: Vec[str],
     // §21.1 rule 1: each declaration's resolved `writes` clause, keyed by
     // its node, as an index into declared_write_syms_flat holding the count
     // then the global symbols (resolve_declared_global_writes).
@@ -1082,7 +1089,8 @@ pub type Sema {
     // self`), keyed by the call node.
     dyn_consuming_calls: HashMap[i32, i32],
     // #1860: a typed binding pattern's view type (`c: &Circle`), keyed by
-    // the pattern node, and the symbols it binds (for the assign help).
+    // the pattern node, and its active binding symbols (for the assign help).
+    // The symbol marker expires when that binding leaves scope.
     dyn_downcast_binding_types: HashMap[i32, i32],
     dyn_downcast_binding_syms: HashMap[i32, i32],
     // The matches Sema proved exhaustive (a value position, a must-use
@@ -1617,7 +1625,8 @@ pub type Sema {
     current_fn_variadic: i32,          // 1 while checking a `...` definition body (never a closure in it)
     recording_propagated_effect: i32,
 
-    // Closure capture summaries: closure node -> flat [capture_sym, effect_bits]* slice.
+    // Closure capture summaries: closure node -> [capture_sym, effect_bits, type]*.
+    // The type is recorded while the capture's scope is still available.
     closure_capture_summary_starts: HashMap[i32, i32],
     closure_capture_summary_counts: HashMap[i32, i32],
     closure_capture_summary_data: Vec[i32],
@@ -1654,6 +1663,11 @@ pub type Sema {
     alloc_site_elided: Vec[i32],
     current_no_alloc_depth: i32,
     current_fn_may_alloc: i32,
+    // #1941: calls recorded while bodies are checked, resolved once every
+    // body has published whether it allocates (resolve_allocating_callees).
+    // Stride 5: owner fn, callee fn, call node, in @[no_alloc] context, file.
+    alloc_callee_calls: Vec[i32],
+    alloc_callee_calls_resolved: i32,
     current_fn_symbol: i32,
 
     // Current state
@@ -1718,6 +1732,9 @@ pub type Sema {
     // then an unannotated signature reads as Unit, which a caller cannot tell
     // from a function that returns nothing.
     body_typed_sigs: HashMap[i32, i32],
+    // Each top-level function declaration index by its semantic symbol
+    // (prepare_body_order), for checking a body on demand.
+    body_decl_by_fn: HashMap[i32, i32],
     // Calls checked against such a placeholder: (node, sig, callee symbol, file)
     // in fours. Whether the placeholder was wrong is known once every body is typed.
     untyped_callee_calls: Vec[i32],
@@ -1769,7 +1786,13 @@ pub type Sema {
     // than as a standalone value. `2147483648` is not a valid i32, but
     // `-2147483648` is exactly i32::MIN.
     in_negated_literal_context: i32,
+    // Active lexical unsafe blocks: 0 unused, 1 definite unsafe operation,
+    // 2 a global read whose need depends on completed mutation facts.
     unsafe_scope_used: Vec[i32],
+    unsafe_scope_nodes: Vec[i32],
+    unsafe_global_scope_reads: Vec[i32], // [unsafe block node, global symbol]
+    deferred_unsafe_global_scopes: Vec[i32],
+    unsafe_global_scopes_resolved: i32,
     break_value_type: TypeId,
     has_break_value_type: i32,
     loop_depth: i32,
@@ -1793,7 +1816,6 @@ pub type Sema {
     current_statement_expr_root: i32,
     current_value_expr_root: i32,
     closure_direct_arg_depth: i32,
-    closure_direct_arg_escape_flags: Vec[i32],
     // > 0 while a closure body is checked: the parameter frame
     // (current_fn_param_syms, current_fn_sig_idx) is then the closure's
     // capture frame, not the enclosing function's.
@@ -2635,6 +2657,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         type_decl_nodes,
         trait_decl_node_cache,
         type_decl_tids,
+        impl_decl_target_types: sema_new_map_i32_i32(),
         cycle_dep_syms: Vec.new(),
         cycle_dep_nodes: Vec.new(),
         pretty_symbol_names,
@@ -2838,6 +2861,8 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         current_effect_body: -1,
         fn_value_ident_sigs: sema_new_map_i32_i32(),
         global_dispatchers_expanded: 0,
+        global_drop_impl_targets: Vec.new(),
+        global_drop_impl_contexts: Vec.new(),
         declared_write_starts: sema_new_map_i32_i32(),
         declared_write_syms_flat: Vec.new(),
         global_dispatchers: Vec.new(),
@@ -3163,6 +3188,8 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         alloc_site_elided: Vec.new(),
         current_no_alloc_depth: 0,
         current_fn_may_alloc: 0,
+        alloc_callee_calls: Vec.new(),
+        alloc_callee_calls_resolved: 0,
         current_fn_symbol: 0,
         source_text: "",
         tracked_input_root: "",
@@ -3186,6 +3213,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         display_join_node: 0,
         join_assign_arms_as_views: 0,
         body_typed_sigs: sema_new_map_i32_i32(),
+        body_decl_by_fn: sema_new_map_i32_i32(),
         untyped_callee_calls: Vec.new(),
         discarded_stmt_node: 0,
         body_order_state: Vec.new(),
@@ -3216,6 +3244,10 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         in_bitwise_literal_context: 0,
         in_negated_literal_context: 0,
         unsafe_scope_used: Vec.new(),
+        unsafe_scope_nodes: Vec.new(),
+        unsafe_global_scope_reads: Vec.new(),
+        deferred_unsafe_global_scopes: Vec.new(),
+        unsafe_global_scopes_resolved: 0,
         break_value_type: 0,
         has_break_value_type: 0,
         loop_depth: 0,
@@ -3229,7 +3261,6 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         current_statement_expr_root: 0,
         current_value_expr_root: 0,
         closure_direct_arg_depth: 0,
-        closure_direct_arg_escape_flags: Vec.new(),
         closure_body_depth: 0,
         expected_expr_type: 0,
         has_expected_type: 0,
@@ -6099,6 +6130,7 @@ impl Sema:
             self.binding_decl_nodes.remove(removed_sym)
             self.binding_value_nodes.remove(removed_sym)
             self.binding_closure_nodes.remove(removed_sym)
+            self.dyn_downcast_binding_syms.remove(removed_sym)
             self.clear_binding_view_deps(removed_sym)
         self.scope_starts.pop()
 
@@ -7702,6 +7734,7 @@ impl Sema:
         for i in 0..count:
             self.closure_capture_summary_data.push(capture_syms[i])
             self.closure_capture_summary_data.push(capture_effs[i])
+            self.closure_capture_summary_data.push(self.scope_lookup(capture_syms[i]))
         self.closure_capture_summary_starts.insert(closure_node, start)
         self.closure_capture_summary_counts.insert(closure_node, count)
 
@@ -7717,7 +7750,7 @@ impl Sema:
         if idx < 0 or idx >= count:
             return 0
         let start = self.closure_capture_summary_starts.get(closure_node).unwrap()
-        self.closure_capture_summary_data[(start + idx * 2)]
+        self.closure_capture_summary_data[(start + idx * 3)]
 
     // 1 when calling the closure moves capture `idx` out of its place (§12.4:
     // the body consumes or returns it) — MirLower keeps that local's drop
@@ -7732,7 +7765,15 @@ impl Sema:
         if idx < 0 or idx >= count:
             return 0
         let start = self.closure_capture_summary_starts.get(closure_node).unwrap()
-        self.closure_capture_summary_data[(start + idx * 2 + 1)]
+        self.closure_capture_summary_data[(start + idx * 3 + 1)]
+
+    fn closure_capture_summary_type(closure_node: i32, idx: i32) -> i32:
+        if not self.closure_capture_summary_starts.contains(closure_node):
+            return 0
+        if idx < 0 or idx >= self.closure_capture_summary_count(closure_node):
+            return 0
+        let start = self.closure_capture_summary_starts.get(closure_node).unwrap()
+        self.closure_capture_summary_data[(start + idx * 3 + 2)]
 
     fn is_mutable_global(sym: i32) -> i32:
         if self.mutable_global_syms.contains(sym): return 1
@@ -7845,7 +7886,9 @@ impl Sema:
         let count = self.sig_param_counts[si]
         if pi < 0 or pi >= count:
             return
-        self.sig_param_effects[(start + pi)] = eff
+        // A validity requirement is stronger than the observational read
+        // category, whether found in the body or added by the fixed point.
+        self.sig_param_effects[(start + pi)] = if (eff & EFF_RAW_PTR_VALIDITY) != 0: eff & ~EFF_READ else: eff
 
     mut fn set_sig_param_direct_effect(si: i32, pi: i32, eff: i32):
         if si < 0 or si >= self.sig_param_eff_starts.len() as i32:
@@ -7942,7 +7985,7 @@ impl Sema:
             // ownership-forcing bit. The origin node is carried in
             // effect_note_origin_node (set by note_place_effect and the other
             // node-bearing noters; 0 when unknown).
-            let new_bits = eff & (EFF_CONSUME | EFF_ESCAPE_VALUE | EFF_WRITE) & (2147483647 - cur)
+            let new_bits = eff & (EFF_CONSUME | EFF_ESCAPE_VALUE | EFF_WRITE | EFF_RAW_PTR_VALIDITY) & (2147483647 - cur)
             if new_bits != 0:
                 self.record_effect_provenance_direct(self.current_fn_sig_idx, pi, new_bits, self.effect_note_origin_node)
             if self.recording_propagated_effect == 0:
@@ -7960,6 +8003,8 @@ impl Sema:
             self.record_effect_provenance_bit(sig, pi, 1, 1, node, self.local_file_id)
         if (bits & EFF_WRITE) != 0:
             self.record_effect_provenance_bit(sig, pi, 2, 1, node, self.local_file_id)
+        if (bits & EFF_RAW_PTR_VALIDITY) != 0:
+            self.record_effect_provenance_bit(sig, pi, 3, 1, node, self.local_file_id)
 
     fn record_effect_provenance_edge(sig: i32, pi: i32, bits: i32, callee_sig: i32, callee_pi: i32):
         if (bits & EFF_CONSUME) != 0:
@@ -7968,6 +8013,8 @@ impl Sema:
             self.record_effect_provenance_bit(sig, pi, 1, 2, callee_sig, callee_pi)
         if (bits & EFF_WRITE) != 0:
             self.record_effect_provenance_bit(sig, pi, 2, 2, callee_sig, callee_pi)
+        if (bits & EFF_RAW_PTR_VALIDITY) != 0:
+            self.record_effect_provenance_bit(sig, pi, 3, 2, callee_sig, callee_pi)
 
     fn record_effect_provenance_bit(sig: i32, pi: i32, bit_idx: i32, kind: i64, a: i32, b: i32):
         let key = effect_prov_key(sig, pi, bit_idx)
@@ -8043,16 +8090,22 @@ impl Sema:
         if caller_sig < 0 or callee_sig < 0 or callee_pi < 0 or arg_node <= 0:
             return
         let root = self.place_root_sym(arg_node)
-        if root == 0:
-            return
-        let caller_pi = self.param_index_for_sym(root)
-        if caller_pi < 0:
-            return
+        let caller_pi = if root != 0: self.param_index_for_sym(root) else: -1
+        if caller_pi >= 0:
+            self.record_effect_edge_for_param(caller_sig, caller_pi, callee_sig, callee_pi, self.effect_arg_is_projection(arg_node))
+        // Raw pointer copies keep the same validity obligation. Snapshot
+        // their parameter origins while the local binding facts are live.
+        let raw_origins = self.raw_pointer_param_origin_mask(arg_node)
+        for pi in 0..self.current_fn_param_syms.len() as i32:
+            if pi != caller_pi and (raw_origins & sema_param_origin_bit(pi)) != 0:
+                self.record_effect_edge_for_param(caller_sig, pi, callee_sig, callee_pi, 1)
+
+    fn record_effect_edge_for_param(caller_sig: i32, caller_pi: i32, callee_sig: i32, callee_pi: i32, projection: i32):
         self.effect_flow_edges.push(caller_sig)
         self.effect_flow_edges.push(caller_pi)
         self.effect_flow_edges.push(callee_sig)
         self.effect_flow_edges.push(callee_pi)
-        self.effect_flow_projections.push(self.effect_arg_is_projection(arg_node))
+        self.effect_flow_projections.push(projection)
 
     // #D5/P0 + D7: complete transitive write/consume/escape_value effects across the whole call
     // graph, so every sig_param_effects entry is final before any share-place
@@ -8078,12 +8131,21 @@ impl Sema:
     // `callee_param_is_copy` is the Copy-ness of the callee parameter's type,
     // supplied by the caller: is_copy (computing, pre-freeze) in the fixpoint,
     // is_copy_frozen (read-only) in the audit.
-    fn effect_edge_transfer(callee_sig: i32, callee_pi: i32, projection: i32, callee_param_is_copy: i32) -> i32:
+    fn effect_edge_transfer(caller_sig: i32, caller_pi: i32, callee_sig: i32, callee_pi: i32, projection: i32, callee_param_is_copy: i32) -> i32:
         let callee_eff = self.sig_param_effect(callee_sig, callee_pi)
-        var trans = callee_eff & (EFF_WRITE | EFF_CONSUME | EFF_ESCAPE_VALUE)
+        var trans = callee_eff & (EFF_WRITE | EFF_CONSUME | EFF_ESCAPE_VALUE | EFF_RAW_PTR_VALIDITY)
         let e_owning = trans & (EFF_CONSUME | EFF_ESCAPE_VALUE)
         if projection != 0 and e_owning != 0 and callee_param_is_copy == 0:
             trans = (trans - e_owning) | EFF_WRITE
+        // References and pointers never own through a parameter. They can
+        // still carry a pointee-validity contract, including &*T.
+        let caller_ty = self.sig_param_type(caller_sig, caller_pi)
+        if caller_ty > 0:
+            let caller_kind = self.get_type_kind(self.resolve_alias(caller_ty))
+            if caller_kind == TypeKind.TY_REF or caller_kind == TypeKind.TY_PTR:
+                trans = trans & EFF_RAW_PTR_VALIDITY
+        if self.type_is_raw_pointer_value(caller_ty) == 0:
+            trans = trans & ~EFF_RAW_PTR_VALIDITY
         trans
 
     mut fn fixpoint_effect_flow():
@@ -8107,14 +8169,9 @@ impl Sema:
                 edge_index = edge_index + 1
                 let edge_arg_ty = self.sig_param_type(callee_sig, callee_pi)
                 let edge_arg_is_copy = if edge_arg_ty > 0: self.is_copy(edge_arg_ty as TypeId) else: 1
-                let trans = self.effect_edge_transfer(callee_sig, callee_pi, projection, edge_arg_is_copy)
+                let trans = self.effect_edge_transfer(caller_sig, caller_pi, callee_sig, callee_pi, projection, edge_arg_is_copy)
                 if trans == 0:
                     continue
-                let p_tid = self.sig_param_type(caller_sig, caller_pi)
-                if p_tid > 0:
-                    let p_tk = self.get_type_kind(self.resolve_alias(p_tid))
-                    if p_tk == TypeKind.TY_REF or p_tk == TypeKind.TY_PTR:
-                        continue
                 let caller_eff = self.sig_param_effect(caller_sig, caller_pi)
                 let merged = caller_eff | trans
                 if merged != caller_eff:
@@ -8693,14 +8750,22 @@ impl Sema:
         if profile:
             sema_profile_report("type_decl_field_defaults", t)
             t = with_clock_nanos()
+        let types_before = self.type_kinds.len()
+        let symbols_before = self.pool.state.symbol_texts.len()
+        let sigs_before = self.sig_names.len()
+        let diags_start = self.diags.items.len() as i32
         self.check_bodies()
         if profile:
             sema_profile_report("bodies", t)
+            // What body checking adds to the module-wide tables: every entry
+            // is numbered in check order, which is what a parallel check
+            // would have to reproduce.
+            with_eprint(f"[profile] sema.bodies.added types={self.type_kinds.len() - types_before} symbols={self.pool.state.symbol_texts.len() - symbols_before} sigs={self.sig_names.len() - sigs_before}")
             t = with_clock_nanos()
-        // #D5/P0: with every top-level body checked, complete transitive
-        // write/consume/escape_value effects across the call graph so sig_param_effects is
-        // final before any share-place decision (lowering/ABI) reads it.
+        // Complete transitive effects before any deferred acceptance verdict
+        // reads a callee's parameter contract.
         self.fixpoint_effect_flow()
+        self.enforce_raw_pointer_contracts()
         // D63: a callable parameter passed on is invoked as often as the
         // parameter it reaches; settled before closure arguments are judged.
         self.propagate_callable_forwards()
@@ -8713,7 +8778,9 @@ impl Sema:
         // D5 superseded: free-parameter share-place is no longer inferred from
         // effects — the declared signature is authoritative (&T borrows, T owns).
         self.finalize_call_site_ownership()
+        self.finalize_unsafe_global_scope_checks()
         self.check_reachable_comptime_errors()
+        self.diags.sort_from(diags_start)
         if profile:
             sema_profile_report("effects_receivers_ownership", t)
 
@@ -8836,9 +8903,7 @@ impl Sema:
     mut fn emit_error_with_suggestion(msg: &str, node: i32, suggestion: &str, origin_file: &str = __FILE__, origin_line: u32 = __LINE__, origin_fn: &str = __FN__):
         if self.suppress_errors != 0:
             return
-        let start = self.ast.get_start(node)
-        let end = self.ast.get_end(node)
-        var diag = Diagnostic.err(msg, Span { file: self.local_file_id, start: start, end: end })
+        var diag = Diagnostic.err(msg, self.diagnostic_node_span(node))
         diag.set_origin(origin_file, origin_fn, origin_line as i32, node)
         if suggestion.len() > 0:
             diag.add_help("did you mean '" ++ suggestion ++ "'?")
