@@ -1,5 +1,6 @@
 //! expect-stdout: ok
 
+use std.collections.HashMap
 type NodeId = distinct i32
 type TypeId = distinct i32
 
@@ -58,7 +59,7 @@ fn main:
     check("Vec push + len", ids.len() == 3)
 
     // 10. Vec.get returns NodeId
-    let got = ids.get(0)
+    let got = ids[0]
     check("Vec.get", got == NodeId(10))
 
     // 11. HashMap with distinct key

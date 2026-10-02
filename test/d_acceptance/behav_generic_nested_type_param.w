@@ -5,6 +5,7 @@
 // monomorphization — positional binding mis-bound T to the OUTER arg
 // (T <- Task[i32]) and crashed codegen with no diagnostic (§11 generics).
 
+use std.task.Task
 type Pair[T] { a: T, b: T }
 type Duo[A, B] { pending_a: A, anchor_a: A, pending_b: B, anchor_b: B }
 
@@ -21,7 +22,7 @@ fn cleanup_remaining[T](tasks: Vec[Task[T]], start: i32):
     let total = tasks.len() as i32
     var i = start
     while i < total:
-        tasks.get(i).join_cleanup()
+        tasks[i].join_cleanup()
         i = i + 1
 
 async fn child() -> i32:

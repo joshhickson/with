@@ -5,6 +5,7 @@
 // Repro shape: AstPool.get_call_named_arg (map get → unwrap view → sum →
 // call argument in return position).
 
+use std.collections.HashMap
 type T {
     m: HashMap[i32, i32],
     extra: Vec[i32],
@@ -12,7 +13,7 @@ type T {
 
 impl T:
     fn extra_at(i: i32) -> i32:
-        self.extra.get(i as i64)
+        self.extra[i]
 
     fn lookup(k: i32, idx: i32) -> i32:
         if self.m.contains(k):
