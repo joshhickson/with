@@ -13081,6 +13081,16 @@ impl MirBuilder:
                     else:
                         intrinsic = MirIntrinsic.OPT_IS_SOME
 
+        // #1010: Sema types `is_empty()` as bool on every receiver whose
+        // `len()` is an intrinsic (collection_len_method_return_type), but only
+        // Vec and FixedString have an is_empty intrinsic. On str, arrays,
+        // slices, HashMap, HashSet and SlotMap the call fell through to the
+        // generic-call path and aborted in validate_generic_call_contracts.
+        if intrinsic == MirIntrinsic.NONE and method_name == "is_empty" and arg_count == 0:
+            let is_empty_len = self.classify_intrinsic(enum_accessor_recv_type, "len")
+            if is_empty_len != MirIntrinsic.NONE:
+                return self.lower_is_empty_via_len(is_empty_len, self_expr, method_sym, node)
+
         // D27 E2: Sema types vec.get(i) as &T — element access observes. Lower
         // the borrow intrinsic so the result place holds the element address;
         // VEC_GET stays the owned-load form for iteration and materialization.
@@ -13332,6 +13342,19 @@ impl MirBuilder:
         if (i == 0 or i == 1) and intrinsic == MirIntrinsic.STR_REPLACE:
             return 1
         0
+
+    // `recv.is_empty()` as `recv.len() == 0`, through the receiver's own len
+    // intrinsic, so both backends lower it the way they lower `len()`.
+    mut fn lower_is_empty_via_len(len_intrinsic: MirIntrinsic, self_expr: i32, method_sym: i32, node: i32) -> i32:
+        let recv_expr_ty = self.expr_type(self_expr)
+        let recv_ty = self.autoderef_result_type_for_method(recv_expr_ty, method_sym)
+        let recv_op = if self.has_contextual_copy_adjustment(self_expr) != 0: self.lower_contextual_copy_adjustment(self_expr) else: self.lower_receiver_with_method_autoderef_for_method(self_expr, method_sym)
+        let len_op = self.lower_intrinsic_call_with_receiver_operand(len_intrinsic, recv_op, recv_ty, method_sym, 0, 0, self.sema.ty_i64 as i32, node)
+        let cmp_rv = self.body.new_rvalue(RvalueKind.RK_BIN_OP, BinaryOp.OP_EQ, len_op, self.int_const_operand(0, self.sema.ty_i64))
+        let cmp_tmp = self.new_temp(self.sema.ty_bool)
+        let cmp_place = self.place_for_local(cmp_tmp)
+        self.body.push_stmt(self.cur_bb, StmtKind.Assign, cmp_place, cmp_rv, self.ast.get_start(node))
+        self.body.new_operand(OperandKind.OK_COPY, cmp_place)
 
     mut fn lower_intrinsic_call(intrinsic: MirIntrinsic, self_expr: i32, method_sym: i32, arg_start: i32, arg_count: i32, node: i32) -> i32:
         // D44 / §2.3: a snapshot whose element is not Copy is built from
