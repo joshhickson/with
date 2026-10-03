@@ -1122,6 +1122,26 @@ impl Sema:
             self.set_expr_view_deps(report_node, 0, empty_origins)
         final_type
 
+    // #1974 (§3.8; D22: an eliminator does not change what the eliminated
+    // value is): a default join — `??`, `unwrap_or`, `unwrap_or_else` — whose
+    // carrier payload is owned produces an owned value. Under a `&P` demand
+    // (a `&str` parameter) it meets the demand as every owned value does: the
+    // call borrows the result (auto-ref). So the demand on the join and on its
+    // fallback is `P`; asked to *be* `&P`, the owned payload arm was refused
+    // ("`??` expression of type `str` cannot produce `&str`") where
+    // `peek(make())` is accepted. A view payload keeps the reference demand:
+    // that join is a view, its origins the carrier's.
+    mut fn default_join_demand(expected: i32, payload_ty: i32) -> i32:
+        if expected == 0 or payload_ty == 0:
+            return expected
+        let er = self.resolve_alias(expected as TypeId)
+        if self.get_type_kind(er) != TypeKind.TY_REF or self.get_type_d1(er) != 0:
+            return expected
+        let pk = self.get_type_kind(self.resolve_alias(payload_ty as TypeId))
+        if pk == TypeKind.TY_REF or pk == TypeKind.TY_PTR or pk == TypeKind.TY_NEVER:
+            return expected
+        self.get_type_d0(er)
+
     mut fn resolve_contextual_default_join(expected: i32, carrier_node: i32, payload_ty: i32, default_node: i32, default_origin_node: i32, default_ty: i32, default_role: i32, report_node: i32, join_name: &str) -> i32:
         let nodes: Vec[i32] = Vec.new()
         nodes.push(0)
@@ -1444,6 +1464,20 @@ impl Sema:
         self.in_param_type_position = self.in_param_type_position - 1
         tid
 
+    // #1975: a C function has no array in its signature. "A function
+    // declarator shall not specify a return type that is ... an array type"
+    // (C11 6.7.6.3p1), and an array parameter is adjusted to a pointer
+    // (6.7.6.3p7), so `[T; N]` by value has no C ABI either way. One rule for
+    // an `extern "C" fn` type and an `extern fn` declaration.
+    mut fn reject_c_abi_array(tid: i32, at: i32, is_return: bool, what: &str):
+        if tid == 0 or self.get_type_kind(self.resolve_alias(tid as TypeId)) != TypeKind.TY_ARRAY:
+            return
+        let shown = self.type_name(tid)
+        if is_return:
+            self.emit_error_with_help(f"{what} cannot return an array: no C function returns one (C11 6.7.6.3p1), so `{shown}` has no C ABI", at, "return a struct that wraps the array, or take an out-pointer (`*mut T`) the function fills")
+        else:
+            self.emit_error_with_help(f"{what} cannot take an array by value: C adjusts an array parameter to a pointer (C11 6.7.6.3p7), so `{shown}` has no C ABI", at, "take a pointer to the first element (`*const T`), or wrap the array in a struct and pass that")
+
     mut fn resolve_type_expr(node: i32) -> TypeId:
         if node == 0:
             return 0 as TypeId
@@ -1569,9 +1603,14 @@ impl Sema:
             let param_types: Vec[i32] = Vec.new()
             for pi in 0..param_count:
                 let p_node = self.ast.get_extra(extra_start + pi)
-                param_types.push(self.resolve_type_expr(p_node) as i32)
+                let p_ty = self.resolve_type_expr(p_node) as i32
+                param_types.push(p_ty)
+                if kind == NodeKind.NK_TYPE_EXTERN_FN:
+                    self.reject_c_abi_array(p_ty, p_node, false, "an `extern \"C\" fn` type")
             // No return annotation on a fn type means Unit, not TY_ERR.
             let ret = if ret_node != 0: self.resolve_type_expr(ret_node) else: self.ty_void
+            if kind == NodeKind.NK_TYPE_EXTERN_FN:
+                self.reject_c_abi_array(ret as i32, ret_node, true, "an `extern \"C\" fn` type")
             let fn_kind = if kind == NodeKind.NK_TYPE_EXTERN_FN: TypeKind.TY_EXTERN_FN else: TypeKind.TY_FN
             return self.ensure_callable_type(fn_kind, param_types, param_count, ret, self.fn_type_node_flags(node))
 
@@ -11692,7 +11731,7 @@ impl Sema:
             if unwrapped == 0:
                 self.emit_error("?? operator requires an Option or Result with a single success payload", node)
                 return 0
-            let join_expected = if self.has_expected_type != 0: self.expected_expr_type as i32 else: 0
+            let join_expected = self.default_join_demand(if self.has_expected_type != 0: self.expected_expr_type as i32 else: 0, unwrapped)
             // The payload type is not an expectation for the fallback. Only an
             // enclosing expectation is independent of this join; otherwise the
             // fallback's exact type participates as an owned anchor.
@@ -16632,6 +16671,17 @@ impl Sema:
             self.emit_error("unknown field '" ++ self.pool_resolve(field) ++ "' for type '" ++ self.type_name(field_base as i32) ++ "'", node)
             return 0
 
+        // #1981: every other type has no fields. Returning 0 here without a
+        // word left `x.v` untyped and MIR read a zero from it (`fn f[T](x:
+        // T) -> i32: x.v` printed 0 for `f(3)`). A generic body is checked
+        // per instantiation (§11.2: "rely on instantiation-time checking"),
+        // so the instantiation whose type has no such field is the error.
+        if ftk != TypeKind.TY_ERR and ftk != TypeKind.TY_NEVER:
+            let unknown_field_msg = "unknown field '" ++ self.pool_resolve(field) ++ "' for type '" ++ self.type_name(field_base as i32) ++ "'"
+            if self.in_concrete_generic_body != 0:
+                self.emit_error_with_help(unknown_field_msg, node, "a generic body is checked for each instantiation (§11.2), and this one's type has no fields; bound the type parameter by a trait whose method provides the value, or instantiate it with a type that has the field")
+            else:
+                self.emit_error(unknown_field_msg, node)
         0
 
     mut fn check_computed_field_access(node: i32) -> i32:
@@ -17472,11 +17522,22 @@ impl Sema:
                 // Never silent: an untyped literal was lowered by name (#1457).
                 self.emit_error("`Self` is not bound here: a `Self { .. }` literal needs an enclosing method of a type", node)
                 return 0
-        if tid != 0 and self.pool_resolve(name) == "Self":
-            let self_lit_res = self.resolve_alias(tid as TypeId)
-            if self.get_type_kind(self_lit_res) == TypeKind.TY_GENERIC_INST:
-                name = self.get_type_d0(self_lit_res)
+        // #1982: a name for a generic struct's instance — an alias
+        // (`AtomicI64 = Atomic[i64]`, std.sync) or a type parameter bound to
+        // one — is the base struct's literal with the instance as its type.
+        // It was left untyped (the literal below only knew a struct name) and
+        // MIR lowered it by name.
+        var named_instance: TypeId = 0 as TypeId
+        if tid != 0:
+            let lit_res = self.resolve_alias(tid as TypeId)
+            if self.get_type_kind(lit_res) == TypeKind.TY_GENERIC_INST:
+                if self.pool_resolve(name) != "Self":
+                    named_instance = lit_res
+                name = self.get_type_d0(lit_res)
                 tid = self.lookup_named_type_visible(name)
+                if tid == 0 and named_instance != 0 and self.named_types.contains(name):
+                    // The alias is visible here; its base need not be.
+                    tid = self.named_types.get(name).unwrap()
         if tid == 0:
             if self.private_symbol_path_from_current(name).len() > 0:
                 self.emit_private_symbol_error(name, node)
@@ -17514,6 +17575,8 @@ impl Sema:
                         expected_struct_ty = expected_resolved
                     else if expected_tk == TypeKind.TY_GENERIC_INST and same_expected_base:
                         expected_struct_ty = expected_resolved
+                if named_instance != 0:
+                    expected_struct_ty = named_instance
                 if expected_struct_ty == 0:
                     let td_node = self.struct_literal_decl_node(name, tid)
                     if td_node != 0 and self.type_decl_tp_count(td_node) == 0:
@@ -17684,6 +17747,9 @@ impl Sema:
                                     if not self.ephemeral_types.contains(name):
                                         self.check_ephemeral_task_storage(decl_default, "non-ephemeral struct")
                                     let _ = default_ty
+                if named_instance != 0:
+                    self.typed_expr_types.insert(node, named_instance as i32)
+                    return named_instance as i32
                 // Check if struct has type params — infer GenericInst
                 let gi_probe_node = self.struct_literal_decl_node(name, tid)
                 if gi_probe_node != 0:
@@ -17705,6 +17771,16 @@ impl Sema:
                     return expected_struct_ty as i32
                 self.typed_expr_types.insert(node, resolved as i32)
                 return resolved as i32
+            // #1982: a name that resolves to a type with no fields to
+            // initialize — a type parameter instantiated with `i32` in
+            // `fn mk[T](x: T) -> T: T { v: 1 }` — left the literal untyped,
+            // and MIR projected field 24 of a scalar (invalid MIR after Sema).
+            let lit_name: str = self.pool_resolve(name)
+            let lit_ty_name = self.type_name(resolved as i32)
+            if self.in_concrete_generic_body != 0 and lit_name != lit_ty_name:
+                self.emit_error_with_help(f"struct literal of `{lit_name}`, which is `{lit_ty_name}` in this instantiation and not a struct", node, "a generic body is checked for each instantiation (§11.2); a struct literal needs a struct type, so construct the value through a trait method of the type parameter's bound, or take it as a parameter")
+            else:
+                self.emit_error(f"struct literal of `{lit_name}`, which is `{lit_ty_name}` and not a struct", node)
         0
 
     mut fn check_match_expr(node: i32) -> i32:
@@ -22290,8 +22366,8 @@ impl Sema:
         self.emit_no_await_guard_may_suspend_call(node, fn_sym)
         self.note_allocating_callee(node, fn_sym)
         let param_count = self.sig_get_param_count(sig_idx)
-        if arg_count != param_count:
-            self.emit_error("wrong argument count", node)
+        // #1973: the one arity rule; the receiver is the first argument here.
+        let _ = self.check_call_arity(node, fn_sym, param_count, self.sig_is_variadic(sig_idx) != 0, arg_count, 0, pkg_name ++ "." ++ method_name, "qualified extension method")
         for ai in 0..arg_count:
             let arg_node = self.ast.get_extra(extra_start + ai)
             let expected_ty = if ai < param_count: self.sig_param_type(sig_idx, ai) else: 0
@@ -22894,34 +22970,10 @@ impl Sema:
                     self.untyped_callee_calls.push(sig_idx)
                     self.untyped_callee_calls.push(fn_sym)
                     self.untyped_callee_calls.push(self.local_file_id)
-            // Check arg count (supports default parameters via required-count
-            // metadata packed into fn_meta flags by the parser).
+            // The one arity rule (#1973); a pipeline's piped value is one of
+            // the arguments the call supplies.
             let expected = self.sig_get_param_count(sig_idx)
-            let min_expected = self.fn_min_expected_arg_count(fn_sym, expected)
-            let actual = resolved_arg_count + param_offset
-            // Skip arg count check when named args were resolved (already filled defaults)
-            if self.ast.has_call_named_args(node) == 0 and self.has_resolved_call_args(node) == 0:
-                if self.sig_is_variadic(sig_idx) == 0:
-                    if actual < min_expected or actual > expected:
-                        // Check if missing params include implicit ones
-                        var has_unfilled_implicit = 0
-                        if self.fn_decl_nodes.contains(fn_sym) and actual < expected:
-                            let fn_node_check = self.fn_decl_nodes.get(fn_sym).unwrap()
-                            let meta_check = self.ast.find_fn_meta(fn_node_check)
-                            if meta_check >= 0:
-                                let ps_check = self.ast.fn_meta_param_start(meta_check)
-                                for pi in actual..expected:
-                                    let pflags = self.ast.fn_param_flags(ps_check, pi)
-                                    if fn_param_is_implicit(pflags) != 0:
-                                        has_unfilled_implicit = 1
-                        if has_unfilled_implicit != 0:
-                            self.emit_error("implicit parameter not provided; add a 'with' binding of the matching type", node)
-                        else:
-                            let fn_name: str = self.pool_resolve(fn_sym)
-                            if min_expected == expected:
-                                self.emit_error(f"function '{fn_name}' expects {expected} argument(s), found {actual}", node)
-                            else:
-                                self.emit_error(f"function '{fn_name}' expects {min_expected}-{expected} argument(s), found {actual}", node)
+            let _ = self.check_call_arity(node, fn_sym, expected, self.sig_is_variadic(sig_idx) != 0, resolved_arg_count + param_offset, 0, self.pool_resolve(fn_sym), "function")
 
             let sc_mut_args: Vec[i32] = Vec.new()
             let sc_all_args: Vec[i32] = Vec.new()
@@ -23305,12 +23357,54 @@ impl Sema:
             self.verify_tail_position(self.ast.get_data1(node), fn_sym, 0)
             return
 
+    // One arity rule for every call that reaches a declared signature (#1973):
+    // free functions, static and instance methods, generic methods and trait
+    // methods all read it. `supplied` counts the arguments the call supplies
+    // after named binding and default/implicit filling; `receiver` is 1 when
+    // the call's receiver fills the signature's first parameter (a method
+    // called on a value), and the counts the message names leave it out.
+    // A call whose arguments were bound by name or filled from defaults was
+    // settled by that resolution (resolve_named_call_args reports a missing
+    // parameter itself). Returns false when the call was refused.
+    mut fn check_call_arity(node: i32, fn_sym: i32, expected: i32, variadic: bool, supplied: i32, receiver: i32, callee_name: &str, what: &str) -> bool:
+        if expected < 0 or variadic:
+            return true
+        if self.ast.has_call_named_args(node) != 0 or self.has_resolved_call_args(node) != 0:
+            return true
+        let min_expected = self.fn_min_expected_arg_count(fn_sym, expected)
+        let actual = supplied + receiver
+        if actual >= min_expected and actual <= expected:
+            return true
+        if fn_sym != 0 and self.fn_decl_nodes.contains(fn_sym) and actual < expected:
+            let meta_check = self.ast.find_fn_meta(self.fn_decl_nodes.get(fn_sym).unwrap())
+            if meta_check >= 0:
+                let ps_check = self.ast.fn_meta_param_start(meta_check)
+                for pi in actual..expected:
+                    if fn_param_is_implicit(self.ast.fn_param_flags(ps_check, pi)) != 0:
+                        self.emit_error("implicit parameter not provided; add a 'with' binding of the matching type", node)
+                        return false
+        if receiver != 0 and expected == 0:
+            // A function of the type (`fn Item.tag()` at top level: no
+            // receiver, functions.md D7 table) called on a value: the value has no
+            // parameter to fill.
+            self.emit_error(f"'{callee_name}' is a function of the type and takes no receiver; call it as `{callee_name}(...)`", node)
+            return false
+        let shown_max = expected - receiver
+        let shown_min = min_expected - receiver
+        let shown_actual = supplied
+        if shown_min == shown_max:
+            self.emit_error(f"{what} '{callee_name}' expects {shown_max} argument(s), found {shown_actual}", node)
+        else:
+            self.emit_error(f"{what} '{callee_name}' expects {shown_min}-{shown_max} argument(s), found {shown_actual}", node)
+        false
+
     fn fn_min_expected_arg_count(fn_sym: i32, fallback_expected: i32) -> i32:
         if fallback_expected <= 0:
             return fallback_expected
-        if not self.fn_decl_nodes.contains(fn_sym):
+        // #2002: a generic method's declaration is its generic fn node.
+        let fn_node = if self.fn_decl_nodes.contains(fn_sym): self.fn_decl_nodes.get(fn_sym).unwrap() else: self.generic_fn_node_for_symbol(fn_sym)
+        if fn_node == 0:
             return fallback_expected
-        let fn_node = self.fn_decl_nodes.get(fn_sym).unwrap()
         let meta = self.ast.find_fn_meta(fn_node)
         if meta < 0:
             return fallback_expected
@@ -25782,12 +25876,11 @@ impl Sema:
             return 0
 
         let param_offset = if is_static != 0: 0 else: 1
-        let expected_args = param_count - param_offset
         // arg_count < 0: a compiler-synthesized call whose receiver alone
         // decides the specialization (D69's `for` over a generic Gen impl);
-        // it has no argument nodes to check.
-        if arg_count >= 0 and arg_count != expected_args:
-            self.emit_error("wrong argument count", node)
+        // it has no argument nodes to check. #1973: the one arity rule.
+        if arg_count >= 0:
+            let _ = self.check_call_arity(node, method_fn_sym, param_count, false, arg_count, param_offset, self.pool_resolve(method_fn_sym), if param_offset == 1: "method" else: "function")
         // #604 stage 1 applies to a method's arguments as to a free call's
         // (D64 found the gap: `n.read(buf)` over a `[]mut u8` refused the
         // array a free `fill(buf)` accepted): a Vec/array argument coerces to
@@ -26512,7 +26605,7 @@ impl Sema:
                 self.emit_error("Option.unwrap_or_else() expects a zero-argument function", node)
                 return 0
             let default_ty = self.get_type_d2(fn_ty2)
-            let join_expected = if self.has_expected_type != 0: self.expected_expr_type as i32 else: 0
+            let join_expected = self.default_join_demand(if self.has_expected_type != 0: self.expected_expr_type as i32 else: 0, elem_ty)
             let joined = self.resolve_contextual_default_join(join_expected, recv_node, elem_ty, 0, self.lazy_default_origin_node(default_node), default_ty, D22_JOIN_ROLE_LAZY_RESULT, node, "Option.unwrap_or_else")
             self.complete_lazy_fallback_result(default_node, fn_ty2, joined)
             return joined
@@ -26661,7 +26754,7 @@ impl Sema:
                 self.emit_argument_type_mismatch("Result.or_else", 0, 0, 0, ok_ty, recovered_ok_ty, node)
             return mapped_ty
         if method_name == "unwrap_or_else":
-            let join_expected = if self.has_expected_type != 0: self.expected_expr_type as i32 else: 0
+            let join_expected = self.default_join_demand(if self.has_expected_type != 0: self.expected_expr_type as i32 else: 0, ok_ty)
             let joined = self.resolve_contextual_default_join(join_expected, recv_node, ok_ty, 0, self.lazy_default_origin_node(default_node), mapped_ty, D22_JOIN_ROLE_LAZY_RESULT, node, "Result.unwrap_or_else")
             self.complete_lazy_fallback_result(default_node, self.callable_fn_type(arg_types[0] as TypeId), joined)
             return joined
@@ -27858,9 +27951,8 @@ impl Sema:
         else:
             self.check_trait_receiver_mode(&info, receiver_expr, node)
 
-        let expected_args = info.param_count - 1
-        if arg_count != expected_args:
-            self.emit_error("wrong argument count", node)
+        // #1973: the one arity rule, receiver excluded.
+        let _ = self.check_call_arity(node, 0, info.param_count, false, arg_count, 1, self.pool_resolve(trait_sym) ++ "." ++ self.pool_resolve(method_sym), "dyn trait method")
 
         for ai in 0..arg_count:
             let param_i = ai + 1
@@ -28009,9 +28101,8 @@ impl Sema:
         if found_info.param_count <= 0:
             self.emit_error("trait method has no self parameter", node)
             return 0
-        let expected_args = found_info.param_count - 1
-        if arg_count != expected_args:
-            self.emit_error("wrong argument count", node)
+        // #1973: the one arity rule, receiver excluded.
+        let _ = self.check_call_arity(node, found_fn, found_info.param_count, false, arg_count, 1, self.pool_resolve(found_trait) ++ "." ++ self.pool_resolve(method_sym), "trait method")
 
         self.check_trait_receiver_mode(&found_info, expr, node)
         for ai in 0..arg_count:
@@ -28300,25 +28391,33 @@ impl Sema:
                 self.mark_resolved_call_arg_default(call_node, pi - param_offset)
         param_count - param_offset
 
+    // #2002: a generic method (of a generic type, or with its own type
+    // parameters) has no registered signature — its parameters are its
+    // declaration's (`sig_idx` < 0, the fn node's meta) — and its defaults
+    // are filled the same way. It returned at `sig_idx < 0`, so `b.get()`
+    // against `fn get(k: i32 = 2)` on `Bx[T]` was refused for its count.
     mut fn resolve_method_implicit_default_args(call_node: i32, sig_idx: i32, method_fn_sym: i32, param_offset: i32, extra_start: i32, arg_count: i32) -> i32:
-        if sig_idx < 0:
-            return arg_count
         if self.has_resolved_call_args(call_node) != 0:
             return self.get_resolved_call_arg_count(call_node)
+        var fn_node = 0
+        if method_fn_sym != 0 and self.fn_decl_nodes.contains(method_fn_sym):
+            fn_node = self.fn_decl_nodes.get(method_fn_sym).unwrap()
+        else if sig_idx < 0 and method_fn_sym != 0:
+            fn_node = self.generic_fn_node_for_symbol(method_fn_sym)
+        let meta = if fn_node != 0: self.ast.find_fn_meta(fn_node) else: -1
+        if sig_idx < 0 and meta < 0:
+            return arg_count
         if self.ast.has_call_named_args(call_node) != 0:
+            if sig_idx < 0:
+                return arg_count
             return self.resolve_named_call_args(call_node, sig_idx, method_fn_sym, param_offset, extra_start, arg_count)
-        let param_count = self.sig_get_param_count(sig_idx)
+        let param_count = if sig_idx >= 0: self.sig_get_param_count(sig_idx) else: self.ast.fn_meta_param_count(meta)
         let actual = arg_count + param_offset
         if actual >= param_count:
             return arg_count
-        var param_start = -1
-        if method_fn_sym != 0 and self.fn_decl_nodes.contains(method_fn_sym):
-            let fn_node = self.fn_decl_nodes.get(method_fn_sym).unwrap()
-            let meta = self.ast.find_fn_meta(fn_node)
-            if meta >= 0:
-                param_start = self.ast.fn_meta_param_start(meta)
-        if param_start < 0:
+        if meta < 0:
             return arg_count
+        let param_start = self.ast.fn_meta_param_start(meta)
         let resolved_map: HashMap[i32, i32] = HashMap.new()
         let resolved_defaults: HashMap[i32, i32] = HashMap.new()
         for ai in 0..arg_count:
@@ -28329,8 +28428,10 @@ impl Sema:
             let pflags = self.ast.fn_param_flags(param_start, pi)
             if fn_param_is_implicit(pflags) == 0:
                 continue
-            let expected_ty = self.sig_param_type(sig_idx, pi)
-            var si = self.implicit_binding_types.len() as i32 - 1
+            // A generic method's implicit parameter has no resolved type to
+            // match a binding against here; it stays missing and is reported.
+            let expected_ty = if sig_idx >= 0: self.sig_param_type(sig_idx, pi) else: 0
+            var si = if expected_ty != 0: self.implicit_binding_types.len() as i32 - 1 else: -1
             var found = 0
             while si >= 0:
                 let bind_ty: i32 = self.implicit_binding_types[si]
@@ -28343,6 +28444,7 @@ impl Sema:
                 si = si - 1
             if found == 0:
                 missing_implicit = 1
+        var missing_required = false
         for pi2 in actual..param_count:
             if resolved_map.contains(pi2):
                 continue
@@ -28351,9 +28453,15 @@ impl Sema:
                 resolved_map.insert(pi2, default_node)
                 resolved_defaults.insert(pi2, 1)
                 filled = 1
+            else if fn_param_is_implicit(self.ast.fn_param_flags(param_start, pi2)) == 0:
+                missing_required = true
         if missing_implicit != 0:
             self.emit_error("implicit parameter not provided; add a 'with' binding of the matching type", call_node)
-        if filled == 0:
+        // #1973: a required parameter with no argument and no default is
+        // not filled — storing the partial list (a 0 for the missing slot)
+        // settled the call's arity and MIR passed Unit. The supplied
+        // arguments stand, and check_call_arity reports the count.
+        if filled == 0 or (missing_required and missing_implicit == 0):
             return arg_count
         let final_args: Vec[i32] = Vec.new()
         for pi3 in param_offset..param_count:
@@ -28444,7 +28552,9 @@ impl Sema:
         // docs/completed/mut.md Rev 8 §15.8 — see check_call.
         let mc_iter_borrow_idxs: Vec[i32] = Vec.new()
         let mc_param_offset_for_resolution = if self.static_receiver_type_is_known(expr) != 0: 0 else: 1
-        var mc_resolved_arg_count = self.resolve_method_implicit_default_args(node, mc_sig_idx_for_effect, mc_method_fn_for_resolution, mc_param_offset_for_resolution, extra_start, arg_count)
+        // #2002: a generic method has no signature; its declaration supplies the defaults.
+        let mc_default_fn = if mc_owner_sym_for_effect != 0 and mc_sig_idx_for_effect < 0: self.lookup_generic_method_fn(mc_owner_sym_for_effect, field) else: mc_method_fn_for_resolution
+        var mc_resolved_arg_count = self.resolve_method_implicit_default_args(node, mc_sig_idx_for_effect, mc_default_fn, mc_param_offset_for_resolution, extra_start, arg_count)
         if self.has_resolved_call_args(node) == 0 and self.ast.has_call_named_args(node) == 0 and arg_count == 0:
             var mc_unit_expected = self.atomic_method_expected_arg_type(mc_order_type, field, 0)
             if mc_unit_expected == 0:
@@ -28975,6 +29085,21 @@ impl Sema:
                     let qualified = self.pool_resolve(type_name_sym) ++ "." ++ self.pool_resolve(field)
                     self.emit_error("'" ++ qualified ++ "' takes `self`, and this call has no receiver; call it on a value, or declare it outside the impl as `fn " ++ qualified ++ "(...)` to make it a function of the type", node)
                     return 0
+                // #1973: the free call's arity rule, receiver excluded. The
+                // method path had none: `self.make(3)` against `make(a, b)`
+                // reached MIR and failed LLVM verification.
+                let mc_arity_name = self.pool_resolve(type_name_sym) ++ "." ++ self.pool_resolve(field)
+                if not self.check_call_arity(node, method_fn_sym, self.sig_get_param_count(sig_idx), self.sig_is_variadic(sig_idx) != 0, mc_resolved_arg_count, call_param_offset, mc_arity_name, if call_param_offset == 1: "method" else: "function"):
+                    // The call is refused, and it still has the method's
+                    // result type: returning 0 left `let (rc, _) = d.prepare(..)`
+                    // unbound and every later use of `rc` reported an
+                    // undefined variable on top of the one real error.
+                    let refused_ret = self.sig_return_type(sig_idx)
+                    if self.get_type_kind(recv_type) == TypeKind.TY_GENERIC_INST:
+                        let refused_subst = self.substitute_method_return_for_generic_inst(recv_type, type_name_sym, field, method_fn_sym, refused_ret)
+                        if refused_subst != 0:
+                            return refused_subst
+                    return refused_ret
                 if call_param_offset == 1 and self.sig_get_param_count(sig_idx) > 0:
                     let exact_receiver_ty = self.recorded_expr_type_or_zero(expr)
                     if exact_receiver_ty != 0:
@@ -29653,7 +29778,7 @@ impl Sema:
                         return 0
                     let option_payload = self.get_generic_inst_arg(recv_type, 0)
                     let option_default_ty = arg_types[0]
-                    let option_join_expected = if self.has_expected_type != 0: self.expected_expr_type as i32 else: 0
+                    let option_join_expected = self.default_join_demand(if self.has_expected_type != 0: self.expected_expr_type as i32 else: 0, option_payload)
                     return self.resolve_contextual_default_join(option_join_expected, expr, option_payload, option_default_node, option_default_node, option_default_ty, D22_JOIN_ROLE_EXPR, node, "Option.unwrap_or")
                 if field == self.syms.is_some or field == self.syms.is_none:
                     return self.ty_bool as i32
@@ -29712,7 +29837,7 @@ impl Sema:
                         return 0
                     let result_payload = self.get_generic_inst_arg(recv_type, 0)
                     let result_default_ty = arg_types[0]
-                    let result_join_expected = if self.has_expected_type != 0: self.expected_expr_type as i32 else: 0
+                    let result_join_expected = self.default_join_demand(if self.has_expected_type != 0: self.expected_expr_type as i32 else: 0, result_payload)
                     return self.resolve_contextual_default_join(result_join_expected, expr, result_payload, result_default_node, result_default_node, result_default_ty, D22_JOIN_ROLE_EXPR, node, "Result.unwrap_or")
                 if field == self.syms.is_ok or field == self.syms.is_err:
                     return self.ty_bool as i32
@@ -30761,13 +30886,17 @@ impl Sema:
         if root == 0:
             return 0
         // Spans are per-file byte offsets and the pool holds every module, so
-        // the window scan below can match a same-named identifier from another
-        // file whose offsets happen to land inside [root_start, root_end] —
-        // phantom "future uses" that shift with any upstream edit. Nodes carry
-        // no file identity, so first require a real use somewhere in root's
-        // subtree; this only ever prunes matches the subtree provably lacks.
+        // the window scan below compares a candidate's offsets only within
+        // root's own file (Ast.file). Without that, a same-named identifier
+        // in another module whose offsets land inside [root_start, root_end]
+        // was a phantom "future use" that moved with any upstream edit: four
+        // lines added to Sema.w put types_identical's `count` (Sema.w:5338)
+        // inside the window of MirLower.w's `for i in 0..count`, and `with
+        // check src/main.w` refused update_string_fields_after_aggregate. The
+        // subtree prune below still skips the scan when root lacks the symbol.
         if self.expr_uses_symbol(root, sym) == 0:
             return 0
+        let root_file = self.ast.file(root as NodeId)
         let root_start = self.ast.get_start(root)
         let root_end = self.ast.get_end(root)
         var found = 0
@@ -30777,7 +30906,7 @@ impl Sema:
         // mutate()` legal while still rejecting `(mutate(), use_view)`.
         for ni in 0..self.ast.node_count():
             let candidate = ni as NodeId
-            if self.ast.kind(candidate) != NodeKind.NK_IDENT or self.ast.get_data0(candidate) != sym:
+            if self.ast.kind(candidate) != NodeKind.NK_IDENT or self.ast.get_data0(candidate) != sym or self.ast.file(candidate) != root_file:
                 continue
             let start = self.ast.get_start(candidate)
             if start > after and start >= root_start and self.ast.get_end(candidate) <= root_end:
