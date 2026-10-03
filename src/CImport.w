@@ -321,7 +321,7 @@ fn c_import_included_files_clear():
 pub fn c_import_included_files() -> str:
     g_cimport_included_files ++ ""
 
-// #1877: the `__c_import_<op>_overflow_<ty>` helpers this import's
+// #1877: the `__with_builtin_<op>_overflow_<ty>` helpers this import's
 // inline bodies call (`__builtin_mul_overflow` and kin). The migrator's
 // preamble defines every width; a header import defines each one it names,
 // once, in its own translation — a name nothing defines is a dangling
@@ -779,7 +779,7 @@ pub fn process_c_import_with_defines(header_spec: &str, defines: &Vec[str], cxx:
         output.push_str("extern fn with_alloc(size: i64) -> *mut u8\n")
         output.push_str("extern fn with_alloc_zeroed(count: i64, size: i64) -> *mut u8\n")
         output.push_str("extern fn with_realloc(ptr: *mut u8, old_size: i64, new_size: i64) -> *mut u8\n")
-        output.push_str("extern fn with_free(ptr: *mut u8) -> Unit\n")
+        output.push_str("extern fn with_free(ptr: *mut u8)\n")
         output.push_str("extern fn with_memcpy(dst: *mut u8, src: *const u8, n: i64) -> *mut u8\n")
         output.push_str("extern fn with_memmove(dst: *mut u8, src: *const u8, n: i64) -> *mut u8\n")
         output.push_str("extern fn with_memset(dst: *mut u8, c: i32, n: i64) -> *mut u8\n")
@@ -1471,6 +1471,21 @@ pub fn ci_unsafe_fn_ptr_type(t: &str) -> str:
         return "unsafe " ++ normalized
     normalized
 
+// The return clause of a rendered signature. An absent return type is Unit,
+// so a C `void` function is spelled without one (#1838): the compiler
+// already knows it, and `unit-return-review` flags any signature that keeps
+// it. Fn-pointer TYPES keep their `-> Unit` (that is type syntax, not a
+// signature).
+pub fn ci_ret_suffix(ret_render: &str) -> str:
+    if ci_trim(ret_render) == "Unit": "" else: " -> " ++ ret_render
+
+// The return clause of a translated definition. An omitted return type is
+// the body tail's type (D43), so a `void` function omits `-> Unit` only when
+// its rendered body's tail infers Unit; a tail with a value (`f()` of an
+// `int f`) keeps it, or the value would become the function's return.
+pub fn ci_def_ret_suffix(ret_render: &str, tail_unit: bool) -> str:
+    if ci_trim(ret_render) == "Unit" and not tail_unit: " -> Unit" else: ci_ret_suffix(ret_render)
+
 fn ci_field_type_is_demoted(ftype: &str, demoted: &str) -> bool:
     if ftype.len() == 0:
         return false
@@ -1651,10 +1666,10 @@ fn ci_emit_buf_wrapper(session: i64, idx: i32, name: &str) -> str:
                         checks = checks ++ "    if " ++ first_name ++ ".len() != " ++ bn ++ ".len():\n        panic(\"" ++ name ++ ": buffer arguments must have equal length\")\n"
 
     let raw_name = "__wc_buf_" ++ safe_name
-    let raw_decl = "@[link_name(\"" ++ name ++ "\")]\nextern fn " ++ raw_name ++ "(" ++ raw_params ++ ") -> " ++ ret_render ++ "\n"
+    let raw_decl = "@[link_name(\"" ++ name ++ "\")]\nextern fn " ++ raw_name ++ "(" ++ raw_params ++ ")" ++ ci_ret_suffix(ret_render) ++ "\n"
     let ret_prefix = if ret == "Unit": "" else: "return "
     let body = checks ++ ptr_lets ++ "    " ++ ret_prefix ++ "unsafe { " ++ raw_name ++ "(" ++ call_args ++ ") }\n"
-    raw_decl ++ "fn " ++ safe_name ++ "(" ++ wrapper_params ++ ") -> " ++ ret_render ++ ":\n" ++ body
+    raw_decl ++ "fn " ++ safe_name ++ "(" ++ wrapper_params ++ ")" ++ ci_ret_suffix(ret_render) ++ ":\n" ++ body
 
 // §16.9: a record c_import demotes to opaque (a bitfield, a sub-alignment
 // field, a field of a demoted type) has no layout in With. The demoted record
@@ -1903,6 +1918,7 @@ fn ci_translate_function(session: i64, idx: i32, known_structs: &str, demoted_ty
         let body_category = if storage == CX_SC_STATIC: "inexpressible" else: "raw-modelable"
         ci_migrate_set_unsafe_function_body_context(si_raw)
         let body = ci_try_translate_fn_body_at(session, idx, definition)
+        let body_tail_unit = ci_take_body_tail_unit()
         ci_migrate_set_unsafe_function_body_context(false)
         let unrendered = ci_print_take_unknowns()
         if unrendered.len() > 0:
@@ -1917,7 +1933,7 @@ fn ci_translate_function(session: i64, idx: i32, known_structs: &str, demoted_ty
             if si_raw:
                 ci_record_raw_function_name(name)
             let si_ret_render = ci_unsafe_fn_ptr_type(si_ret)
-            return ci_take_body_hoisted_decls() ++ ci_render_generated_fn_body(fn_kw ++ safe_name ++ "(" ++ si_params ++ ") -> " ++ si_ret_render, body)
+            return ci_take_body_hoisted_decls() ++ ci_render_generated_fn_body(fn_kw ++ safe_name ++ "(" ++ si_params ++ ")" ++ ci_def_ret_suffix(si_ret_render, body_tail_unit), body)
         // The translator's own reason (va_arg, an unsupported builtin, a
         // record initializer it cannot resolve), not only that it failed.
         let failed_why = if g_ci_bail_message.len() > 0: "inline body translation failed: " ++ g_ci_bail_message else: "inline body translation failed"
@@ -2013,7 +2029,7 @@ fn ci_translate_function(session: i64, idx: i32, known_structs: &str, demoted_ty
     if is_unprototyped:
         g_cimport_unprototyped_names = g_cimport_unprototyped_names ++ "|" ++ safe_name ++ "|"
     let ret_render = ci_unsafe_fn_ptr_type(ret)
-    link_prefix ++ cc_prefix ++ "extern fn " ++ safe_name ++ "(" ++ params ++ ") -> " ++ ret_render ++ "\n"
+    link_prefix ++ cc_prefix ++ "extern fn " ++ safe_name ++ "(" ++ params ++ ")" ++ ci_ret_suffix(ret_render) ++ "\n"
 
 // ── Member function detection (Zig-style) ───────────────────
 // Scan all functions. If a function's first parameter is *StructType (pointer
@@ -2249,7 +2265,7 @@ fn ci_emit_member_fn_wrapper(session: i64, idx: i32, struct_name: &str, method_n
     let ret_prefix = if ret == "Unit": "" else: "return "
     let mode_kw = if recv_mut: "mut fn " else: "fn "
     let fn_kw = (if raw_wrapper: "unsafe " else: "") ++ mode_kw
-    let method_text = ci_render_generated_fn_body("    " ++ fn_kw ++ safe_method ++ "(" ++ params ++ ") -> " ++ ret, "        " ++ ret_prefix ++ safe_fn_name ++ "(" ++ call_args ++ ")")
+    let method_text = ci_render_generated_fn_body("    " ++ fn_kw ++ safe_method ++ "(" ++ params ++ ")" ++ ci_ret_suffix(ret), "        " ++ ret_prefix ++ safe_fn_name ++ "(" ++ call_args ++ ")")
     if migrate_prefer_brace():
         return "impl " ++ safe_struct ++ " {\n" ++ method_text ++ "\n}\n"
     "impl " ++ safe_struct ++ ":\n" ++ method_text ++ "\n"
@@ -2289,7 +2305,7 @@ fn ci_emit_constructor_wrapper(session: i64, idx: i32, struct_name: &str, method
         call_args = call_args ++ actual_name
         pi = pi + 1
     let fn_kw = if raw_wrapper: "unsafe fn " else: "fn "
-    ci_render_generated_fn_body(fn_kw ++ safe_struct ++ "." ++ safe_method ++ "(" ++ params ++ ") -> " ++ ret, "    " ++ safe_fn_name ++ "(" ++ call_args ++ ")") ++ "\n"
+    ci_render_generated_fn_body(fn_kw ++ safe_struct ++ "." ++ safe_method ++ "(" ++ params ++ ")" ++ ci_ret_suffix(ret), "    " ++ safe_fn_name ++ "(" ++ call_args ++ ")") ++ "\n"
 
 fn ci_cimport_type_is_raw_abi(ty: &str) -> bool:
     let t = ci_trim(ty)
@@ -3482,7 +3498,7 @@ pub fn ci_translate_macros(session: i64, type_session: i64, macro_source: &str) 
                                 empty_params = empty_params ++ ", "
                             empty_params = empty_params ++ bindings[epi] ++ ": i32"
                             epi = epi + 1
-                        let r = ci_render_generated_fn_body("fn " ++ safe_name ++ "(" ++ empty_params ++ ") -> Unit", "    return")
+                        let r = ci_render_generated_fn_body("fn " ++ safe_name ++ "(" ++ empty_params ++ ")", "    return")
                         with_cimport_mark_name_emitted(name)
                         if not ci_migrate_shared_decl_add("fn", safe_name, r):
                             output = output ++ r ++ "\n"
@@ -3588,7 +3604,7 @@ pub fn ci_translate_macros(session: i64, type_session: i64, macro_source: &str) 
                             ci_record_untranslated_macro(name)
                             continue
                         let fn_kw = if ci_translation_calls_raw_function(translated): "unsafe fn " else: "fn "
-                        let r = ci_render_generated_fn_body(fn_kw ++ safe_name ++ type_params ++ "(" ++ param_decl ++ ") -> " ++ inferred_ret, "    " ++ translated)
+                        let r = ci_render_generated_fn_body(fn_kw ++ safe_name ++ type_params ++ "(" ++ param_decl ++ ")" ++ ci_ret_suffix(inferred_ret), "    " ++ translated)
                         with_cimport_mark_name_emitted(name)
                         if not ci_migrate_shared_decl_add("fn", safe_name, r):
                             output = output ++ r ++ "\n"
@@ -6434,7 +6450,10 @@ impl CiStmtPool:
     fn merge_both_or_fail_ir(first: CiStmtId, second: CiStmtId) -> CiStmtId:
         if (first as i32) == 0 or (second as i32) == 0:
             return 0 as CiStmtId
-        self.merge_ir(first, second)
+        // Two empty parts merge to nothing, which merge_ir answers as 0:
+        // here that is an empty statement, not a failure (`(void)(a + b)`).
+        let merged = self.merge_ir(first, second)
+        if (merged as i32) == 0: self.empty_stmt_ir() else: merged
 
     fn merge_ir(first: CiStmtId, second: CiStmtId) -> CiStmtId:
         if (first as i32) == 0:
@@ -6946,6 +6965,23 @@ fn ci_cursor_is_void_cstyle_cast(session: i64, cursor: i32) -> bool:
     let ty = with_ci_type_translated(session, with_ci_cursor_type(session, cursor))
     ty == "void" or ty == "unit" or ty == "Unit"
 
+// The C expression at `cursor` has type `void` (a call of a void function).
+fn ci_cursor_value_is_void(session: i64, cursor: i32) -> bool:
+    let ty = with_ci_type_translated(session, with_ci_cursor_type(session, cursor))
+    ty == "void" or ty == "unit" or ty == "Unit"
+
+// C's `(void)x` says "x is unused": reading a variable, a function or an
+// enumerator, or a literal, has no effect, so the discarded value is no
+// statement at all (#1838: rendered, the read became the body's tail, and D43
+// made it the function's return value). A volatile read is an access C
+// keeps, so it stays.
+fn ci_discard_operand_is_pure(session: i64, cursor: i32, kind: i32) -> bool:
+    if kind == CXK_INT_LITERAL or kind == CXK_FLOAT_LITERAL or kind == CXK_STRING_LITERAL or kind == CXK_CHAR_LITERAL:
+        return true
+    if kind != CXK_DECL_REF:
+        return false
+    with_ci_type_is_volatile(session, with_ci_cursor_type(session, cursor)) == 0
+
 impl CiStmtPool:
     fn empty_stmt_ir() -> CiStmtId:
         self.block(self.extra_len(), 0)
@@ -6980,9 +7016,23 @@ impl CiStmtPool:
             let inner = ci_find_last_expr_child(session, cursor)
             if inner < 0:
                 return self.empty_stmt_ir()
-            if ci_cursor_is_void_cstyle_cast(session, cursor):
-                return self.lower_discard_expr_side_effects_ir(session, inner, exprs, types, scope)
-            return self.lower_effect_expr_ir(session, inner, exprs, types, scope)
+            // A discarded conversion is its operand's effects, whatever it
+            // converts to: a cast has none of its own.
+            return self.lower_discard_expr_side_effects_ir(session, inner, exprs, types, scope)
+
+        if ci_discard_operand_is_pure(session, cursor, kind):
+            return self.empty_stmt_ir()
+
+        // A discarded field or element read is its operands' effects
+        // (`(void)f()->x` calls f, `(void)a[i++]` steps i); a volatile one
+        // is an access C keeps, lowered below.
+        if (kind == CXK_MEMBER_REF or kind == CXK_ARRAY_SUBSCRIPT) and with_ci_type_is_volatile(session, with_ci_cursor_type(session, cursor)) == 0:
+            var operand_effects = self.empty_stmt_ir()
+            for oi in 0..nc:
+                let operand = with_ci_child(session, cursor, oi)
+                if ci_cursor_kind_is_expression(with_ci_cursor_kind(session, operand)):
+                    operand_effects = self.merge_both_or_fail_ir(operand_effects, self.lower_discard_expr_side_effects_ir(session, operand, exprs, types, scope))
+            return operand_effects
 
         if kind == CXK_BINARY_OP and nc >= 2 and with_ci_binary_op(session, cursor) == BO_COMMA:
             let lhs_stmt = self.lower_discard_expr_side_effects_ir(session, with_ci_child(session, cursor, 0), exprs, types, scope)
@@ -7133,7 +7183,7 @@ impl CiStmtPool:
 
         var tail_stmt = 0 as CiStmtId
         if ci_effect_expr_needs_terminal_stmt(session, cursor):
-            tail_stmt = self.expr_stmt(lowered.value_expr)
+            tail_stmt = if ci_cursor_value_is_void(session, cursor): self.expr_stmt_void(lowered.value_expr) else: self.expr_stmt(lowered.value_expr)
         let effects = self.merge_ir( lowered.setup_stmt, tail_stmt)
         // A lowered expression with no effect is an empty statement: zero
         // is failure.
@@ -12455,6 +12505,8 @@ fn ci_cursor_kind_is_expression(kind: i32) -> bool:
 type CiTransStmt {
     lowered: bool,
     text: str,
+    // The text, as a function body's tail, infers Unit (#1838).
+    tail_unit: bool,
 }
 
 fn ci_trans_stmt_via_ir(session: i64, cursor: i32, kind: i32, indent: i32, scope: CiScope) -> str:
@@ -12489,7 +12541,7 @@ fn ci_trans_stmt_ir(session: i64, cursor: i32, kind: i32, indent: i32, scope: Ci
         exprs.deinit()
         types.deinit()
         // CXK_NULL_STMT and empty-bypass map to empty string.
-        return CiTransStmt { lowered: false, text: "" }
+        return CiTransStmt { lowered: false, text: "", tail_unit: false }
 
     // Target depth is the caller's indent level converted to
     // spaces. For simple single-line stmt kinds (break / continue
@@ -12505,10 +12557,11 @@ fn ci_trans_stmt_ir(session: i64, cursor: i32, kind: i32, indent: i32, scope: Ci
     else:
         let target_depth = indent * 4
         rendered = ci_print_stmt(stmts, exprs, types, id, target_depth)
+    let tail_unit = ci_stmt_ir_tail_is_unit(stmts, exprs, types, id, true)
     stmts.deinit()
     exprs.deinit()
     types.deinit()
-    CiTransStmt { lowered: true, text: rendered }
+    CiTransStmt { lowered: true, text: rendered, tail_unit: tail_unit }
 
 fn ci_location_path(loc: &str) -> str:
     if loc.len() == 0:
@@ -13320,11 +13373,21 @@ pub fn ci_take_body_hoisted_decls() -> str:
     g_ci_body_hoisted_decls = ""
     taken
 
+// #1838: whether the last translated body's tail infers Unit, so a C `void`
+// function may be rendered without `-> Unit` (ci_def_ret_suffix).
+var g_ci_body_tail_unit = false
+
+pub fn ci_take_body_tail_unit() -> bool:
+    let taken = g_ci_body_tail_unit
+    g_ci_body_tail_unit = false
+    taken
+
 fn ci_try_translate_fn_body_at(session: i64, decl_idx: i32, found_cursor: i32) -> str:
     // A record left by a body that bailed elsewhere must not be charged to
     // this one: every caller takes the records right after this returns.
     let _stale = ci_print_take_unknowns()
     g_ci_body_hoisted_decls = ""
+    g_ci_body_tail_unit = false
     ci_clear_bail_location()
     // B9: fresh per-function temp counter. This path is called
     // from ci_translate_function's static-inline branch — which
@@ -13400,8 +13463,10 @@ fn ci_try_translate_fn_body_at(session: i64, decl_idx: i32, found_cursor: i32) -
     if ci_trim(body.text).len() == 0:
         if not (ret_type == "void" or ret_type == "Unit"):
             return ""
+        g_ci_body_tail_unit = true
         return param_rebinds ++ "    return\n"
 
+    g_ci_body_tail_unit = body.tail_unit
     param_rebinds ++ body.text
 
 // ── String helpers ──────────────────────────────────────────

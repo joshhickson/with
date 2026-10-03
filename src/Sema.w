@@ -1000,6 +1000,18 @@ pub type Sema {
     // by the NK_FOR node, and a comprehension clause's by its iterable node.
     // MIR reads it; it re-derived one from the iterable's type.
     for_elem_types: HashMap[i32, i32],
+    // §13.5 (#1837): the `.iter()` the compiler inserts for a loop over a
+    // collection that is no Iter[T] — the callee, its signature, its
+    // specialization symbol (a generic impl) and the iterator type it
+    // returns, keyed like for_elem_types. MIR lowers exactly this call and
+    // steps its result with `next()`.
+    for_iter_fn_syms: HashMap[i32, i32],
+    for_iter_sigs: HashMap[i32, i32],
+    for_iter_monos: HashMap[i32, i32],
+    for_iter_types: HashMap[i32, i32],
+    // The concrete `next()` of a non-generic iterator that `.iter()`
+    // returns (a generic one is demanded into iter_next_sigs/monos).
+    for_iter_next_fns: HashMap[i32, i32],
     mutable_global_syms: HashMap[i32, i32],
     // docs/completed/mut.md Rev 8 §12 / §15.12 — symbols declared via `global X = ...`
     // (stable) recorded here. Used by check_assign to emit a specific
@@ -2626,6 +2638,11 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
     let gen_for_each_sigs = sema_new_map_i32_i32()
     let gen_for_each_monos = sema_new_map_i32_i32()
     let for_elem_types = sema_new_map_i32_i32()
+    let for_iter_fn_syms = sema_new_map_i32_i32()
+    let for_iter_sigs = sema_new_map_i32_i32()
+    let for_iter_monos = sema_new_map_i32_i32()
+    let for_iter_types = sema_new_map_i32_i32()
+    let for_iter_next_fns = sema_new_map_i32_i32()
     let mutable_global_syms = sema_new_map_i32_i32()
     let stable_global_syms = sema_new_map_i32_i32()
     let global_value_decl_kinds = sema_new_map_i32_i32()
@@ -2869,6 +2886,11 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         gen_for_each_sigs,
         gen_for_each_monos,
         for_elem_types,
+        for_iter_fn_syms,
+        for_iter_sigs,
+        for_iter_monos,
+        for_iter_types,
+        for_iter_next_fns,
         mutable_global_syms,
         stable_global_syms,
         global_value_decl_kinds,
@@ -3694,11 +3716,26 @@ impl Sema:
             return sym
         let head: i32 = self.displaced_fn_index.get(sym).unwrap()
         var chosen = 0
+        // #1882: a c_import's displaced definition carries its importer's
+        // path, but it is the importer's IMPORT (tier 3), not its own
+        // declaration (tier 2): the module's own `fn twice` outranks the
+        // header's `twice`, which its namespace still names (D70).
+        var own_import = 0
         var i = head
         while i >= 0 and chosen == 0:
             if self.displaced_fn_paths[i] == self.current_module_path:
-                chosen = self.displaced_fn_syms[i]
+                if self.ci_syms.contains(self.displaced_fn_syms[i]):
+                    if own_import == 0: own_import = self.displaced_fn_syms[i]
+                else:
+                    chosen = self.displaced_fn_syms[i]
             i = self.displaced_fn_prev[i]
+        if chosen == 0 and own_import != 0:
+            var own = if self.decl_visibility_index.contains(sym): self.decl_visibility_index.get(sym).unwrap() else: -1
+            while own >= 0:
+                if self.decl_visibility_paths[own] == self.current_module_path:
+                    return sym
+                own = self.decl_visibility_prev[own]
+            chosen = own_import
         if chosen == 0:
             // §18.2 tier 3 (Eric's ruling, #1221/#993): of the fns the
             // current module's explicit imports provide, the import written

@@ -493,18 +493,16 @@ fn ci_migrate_render_preamble_fn(signature: &str, colon_expr: &str, brace_expr: 
 
 // The helper a `__builtin_<op>_overflow` call names. The migrator's preamble
 // defines `__with_builtin_<op>_overflow_<ty>` for every width; a c_import
-// translation defines `__c_import_<op>_overflow_<ty>` beside the bodies that
-// call it (#1877). The spellings differ on purpose: a c_import-origin name is
-// global (SemaDecl's c_import scoping), and the `.wo` bundles' shared defs
-// (lib/std/re/defs.w) reach every compilation over the prelude edge, so a
-// c_import definition of the bundle's name would capture the bundle's own
-// calls (#1882).
-pub fn ci_overflow_helper_name(op: &str, ty: &str) -> str:
-    let prefix = if ci_translate_in_migrate_mode(): "__with_builtin_" else: "__c_import_"
-    prefix ++ op ++ "_overflow_" ++ ty
+// translation defines the same name beside the bodies that call it (#1877).
+// The `.wo` bundles' shared defs (lib/std/re/defs.w) reach every
+// compilation over the prelude edge with their own definitions of these
+// names; an import's definition is its importer's, displaced to the
+// importer's identity when another owner holds the name
+// (Frontend.displace_colliding_c_import_fns, #1882), so neither captures
+// the other's calls.
+pub fn ci_overflow_helper_name(op: &str, ty: &str): "__with_builtin_" ++ op ++ "_overflow_" ++ ty
 
-pub fn ci_u128_mul_helper_name() -> str:
-    if ci_translate_in_migrate_mode(): "u128_mul_would_overflow" else: "__c_import_u128_mul_would_overflow"
+pub fn ci_u128_mul_helper_name(): "u128_mul_would_overflow"
 
 fn ci_migrate_render_overflow_helper(name: &str, op: &str, ty: &str, is_signed: bool):
     let token = if op == "add": "+%" else if op == "sub": "-%" else: "*%"
@@ -786,7 +784,7 @@ fn ci_migrate_preamble_text() -> str:
     p = p ++ "extern fn with_alloc(size: i64) -> " ++ pm ++ "\n"
     p = p ++ "extern fn with_alloc_zeroed(count: i64, size: i64) -> " ++ pm ++ "\n"
     p = p ++ "extern fn with_realloc(ptr: " ++ pm ++ ", old_size: i64, new_size: i64) -> " ++ pm ++ "\n"
-    p = p ++ "extern fn with_free(ptr: " ++ pm ++ ") -> Unit\n"
+    p = p ++ "extern fn with_free(ptr: " ++ pm ++ ")\n"
     p = p ++ "extern fn with_memcpy(dst: " ++ pm ++ ", src: " ++ pc ++ ", n: i64) -> " ++ pm ++ "\n"
     p = p ++ "extern fn with_memmove(dst: " ++ pm ++ ", src: " ++ pc ++ ", n: i64) -> " ++ pm ++ "\n"
     p = p ++ "extern fn with_memset(dst: " ++ pm ++ ", c: i32, n: i64) -> " ++ pm ++ "\n"
@@ -1913,7 +1911,7 @@ fn ci_migrate_translate_function(session: i64, idx: i32, known_structs: &str, pr
         // A renamed extern (keyword or prelude collision) keeps its C
         // linkage through the original symbol.
         let link_prefix = if safe_name != name: "@[link_name(\"" ++ name ++ "\")]\n" else: ""
-        return link_prefix ++ cc_prefix ++ "extern fn " ++ safe_name ++ "(" ++ params ++ ") -> " ++ ret_render ++ "\n"
+        return link_prefix ++ cc_prefix ++ "extern fn " ++ safe_name ++ "(" ++ params ++ ")" ++ ci_ret_suffix(ret_render) ++ "\n"
 
     // A header's `static inline` definition is published once, by the unit
     // that owns the header (the project scan's header_owner_module); every
@@ -1931,6 +1929,7 @@ fn ci_migrate_translate_function(session: i64, idx: i32, known_structs: &str, pr
     let body_is_unsafe_context = ci_migrate_extern_fn_call_requires_unsafe(safe_name)
     ci_migrate_set_unsafe_function_body_context(body_is_unsafe_context)
     let body = ci_try_translate_fn_body(session, idx)
+    let body_tail_unit = ci_take_body_tail_unit()
     ci_migrate_set_unsafe_function_body_context(false)
     // #1878: the declarations the body's locals need, beside the function.
     let hoisted_decls = ci_take_body_hoisted_decls()
@@ -1949,7 +1948,8 @@ fn ci_migrate_translate_function(session: i64, idx: i32, known_structs: &str, pr
         with_cimport_mark_name_emitted(name)
         g_migrate_fn_translated = g_migrate_fn_translated + 1
         let ret_render = ci_unsafe_fn_ptr_type(ret)
-        let ret_suffix = " -> " ++ ret_render
+        // A blank body is emitted as `return`, whose tail is Unit.
+        let ret_suffix = ci_def_ret_suffix(ret_render, body_tail_unit or ci_migrate_text_is_blank(body))
         let body_for_emit = if ret == "Unit" and ci_migrate_text_is_blank(body): "    return\n" else: body
         let visibility = if g_migrate_no_c_export != 0 and (storage != CX_SC_STATIC or header_owner.len() > 0): "pub " else: ""
         let fn_keyword = visibility ++ if ci_migrate_extern_fn_call_requires_unsafe(safe_name): "unsafe fn " else: "fn "
