@@ -96,9 +96,19 @@ fn cross_triple(tag: &str) -> str:
 
 // The pcre2-style bundle plan for a cross tag: the same corpus, compiled by
 // the release compiler with --target=<triple> into its own store slot and
-// out/wo/<tag>/ (build/wo.w; #946).
+// out/wo/<tag>/ (build/wo.w; #946). For the host's own tag (the linux_x86_64
+// cross compiler built on linux-x86_64) it is the host plan: both once
+// installed into one store slot, <store>/<name>/<tag>-<abi>, two targets
+// owning each file (#2014).
 fn cross_wo_plan(ctx: &BuildCtx, host_plan: &WoBundle, tag: &str) -> WoBundle:
-    wo_bundle_plan_for_target(ctx, host_plan.name, host_plan.corpus_rel, host_plan.root, tag, cross_triple(tag))
+    let triple = if tag == wo_host_target(): "" else: cross_triple(tag)
+    wo_bundle_plan_for_target(ctx, host_plan.name, host_plan.corpus_rel, host_plan.root, tag, triple)
+
+// A cross compiler's bundle targets: none for a host plan, which the host
+// graph already builds and installs.
+fn cross_wo_bundle_targets(out: Build, ctx: &BuildCtx, plan: &WoBundle) -> Build:
+    if plan.triple.len() == 0: return out
+    wo_bundle_targets(move out, ctx, plan, release_compiler_bin("with"), "build")
 
 // Every registered corpus's plan for one cross tag, in registry order.
 fn cross_wo_plans(ctx: &BuildCtx, host_plans: &Vec[WoBundle], tag: &str) -> Vec[WoBundle]:
@@ -144,8 +154,10 @@ fn add_cross_wasm_rt_targets(out0: Build, tag: &str, p: &str, group_name: &str) 
     cross_rt = cross_rt.dep(p ++ "fiber-stubs-object")
     out.add_target(cross_rt)
 
-// The target that generates an architecture's linux sysroot on this host.
-fn linux_sysroot_target_name(a: &str) -> str: if a == arch(): "linux-sysroot" else: "linux-sysroot-" ++ a
+// The target that generates an architecture's linux sysroot on this host:
+// `linux-sysroot` is a Linux host's own; every other architecture's, and
+// every one off Linux, is `linux-sysroot-<arch>`. One target per pack (#2014).
+fn linux_sysroot_target_name(a: &str) -> str: if a == arch() and os() == "Linux": "linux-sysroot" else: "linux-sysroot-" ++ a
 
 fn cross_llvm_prefix(tag: &str) -> str:
     let arch_tag = if tag == "linux_aarch64": "linux-aarch64" else: "linux-x86_64"
@@ -227,7 +239,7 @@ fn add_cross_rt_targets(out0: Build, ctx: &BuildCtx, tag: &str, p: &str, group_n
     // Each cross compiler embeds every corpus bundle compiled for its own
     // target by the release compiler (#946).
     for pi in 0..plans.len() as i32:
-        out = wo_bundle_targets(move out, ctx, plans[pi], release_compiler_bin("with"), "build")
+        out = cross_wo_bundle_targets(move out, ctx, plans[pi])
         cross_embedded = target_with_wo_blobs(move cross_embedded, plans[pi])
     out = add_empty_darwin_sysroot_blob_target(move out, p, dir)
     // #1915 (D81): the target's sysroot, compiler-rt and libc++ (a pack the
@@ -353,9 +365,10 @@ fn add_stage1_runtime_targets(out0: Build, host_runtime: &HostRuntimeSpec, corpu
     metadata = metadata.dep("sdk-clang-main")
     metadata = metadata.input("out/command/sdk-clang-main/done")
     metadata = metadata.input("sdk.lock")
-    // #1915: the rsp names the darwin sysroot as -syslibroot.
+    // #1915: the rsp names the darwin sysroot as -syslibroot, and a Linux
+    // host's own sysroot as --sysroot.
     metadata = metadata.dep("darwin-sysroot")
-    metadata = metadata.dep("linux-sysroot")
+    if os() == "Linux": metadata = metadata.dep("linux-sysroot")
     metadata = metadata.input(sdk_darwin_sysroot_pack())
     metadata = metadata.input(dir ++ "/llvm_bridge.o")
     metadata = metadata.input(dir ++ "/clang_bridge.o")
@@ -1168,10 +1181,15 @@ fn package_current_host_target() -> Target:
         return target.dep("package-windows-aarch64")
     target.dep("package-darwin-aarch64")
 
-fn package_llvm_sdk_platform_target(name: &str, platform: &str, prefix: &str, build_cache: &str) -> Target:
+// The SDK archive of `prefix`, with its digest and manifest, in `dir`. An
+// SDK fetched into .deps is repackaged into out/release (the release
+// payload); a source-built one (sdk-package, sdk-cross-aarch64-package) into
+// out/sdk-release. One directory per packager: both once wrote
+// out/release/<asset>, two targets owning one file (#2014).
+fn package_llvm_sdk_platform_target(name: &str, dir: &str, platform: &str, prefix: &str, build_cache: &str) -> Target:
     let asset = sdk_asset_for_platform(platform)
     let sdk_base = "llvm-" ++ compiler_llvm_version() ++ "-" ++ sdk_host_tag_for_platform(platform)
-    var target = target_new(.Action, build_owned_text(name), "").output("out/release/" ++ name ++ ".passed")
+    var target = target_new(.Action, build_owned_text(name), "").output(dir ++ "/" ++ name ++ ".passed")
     target = target.dep("sdk-contract-tests")
     target.action = run_package_llvm_sdk_action
     target = target.arg(build_owned_text(platform))
@@ -1186,10 +1204,10 @@ fn package_llvm_sdk_platform_target(name: &str, platform: &str, prefix: &str, bu
     if platform == "darwin-aarch64":
         target = target.dep("darwin-sysroot")
         target = target.input(sdk_darwin_sysroot_pack())
-    target = target.extra_output("out/release/" ++ asset)
-    target = target.extra_output("out/release/" ++ asset ++ ".sha256")
-    target = target.extra_output("out/release/" ++ asset ++ ".manifest")
-    target = target.write_scope("out/release")
+    target = target.extra_output(dir ++ "/" ++ asset)
+    target = target.extra_output(dir ++ "/" ++ asset ++ ".sha256")
+    target = target.extra_output(dir ++ "/" ++ asset ++ ".manifest")
+    target = target.write_scope(build_owned_text(dir))
     target = target.write_scope("out/command/" ++ name)
     target.timeout(1800000)
 
@@ -1290,7 +1308,7 @@ fn add_sdk_cross_aarch64_targets(out0: Build, ctx: &BuildCtx) -> Build:
     runtimes = runtimes.arg(build_owned_text(bootstrap)).arg(build_owned_text(prefix)).arg(sdk_llvm_source_dir()).arg(root ++ "/runtimes-" ++ tag).arg(sdk_jobs_arg(ctx)).arg("aarch64")
     runtimes = runtimes.input(sdk_llvm_source_marker()).input(build_owned_text(bootstrap)).input("build/sdk.w").input(sdk_linux_sysroot_pack_for("aarch64"))
     runtimes = runtimes.write_scope(build_owned_text(prefix)).write_scope(build_owned_text(root)).write_scope("out/command/sdk-cross-aarch64-runtimes")
-    runtimes = runtimes.dep("sdk-llvm-source").dep("linux-sysroot-aarch64")
+    runtimes = runtimes.dep("sdk-llvm-source").dep(linux_sysroot_target_name("aarch64"))
     out = out.add_target(runtimes.timeout(7200000))
     var ninja = target_new(.Action, "sdk-cross-aarch64-ninja", "").output(prefix ++ "/bin/ninja")
     ninja.action = run_sdk_ninja_action
@@ -1314,7 +1332,7 @@ fn add_sdk_cross_aarch64_targets(out0: Build, ctx: &BuildCtx) -> Build:
     // The host SDK build (sdk-llvm) supplies the tablegens the cross build runs.
     llvm = llvm.dep("sdk-llvm-source").dep("sdk-cross-aarch64-cmake").dep("sdk-cross-aarch64-runtimes").dep("sdk-llvm")
     out = out.add_target(llvm.timeout(21600000))
-    let package = package_llvm_sdk_platform_target("sdk-cross-aarch64-package", platform, prefix, llvm_build ++ "/CMakeCache.txt")
+    let package = package_llvm_sdk_platform_target("sdk-cross-aarch64-package", "out/sdk-release", platform, prefix, llvm_build ++ "/CMakeCache.txt")
     out = out.add_target(package.dep("sdk-cross-aarch64-llvm"))
     out
 
@@ -1509,7 +1527,7 @@ fn sdk_group_target() -> Target:
 
 fn sdk_package_target(ctx: &BuildCtx) -> Target:
     let platform = sdk_current_platform()
-    var target = package_llvm_sdk_platform_target("sdk-package", platform, sdk_output_prefix_arg(ctx, platform), sdk_output_llvm_cache_for_platform(platform))
+    var target = package_llvm_sdk_platform_target("sdk-package", "out/sdk-release", platform, sdk_output_prefix_arg(ctx, platform), sdk_output_llvm_cache_for_platform(platform))
     target.dep("sdk")
 
 // The unit digests of the two compiles `:fixpoint` compares.
@@ -2644,8 +2662,8 @@ pub fn build(ctx: BuildCtx) -> Build:
     var bootstrap_c_emit_sources = target_new(.Action, "bootstrap-c-emit-sources", "").output("out/bootstrap-c/src/with_compiler.c")
     bootstrap_c_emit_sources.action = run_bootstrap_c_emit_sources_action
     bootstrap_c_emit_sources = bootstrap_c_emit_sources.arg(release_compiler_bin("with"))
-    bootstrap_c_emit_sources = bootstrap_c_emit_sources.extra_output("out/gen/wl_decls.h")
-    bootstrap_c_emit_sources = bootstrap_c_emit_sources.extra_output("out/gen/wl_stubs.c")
+    bootstrap_c_emit_sources = bootstrap_c_emit_sources.extra_output("out/bootstrap-c/src/wl_decls.h")
+    bootstrap_c_emit_sources = bootstrap_c_emit_sources.extra_output("out/bootstrap-c/src/wl_stubs.c")
     bootstrap_c_emit_sources = bootstrap_c_emit_sources.write_scope("out/bootstrap-c/src")
     bootstrap_c_emit_sources = bootstrap_c_emit_sources.write_scope("out/gen")
     bootstrap_c_emit_sources = bootstrap_c_emit_sources.write_scope("out/command/bootstrap-c-emit-sources")
@@ -2670,7 +2688,7 @@ pub fn build(ctx: BuildCtx) -> Build:
     package_bootstrap_c = package_bootstrap_c.input("src/version")
     package_bootstrap_c = package_bootstrap_c.input("out/release/bin/with")
     package_bootstrap_c = package_bootstrap_c.input("out/bootstrap-c/src/with_compiler.c")
-    package_bootstrap_c = package_bootstrap_c.input("out/gen/wl_decls.h")
+    package_bootstrap_c = package_bootstrap_c.input("out/bootstrap-c/src/wl_decls.h")
     package_bootstrap_c = package_bootstrap_c.input("rt/rt_core.w")
     package_bootstrap_c = package_bootstrap_c.input("rt/panic_runtime.w")
     package_bootstrap_c = package_bootstrap_c.input("rt/fiber_stubs.w")
@@ -2705,11 +2723,11 @@ pub fn build(ctx: BuildCtx) -> Build:
     sdk_contract = sdk_contract.extra_output("out/test-graph/sdk-contract-tests/repeat.tar.gz")
     sdk_contract = sdk_contract.write_scope("out/test-graph/sdk-contract-tests")
     out = out.add_target(sdk_contract)
-    out = out.add_target(package_llvm_sdk_platform_target("package-llvm-sdk-darwin-aarch64", "darwin-aarch64", sdk_default_prefix_for_platform("darwin-aarch64"), sdk_default_build_cache_for_platform("darwin-aarch64")))
-    out = out.add_target(package_llvm_sdk_platform_target("package-llvm-sdk-linux-x86_64", "linux-x86_64", sdk_default_prefix_for_platform("linux-x86_64"), sdk_default_build_cache_for_platform("linux-x86_64")))
-    out = out.add_target(package_llvm_sdk_platform_target("package-llvm-sdk-linux-aarch64", "linux-aarch64", sdk_default_prefix_for_platform("linux-aarch64"), sdk_default_build_cache_for_platform("linux-aarch64")))
-    out = out.add_target(package_llvm_sdk_platform_target("package-llvm-sdk-windows-x86_64", "windows-x86_64", sdk_default_prefix_for_platform("windows-x86_64"), sdk_default_build_cache_for_platform("windows-x86_64")))
-    out = out.add_target(package_llvm_sdk_platform_target("package-llvm-sdk-windows-aarch64", "windows-aarch64", sdk_default_prefix_for_platform("windows-aarch64"), sdk_default_build_cache_for_platform("windows-aarch64")))
+    out = out.add_target(package_llvm_sdk_platform_target("package-llvm-sdk-darwin-aarch64", "out/release", "darwin-aarch64", sdk_default_prefix_for_platform("darwin-aarch64"), sdk_default_build_cache_for_platform("darwin-aarch64")))
+    out = out.add_target(package_llvm_sdk_platform_target("package-llvm-sdk-linux-x86_64", "out/release", "linux-x86_64", sdk_default_prefix_for_platform("linux-x86_64"), sdk_default_build_cache_for_platform("linux-x86_64")))
+    out = out.add_target(package_llvm_sdk_platform_target("package-llvm-sdk-linux-aarch64", "out/release", "linux-aarch64", sdk_default_prefix_for_platform("linux-aarch64"), sdk_default_build_cache_for_platform("linux-aarch64")))
+    out = out.add_target(package_llvm_sdk_platform_target("package-llvm-sdk-windows-x86_64", "out/release", "windows-x86_64", sdk_default_prefix_for_platform("windows-x86_64"), sdk_default_build_cache_for_platform("windows-x86_64")))
+    out = out.add_target(package_llvm_sdk_platform_target("package-llvm-sdk-windows-aarch64", "out/release", "windows-aarch64", sdk_default_prefix_for_platform("windows-aarch64"), sdk_default_build_cache_for_platform("windows-aarch64")))
     out = out.add_target(package_llvm_sdk_current_host_target())
 
     out = out.add_target(sdk_source_target("sdk-ninja-source", sdk_ninja_source_url(), sdk_ninja_source_sha256(), sdk_ninja_archive(), sdk_source_root(), sdk_ninja_source_dir(), sdk_ninja_source_marker()))
@@ -2827,22 +2845,28 @@ pub fn build(ctx: BuildCtx) -> Build:
     darwin_sysroot = darwin_sysroot.timeout(600000)
     out = out.add_target(darwin_sysroot)
 
-    var linux_sysroot = target_new(.Action, "linux-sysroot", "").output(sdk_linux_sysroot_pack())
-    linux_sysroot.action = run_linux_sysroot_action
-    linux_sysroot = linux_sysroot.input("build/sdk.w")
-    linux_sysroot = linux_sysroot.input("sdk.lock")
-    if os() == "Linux" and sdk_linux_arch_supported(arch()):
-        linux_sysroot = linux_sysroot.dep("sysroot-zig-source")
-        linux_sysroot = linux_sysroot.input(sdk_zig_source_marker())
-    linux_sysroot = linux_sysroot.write_scope(sdk_linux_sysroot_dir())
-    linux_sysroot = linux_sysroot.write_scope("out/command/linux-sysroot")
-    linux_sysroot = linux_sysroot.timeout(1200000)
-    out = out.add_target(linux_sysroot)
+    // A Linux host's own sysroot (`linux-sysroot`, the pack its compiler
+    // embeds). Off Linux there is none: a placeholder here once wrote an empty
+    // pack over linux-sysroot-<host arch>'s, two targets owning one file (#2014).
+    if os() == "Linux":
+        var linux_sysroot = target_new(.Action, "linux-sysroot", "").output(sdk_linux_sysroot_pack())
+        linux_sysroot.action = run_linux_sysroot_action
+        linux_sysroot = linux_sysroot.input("build/sdk.w")
+        linux_sysroot = linux_sysroot.input("sdk.lock")
+        if sdk_linux_arch_supported(arch()):
+            linux_sysroot = linux_sysroot.dep("sysroot-zig-source")
+            linux_sysroot = linux_sysroot.input(sdk_zig_source_marker())
+        linux_sysroot = linux_sysroot.write_scope(sdk_linux_sysroot_dir())
+        linux_sysroot = linux_sysroot.write_scope("out/command/linux-sysroot")
+        linux_sysroot = linux_sysroot.timeout(1200000)
+        out = out.add_target(linux_sysroot)
     // Every other Linux architecture's sysroot, generated here for a cross
-    // build (the aarch64 SDK and compiler from linux-x86_64, and back).
+    // build (the aarch64 SDK and compiler from linux-x86_64, and back; both
+    // from macOS and Windows).
     for other in ["x86_64", "aarch64"]:
-        if other == arch() and os() == "Linux": continue
-        var linux_sysroot_arm = target_new(.Action, "linux-sysroot-" ++ other, "").output(sdk_linux_sysroot_pack_for(other))
+        let name = linux_sysroot_target_name(other)
+        if name == "linux-sysroot": continue
+        var linux_sysroot_arm = target_new(.Action, name.clone(), "").output(sdk_linux_sysroot_pack_for(other))
         linux_sysroot_arm.action = run_linux_sysroot_action
         linux_sysroot_arm = linux_sysroot_arm.arg(build_owned_text(other))
         linux_sysroot_arm = linux_sysroot_arm.input("build/sdk.w")
@@ -2850,16 +2874,19 @@ pub fn build(ctx: BuildCtx) -> Build:
         linux_sysroot_arm = linux_sysroot_arm.dep("sysroot-zig-source")
         linux_sysroot_arm = linux_sysroot_arm.input(sdk_zig_source_marker())
         linux_sysroot_arm = linux_sysroot_arm.write_scope(sdk_linux_sysroot_dir_for(other))
-        linux_sysroot_arm = linux_sysroot_arm.write_scope("out/command/linux-sysroot-" ++ other)
+        linux_sysroot_arm = linux_sysroot_arm.write_scope("out/command/" ++ name)
         linux_sysroot_arm = linux_sysroot_arm.timeout(1200000)
         out = out.add_target(linux_sysroot_arm)
 
+    // Off Linux the host pack is empty and reads no sysroot (build/sdk.w
+    // run_linux_link_pack_action).
     var linux_link_pack = target_new(.Action, "linux-link-pack", "").output(sdk_linux_link_pack())
     linux_link_pack.action = run_linux_link_pack_action
     linux_link_pack = linux_link_pack.input("build/sdk.w")
     linux_link_pack = linux_link_pack.input("sdk.lock")
-    linux_link_pack = linux_link_pack.input(sdk_linux_sysroot_pack())
-    linux_link_pack = linux_link_pack.dep("linux-sysroot")
+    if os() == "Linux":
+        linux_link_pack = linux_link_pack.input(sdk_linux_sysroot_pack())
+        linux_link_pack = linux_link_pack.dep("linux-sysroot")
     linux_link_pack = linux_link_pack.timeout(600000)
     out = out.add_target(linux_link_pack)
 
@@ -2944,7 +2971,7 @@ pub fn build(ctx: BuildCtx) -> Build:
     bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.input("sdk.lock")
     // #1915: the rsp names the darwin sysroot as -syslibroot.
     bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.dep("darwin-sysroot")
-    bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.dep("linux-sysroot")
+    if os() == "Linux": bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.dep("linux-sysroot")
     bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.input(sdk_darwin_sysroot_pack())
     bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.input("out/bootstrap-lib/llvm_bridge.o")
     bootstrap_llvm_link_metadata = bootstrap_llvm_link_metadata.input("out/bootstrap-lib/clang_bridge.o")
@@ -3087,7 +3114,7 @@ pub fn build(ctx: BuildCtx) -> Build:
     llvm_link_metadata = llvm_link_metadata.input("sdk.lock")
     // #1915: the rsp names the darwin sysroot as -syslibroot.
     llvm_link_metadata = llvm_link_metadata.dep("darwin-sysroot")
-    llvm_link_metadata = llvm_link_metadata.dep("linux-sysroot")
+    if os() == "Linux": llvm_link_metadata = llvm_link_metadata.dep("linux-sysroot")
     llvm_link_metadata = llvm_link_metadata.input(sdk_darwin_sysroot_pack())
     llvm_link_metadata = llvm_link_metadata.input("out/lib/llvm_bridge.o")
     llvm_link_metadata = llvm_link_metadata.input("out/lib/clang_bridge.o")
@@ -3496,7 +3523,7 @@ pub fn build(ctx: BuildCtx) -> Build:
     cross_win_embedded = cross_win_embedded.dep("cross-win-rt-platform-object")
     let corpus_plans_windows_x86_64 = cross_wo_plans(ctx, &corpus_plans, "windows_x86_64")
     for pi in 0..corpus_plans_windows_x86_64.len() as i32:
-        out = wo_bundle_targets(move out, ctx, corpus_plans_windows_x86_64[pi], release_compiler_bin("with"), "build")
+        out = cross_wo_bundle_targets(move out, ctx, corpus_plans_windows_x86_64[pi])
         cross_win_embedded = target_with_wo_blobs(move cross_win_embedded, corpus_plans_windows_x86_64[pi])
     out = add_empty_darwin_sysroot_blob_target(move out, "cross-win-", cross_windows_dir())
     cross_win_embedded = target_with_empty_darwin_sysroot_blob(move cross_win_embedded, "cross-win-", cross_windows_dir())
@@ -3575,7 +3602,7 @@ pub fn build(ctx: BuildCtx) -> Build:
     cross_winarm_embedded = cross_winarm_embedded.dep("cross-winarm-rt-platform-object")
     let corpus_plans_windows_aarch64 = cross_wo_plans(ctx, &corpus_plans, "windows_aarch64")
     for pi in 0..corpus_plans_windows_aarch64.len() as i32:
-        out = wo_bundle_targets(move out, ctx, corpus_plans_windows_aarch64[pi], release_compiler_bin("with"), "build")
+        out = cross_wo_bundle_targets(move out, ctx, corpus_plans_windows_aarch64[pi])
         cross_winarm_embedded = target_with_wo_blobs(move cross_winarm_embedded, corpus_plans_windows_aarch64[pi])
     out = add_empty_darwin_sysroot_blob_target(move out, "cross-winarm-", cross_windows_aarch64_dir())
     cross_winarm_embedded = target_with_empty_darwin_sysroot_blob(move cross_winarm_embedded, "cross-winarm-", cross_windows_aarch64_dir())
@@ -3669,8 +3696,6 @@ pub fn build(ctx: BuildCtx) -> Build:
     emit_c_test = emit_c_test.input(release_compiler_bin("with"))
     emit_c_test = emit_c_test.input("out/gen/versioned_main.w")
     emit_c_test = emit_c_test.extra_output("out/emit-c-test")
-    emit_c_test = emit_c_test.extra_output("out/gen/wl_decls.h")
-    emit_c_test = emit_c_test.extra_output("out/gen/wl_stubs.c")
     emit_c_test = emit_c_test.extra_output("out/command/emit-c-test")
     emit_c_test = emit_c_test.dep("build")
     emit_c_test = emit_c_test.dep("compiler-version-sources")
@@ -3693,8 +3718,6 @@ pub fn build(ctx: BuildCtx) -> Build:
     emit_c_roundtrip = emit_c_roundtrip.input("out/gen/versioned_main.w")
     emit_c_roundtrip = emit_c_roundtrip.input("out/gen/version.txt")
     emit_c_roundtrip = emit_c_roundtrip.extra_output("out/emit-c-roundtrip")
-    emit_c_roundtrip = emit_c_roundtrip.extra_output("out/gen/wl_decls.h")
-    emit_c_roundtrip = emit_c_roundtrip.extra_output("out/gen/wl_stubs.c")
     emit_c_roundtrip = emit_c_roundtrip.extra_output("out/command/emit-c-roundtrip")
     emit_c_roundtrip = emit_c_roundtrip.dep("build")
     emit_c_roundtrip = emit_c_roundtrip.dep("compiler-version-sources")

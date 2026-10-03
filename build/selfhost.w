@@ -1488,6 +1488,28 @@ pub fn run_cli_selfhost_one_liner_action(ctx: ActionCtx) -> i32:
     rc = bs_expect_cli_input_success_exact(ctx, compiler_path, "one-liner-parity-jq-nested", bs_one_liner_args("-e", "use std.json\nprint(JsonDocument.parse(read_all()).root().field(\"b\").field(\"c\").raw())"), parity_json, "hi")
     if rc != 0: return rc
 
+    // #2015: a one-liner imports a std module beyond the ambient header, in
+    // every mode. -n/-p hoist a part's leading `use` lines out of the
+    // per-line loop; the body keeps its lines and columns.
+    rc = bs_expect_cli_success_exact(ctx, compiler_path, "one-liner-e-use", bs_one_liner_args("-e", "use std.time.now_ns; print(f\"{now_ns() > 0}\")"), "true")
+    if rc != 0: return rc
+    rc = bs_expect_cli_input_success_exact(ctx, compiler_path, "one-liner-n-use", bs_one_liner_args("-n", "use std.time.now_ns; if now_ns() > 0: print(line)"), "a\nb\n", "a\nb")
+    if rc != 0: return rc
+    rc = bs_expect_cli_input_success_exact(ctx, compiler_path, "one-liner-p-use", bs_one_liner_args("-p", "use std.time.now_ns\nuse std.time.now; line = line ++ f\" {now_ns() > 0} {now() > 0}\""), "a\n", "a true true")
+    if rc != 0: return rc
+    var use_parts: Vec[str] = Vec.new()
+    for a in ["-n", "use std.time.now_ns", "-n", "if now_ns() > 0: print(line.upper())"]: use_parts |> push(selfhost_owned_text(a))
+    rc = bs_expect_cli_input_success_exact(ctx, compiler_path, "one-liner-n-use-own-part", use_parts, "a\n", "A")
+    if rc != 0: return rc
+    // A name that starts with `use` is code, not an import.
+    rc = bs_expect_cli_input_success_exact(ctx, compiler_path, "one-liner-n-user-is-code", bs_one_liner_args("-n", "let user = line; print(user)"), "a\n", "a")
+    if rc != 0: return rc
+    let diag_use = bs_run_cli_capture_input(ctx, compiler_path, "one-liner-diag-n-after-use", bs_one_liner_args("-n", "use std.time.now_ns; print(missing_name)"), "a\n", 120000)
+    if diag_use.rc == 0:
+        return bs_fail(ctx, "one-liner with an unknown name after a use unexpectedly succeeded")
+    rc = bs_assert_contains(ctx, diag_use.stderr, "<cli -n #1>:2:8", "one_liners")
+    if rc != 0: return rc
+
     args = Vec.new()
     args |> push("-e")
     args |> push("print(\"x\")")
@@ -7938,7 +7960,41 @@ pub fn run_cli_selfhost_build_w_action(ctx: ActionCtx) -> i32:
     if rc != 0: return rc
     rc = bs_check_build_w_action_no_deps(ctx, compiler_path, bs_join(base_dir, "action_no_deps"))
     if rc != 0: return rc
+    rc = bs_check_build_w_shared_output(ctx, compiler_path, bs_join(base_dir, "shared_output"))
+    if rc != 0: return rc
     bs_check_build_w_action_failures(ctx, compiler_path, bs_join(base_dir, "action_failures"))
+
+// #2014: two targets declaring one output are refused when the graph loads,
+// even when the command selects only one of them (linux-sysroot and
+// linux-sysroot-aarch64 both wrote out/gen/linux-sysroot-aarch64.pack).
+fn bs_check_build_w_shared_output(ctx: &ActionCtx, compiler_path: &str, case_dir: &str) -> i32:
+    var rc = bs_write_project_manifest(ctx, case_dir, "sharedoutput")
+    if rc != 0: return rc
+    rc = bs_build_w_write_fixture(ctx, bs_join(case_dir, "src/main.w"), "fn main:\n    print(\"unused\")\n", ctx.target_name(), "shared output source")
+    if rc != 0: return rc
+    let build =
+        "use std.build\n\n" ++
+        "fn write_a(ctx: ActionCtx) -> i32: ctx.fs().write_text(ctx.output(), \"a\")\n\n" ++
+        "fn write_b(ctx: ActionCtx) -> i32: ctx.fs().write_text(ctx.output(), \"b\")\n\n" ++
+        "pub fn build(ctx: BuildCtx) -> Build:\n" ++
+        "    var out = ctx.new_build()\n" ++
+        "    var a = target_new(.Action, \"writer-a\", \"\").output(\"out/action/shared.txt\")\n" ++
+        "    a.action = write_a\n" ++
+        "    out = out.add_target(a)\n" ++
+        "    var b = target_new(.Action, \"writer-b\", \"\").output(\"out/action/shared.txt\")\n" ++
+        "    b.action = write_b\n" ++
+        "    out = out.add_target(b)\n" ++
+        "    out.default(\"writer-a\")\n"
+    rc = bs_build_w_write_fixture(ctx, bs_join(case_dir, "build.w"), build, ctx.target_name(), "shared output build.w")
+    if rc != 0: return rc
+    let shared = bs_run_cli_capture_cwd(ctx, compiler_path, "build-w-shared-output", bs_blob_to_args(bs_argv_append("", "build")), 120000, case_dir)
+    if shared.rc == 0:
+        return bs_fail(ctx, "build_w_shared_output: building one of two targets that declare one output unexpectedly succeeded")
+    rc = bs_assert_contains(ctx, shared.stderr, "is declared by both target 'writer-a' and target 'writer-b'", "build_w_shared_output")
+    if rc != 0: return rc
+    if ctx.fs().exists(bs_join(case_dir, "out/action/shared.txt")):
+        return bs_fail(ctx, "build_w_shared_output: the refused graph still ran a writer")
+    0
 
 
 fn bs_copy_fixture_file(ctx: &ActionCtx, src: &str, dst: &str, label: &str) -> i32:
