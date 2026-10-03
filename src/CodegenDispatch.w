@@ -1850,8 +1850,22 @@ impl Codegen:
                 if callable_value:
                     return self.gen_fn_to_fat_ptr_thunk(found, callable_ty)
                 return found
-            with_eprint(f"warning: [ck-fn] NOT FOUND sym={fn_sym} name={fn_name}")
-            return wl_get_undef(fallback_ty)
+            // #1857: a generic function named as a value is its instance at
+            // the expected callable type (Sema's specialization, recorded on
+            // the name); the instance is emitted on demand like a generic
+            // call's callee.
+            let spec_sig = self.sema.get_sig(fn_sym)
+            if spec_sig >= 0 and self.sema.concrete_specialization_by_sym.contains(fn_sym):
+                let spec = self.ensure_concrete_mir_function(0, spec_sig, fn_sym, 0, "function value")
+                if spec.sym != 0 and spec.value != 0:
+                    if callable_value:
+                        return self.gen_fn_to_fat_ptr_thunk(spec.value, callable_ty)
+                    return spec.value
+            // #1859: a function constant with no function behind it is a
+            // compiler defect — Sema resolved the name, MirLower emitted the
+            // constant, and codegen declared nothing for it. An undef value
+            // here compiled and jumped into garbage at run time; it is a BUG.
+            sema_phase_bug(f"BUG: function constant names no function: sym={fn_sym} name={fn_name} (not in fn_values or the LLVM module)")
 
         wl_get_undef(fallback_ty)
 

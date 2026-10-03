@@ -62,6 +62,22 @@ const GEN_LOOP_ERR_RETURN: i32 = 2
 const GEN_LOOP_CANCEL: i32 = 3
 const GEN_LOOP_LABEL_BASE: i32 = 4
 
+// §14.17.1: the ordering an Atomic method uses when the call omits it —
+// `Order.SeqCst` (lib/std/sync.w), the value codegen's AtomicOrdering.SEQ_CST
+// names. MirLower materializes the omitted argument (#1861).
+const ATOMIC_ORDER_SEQ_CST: i64 = 4
+
+// The argument count (receiver excluded) of an Atomic method intrinsic, the
+// ordering(s) included: load(order), store/swap/fetch_*(value, order),
+// compare_exchange[_weak](expected, new, success, failure); 0 for any other
+// intrinsic. Codegen reads each argument by this position.
+fn mir_atomic_intrinsic_arg_count(intrinsic: MirIntrinsic) -> i32:
+    if intrinsic == MirIntrinsic.ATOMIC_LOAD: return 1
+    if intrinsic == MirIntrinsic.ATOMIC_STORE or intrinsic == MirIntrinsic.ATOMIC_SWAP: return 2
+    if intrinsic == MirIntrinsic.ATOMIC_FETCH_ADD or intrinsic == MirIntrinsic.ATOMIC_FETCH_SUB or intrinsic == MirIntrinsic.ATOMIC_FETCH_AND or intrinsic == MirIntrinsic.ATOMIC_FETCH_OR or intrinsic == MirIntrinsic.ATOMIC_FETCH_XOR or intrinsic == MirIntrinsic.ATOMIC_FETCH_MIN or intrinsic == MirIntrinsic.ATOMIC_FETCH_MAX: return 2
+    if intrinsic == MirIntrinsic.ATOMIC_CAS or intrinsic == MirIntrinsic.ATOMIC_CAS_WEAK: return 4
+    0
+
 // How a gen-loop closure's exit to a label outside it continues in the
 // owning frame (MirBuilder.gen_loop_exit_kinds).
 const GEN_EXIT_BREAK: i32 = 0
@@ -4215,6 +4231,14 @@ impl MirBuilder:
 
         // Generic function reference (monomorphized at codegen time)
         if self.sema.generic_fn_node_for_symbol(fn_sym) != 0:
+            // #1857: Sema instantiated the generic at the expected callable
+            // type and recorded the specialization on this node; the
+            // constant names that instance.
+            if node_id != 0 and self.sema.resolved_call_mono_syms.contains(node_id):
+                let mono_sym: i32 = self.sema.resolved_call_mono_syms.get(node_id).unwrap()
+                let mono_sig = self.sema.get_sig(mono_sym)
+                let mono_tid = if type_id != 0: type_id else if mono_sig >= 0: self.sema.sig_type_ids[mono_sig] else: 0
+                return self.fn_const_operand(mono_sym, mono_tid, node_id)
             return self.fn_const_operand(fn_sym, type_id, node_id)
 
         let const_node = self.try_resolve_module_const_node(sym)
@@ -12150,6 +12174,13 @@ impl MirBuilder:
         var operand = self.lower_expr(node)
         if self.sema.callable_any_fn_type(exact_type as TypeId) == 0:
             return operand
+        // D63 (§12.4): calling a callable observes it, a temporary included
+        // (`h.f.clone()(21)`). lower_expr hands a call result back as a MOVE
+        // of its statement temp, and the temp's scope-exit drop then follows
+        // a path that moved it (#1858: the ownership validator's "drop of _5
+        // after a path reaching it moved it out"). Read the temp in place.
+        if self.body.operand_kinds[operand] == OperandKind.OK_MOVE:
+            operand = self.body.new_operand(OperandKind.OK_COPY, self.body.operand_d0[operand])
         // A callable view (including a collection element) addresses the
         // stored callable. Project through references before invoking it;
         // passing the reference itself jumps into data instead of code.
@@ -13386,8 +13417,25 @@ impl MirBuilder:
                         // here: gen_closure resolves the node through this
                         // body's CK_CLOSURE constant, never from the AST.
                         let gc_closure_op = self.lower_closure(0, 0, self.ast.get_data1(gc_ma_node), self.ast.get_data2(gc_ma_node), gc_ma_node)
-                        gc_closure_ops.push(gc_closure_op)
-                        gc_args.push(gc_closure_op)
+                        // #1904 (§16.2b.9, §12.4): a closure literal given to
+                        // a `&U` parameter — a facade callback method's
+                        // userdata — is auto-borrowed exactly as a bound
+                        // closure is through lower_call_arg; passed by value
+                        // it was "a value where the callee parameter is a
+                        // reference to it". The literal's temp is this
+                        // statement's and is dropped with it.
+                        let gc_closure_param_ty = if gc_sig_idx >= 0: self.sema.sig_param_type(gc_sig_idx, gc_mai + gc_param_offset) else: 0
+                        let gc_closure_ty = self.expr_type(gc_ma_node)
+                        if gc_closure_param_ty != 0 and gc_closure_ty != 0 and self.sema.can_auto_ref_arg_frozen(gc_closure_param_ty, gc_closure_ty) != 0:
+                            let gc_closure_place = self.materialize_operand(gc_closure_op, gc_closure_ty, self.ast.get_start(gc_ma_node))
+                            let gc_closure_ref = self.body.new_rvalue(RvalueKind.RK_REF, BorrowKind.SHARED, gc_closure_place, 0)
+                            let gc_ref_temp = self.new_temp(gc_closure_param_ty)
+                            let gc_ref_place = self.place_for_local(gc_ref_temp)
+                            self.body.push_stmt(self.cur_bb, StmtKind.Assign, gc_ref_place, gc_closure_ref, self.ast.get_start(gc_ma_node))
+                            gc_args.push(self.body.new_operand(OperandKind.OK_COPY, gc_ref_place))
+                        else:
+                            gc_closure_ops.push(gc_closure_op)
+                            gc_args.push(gc_closure_op)
                 let gc_args_id = self.body.new_call_args(gc_args)
                 self.body.set_call_intrinsic(gc_args_id, MirIntrinsic.GENERIC_CALL)
                 self.require_generic_call_contract(gc_args_id, callee_sym, method_sym, self_expr, has_recorded_method_sig, "method-gc")
@@ -13588,6 +13636,19 @@ impl MirBuilder:
             call_args.push(arg_op)
         if intrinsic == MirIntrinsic.OPT_UNWRAP or intrinsic == MirIntrinsic.OPT_EXPECT:
             call_args.push(self.source_location_operand(node))
+        // §14.17.1 (#1861): an Atomic method's omitted ordering is SeqCst.
+        // Both backends read the ordering by position from the flat operand
+        // table, so an absent operand read the NEXT call's first operand (an
+        // f-string's literal text as the ordering: "wrong argument type
+        // actual=i32 expected=ptr") or ran off the table's end (a global
+        // initializer: "index out of bounds"). The omitted argument is
+        // materialized here, once, as this call's own operand.
+        let atomic_arg_count = mir_atomic_intrinsic_arg_count(intrinsic)
+        if atomic_arg_count > 0:
+            let order_tid = self.sema.resolve_atomic_order_type(recv_type_for_args)
+            let order_const_tid = if order_tid != 0: order_tid else: self.sema.ty_i32 as i32
+            while call_args.len() as i32 < 1 + atomic_arg_count:
+                call_args.push(self.int_const_operand(ATOMIC_ORDER_SEQ_CST, order_const_tid))
 
         let args_id = self.body.new_call_args(call_args)
         // D65: the intrinsic materializes this call node (a static
@@ -18107,12 +18168,16 @@ fn lower_concrete_specialization(sema: Sema, ast_pool: AstPool, pool: InternPool
     sema.current_module_path = saved_module_path
     sema.current_module_has_ci = saved_module_has_ci
 
-    for i in 0..subst_count:
-        let sym = subst_syms[i]
-        if saved_named_had[i] != 0:
-            sema.named_types.insert(sym, saved_named[i])
+    // Last to first: a parameter listed twice was saved twice, and only the
+    // first save is the caller's binding.
+    var ri = subst_count - 1
+    while ri >= 0:
+        let sym = subst_syms[ri]
+        if saved_named_had[ri] != 0:
+            sema.named_types.insert(sym, saved_named[ri])
         else:
             sema.named_types.remove(sym)
+        ri = ri - 1
     sema.generic_subst_param_syms = saved_subst_syms
     sema.generic_subst_type_ids = saved_subst_types
     ConcreteSpecializationLowerResult { sema, lowered }

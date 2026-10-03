@@ -977,6 +977,17 @@ impl Sema:
         if final_type == 0:
             self.emit_error(join_name ++ " expressions do not establish one compatible result type", report_node)
             return 0
+        // #1856 (§9.7, §21.1): `Ok(a)` alone fixes only `A` and `Err(b)`
+        // alone only `B`, so each arm is typed as the bare `Result` and the
+        // join agreed on the bare enum — an uninstantiated type no binding
+        // may hold (`:?` reached MIR for type 0). With no outer demand, the
+        // arms together name one `Result[A, B]`: `A` from the `Ok` arms' payloads,
+        // `B` from the `Err` arms'. (`Some(x)`/`None` already joins by the
+        // generic-instance-beside-base rule above.)
+        if expected == 0:
+            let result_join = self.infer_result_join_from_variant_arms(final_type, arm_nodes)
+            if result_join != 0:
+                final_type = result_join
 
         // The untyped literal arms take the typed arms' type, checked again
         // under that demand so their recorded type and constant fold agree
@@ -2051,7 +2062,6 @@ impl Sema:
         // (the callee-first dependencies still apply): a program whose facts
         // or diagnostics change under it depends on declaration order.
         let reverse = with_getenv_str("WITH_SEMA_BODY_ORDER") == "reverse"
-        self.publish_trait_contract_returns(count)
         for di in 0..count:
             self.check_decl_body_in_order(if reverse: count - 1 - di else: di)
         self.resolve_allocating_callees()
@@ -5729,13 +5739,17 @@ impl Sema:
 
         self.leave_callee_lexical_env(caller_env)
 
-        // Restore named_types
-        for ti in 0..tp_count:
+        // Restore named_types last to first: a parameter may be listed twice
+        // (`fn Box.new[T]` binds the owner's `T` and its own), and the second
+        // save read the first install, so only the first save is the caller's.
+        var ti = tp_count - 1
+        while ti >= 0:
             let tp_sym = tp_syms[ti]
             if saved_had[ti] == 1:
                 self.named_types.insert(tp_sym, saved_named[ti])
             else:
                 self.named_types.remove(tp_sym)
+            ti = ti - 1
 
         self.generic_subst_param_syms = saved_generic_subst_param_syms
         self.generic_subst_type_ids = saved_generic_subst_type_ids
@@ -9788,6 +9802,43 @@ impl Sema:
 
         // Check function names
         if self.generic_fn_node_for_symbol(sym) != 0 and self.is_ci_visible(sym) != 0 and self.symbol_visible_from_current(sym) != 0:
+            // #1857 (§12): a generic function named where a `fn(..) -> R`
+            // is expected is instantiated at that type's parameters. The
+            // specialization is recorded on this node (resolved_call_mono_syms,
+            // as a generic call records it) and the name is the instance's
+            // With callable value (D65); MIR never meets an untyped name.
+            if self.has_expected_type != 0 and self.expected_expr_type != 0:
+                let expected_callable = self.resolve_alias(self.expected_expr_type)
+                if self.get_type_kind(expected_callable) == TypeKind.TY_FN:
+                    let generic_node = self.generic_fn_node_for_symbol(sym)
+                    let expected_param_count = self.get_type_d1(expected_callable)
+                    let instance_arg_types: Vec[i32] = Vec.new()
+                    let instance_arg_nodes: Vec[i32] = Vec.new()
+                    for pi in 0..expected_param_count:
+                        instance_arg_types.push(self.fn_type_param_type(expected_callable as i32, pi))
+                    if self.check_generic_call(sym, generic_node, &instance_arg_types, &instance_arg_nodes, expected_param_count, node) == 0:
+                        return 0
+                    let mono_sig = self.resolved_call_sigs.get(node) ?? -1
+                    if mono_sig < 0:
+                        return 0
+                    // A specialization's signature carries no function type
+                    // (check_fn_body_concrete adds it with 0); the instance's
+                    // callable type is built from its concrete parameters
+                    // and return.
+                    let mono_param_count = self.sig_get_param_count(mono_sig)
+                    let mono_params: Vec[i32] = Vec.new()
+                    for mpi in 0..mono_param_count:
+                        mono_params.push(self.sig_param_type(mono_sig, mpi))
+                    let mono_tid = self.ensure_fn_type(&mono_params, mono_param_count, self.sig_return_type(mono_sig) as TypeId) as i32
+                    if self.fn_types_assignable(expected_callable as i32, mono_tid) == 0:
+                        self.emit_error("`" ++ self.pool_resolve(sym) ++ "` instantiated at the expected parameters is `" ++ self.type_name(mono_tid) ++ "`, not `" ++ self.type_name(expected_callable as i32) ++ "`", node)
+                        return 0
+                    self.fn_callable_values.insert(node, 1)
+                    self.typed_expr_types.insert(node, mono_tid)
+                    self.fn_value_ident_sigs.insert(node, mono_sig)
+                    self.note_callable_value(mono_sig, mono_tid)
+                    return mono_tid
+            self.emit_error("generic function `" ++ self.pool_resolve(sym) ++ "` as a value needs an expected function type to instantiate it (§12): annotate the binding or parameter, or call it", node)
             return 0
 
         let sig_idx = self.get_visible_sig(sym)
@@ -11865,6 +11916,9 @@ impl Sema:
             return 0
 
         if op == BinaryOp.OP_ADD or op == BinaryOp.OP_SUB or op == BinaryOp.OP_MUL or op == BinaryOp.OP_DIV or op == BinaryOp.OP_MOD:
+            let arith_op_text = if op == BinaryOp.OP_ADD: "+" else if op == BinaryOp.OP_SUB: "-" else if op == BinaryOp.OP_MUL: "*" else if op == BinaryOp.OP_DIV: "/" else: "%"
+            if self.reject_unit_operand(arith_op_text, lhs_node, lhs as i32) or self.reject_unit_operand(arith_op_text, rhs_node, rhs as i32):
+                return 0
             if op == BinaryOp.OP_ADD and lhs == self.ty_str and rhs == self.ty_str:
                 self.emit_error("string concatenation uses '++', not '+'", node)
                 return 0
@@ -11972,6 +12026,8 @@ impl Sema:
         // An unresolved type parameter may become str. An instantiated generic
         // such as Result[str, E] is already a known non-str container.
         if op == BinaryOp.OP_CONCAT:
+            if self.reject_unit_operand("++", lhs_node, lhs as i32) or self.reject_unit_operand("++", rhs_node, rhs as i32):
+                return 0
             let lhs_resolved = self.resolve_alias(lhs)
             let rhs_resolved = self.resolve_alias(rhs)
             let lhs_k = self.get_type_kind(lhs_resolved)
@@ -11983,6 +12039,30 @@ impl Sema:
             return self.ty_str as i32
 
         0
+
+    // #1862 (D65): a Unit operand of `++` or arithmetic is a type error here,
+    // never a codegen failure. The operand-kind lists below enumerated what
+    // is not a str or a number and left Unit out, so `"x " ++ test_label(0)`
+    // passed `check` and died in codegen. A call whose function returns Unit
+    // is named, with the D43 rule when that is why (`main`, `@[entry]` and
+    // `test_*` functions do not infer a return: their tail is a statement).
+    mut fn reject_unit_operand(op_text: &str, operand_node: i32, operand_ty: i32) -> bool:
+        if operand_ty == 0 or self.resolve_alias(operand_ty as TypeId) != self.ty_void:
+            return false
+        var why = ""
+        var callee = 0
+        var call = operand_node
+        while call != 0 and self.ast.kind(call) == NodeKind.NK_GROUPED:
+            call = self.ast.get_data0(call)
+        if call != 0 and self.ast.kind(call) == NodeKind.NK_CALL and self.ast.kind(self.ast.get_data0(call)) == NodeKind.NK_IDENT:
+            callee = self.ast.get_data0(self.ast.get_data0(call))
+        if callee != 0:
+            let callee_name: str = with_str_clone_ref(self.pool_resolve(callee))
+            why = ": `" ++ callee_name ++ "` returns Unit"
+            if callee_name == "main" or callee_name.starts_with("test_"):
+                why = why ++ " (D43: `main`, `@[entry]` and `test_*` functions do not infer a return; their tail is statement position — a `test_` name marks a test, so rename a helper)"
+        self.emit_error("operand of `" ++ op_text ++ "` is Unit" ++ why, operand_node)
+        true
 
     fn unwrap_lint_grouped_expr(node: i32) -> i32:
         var cur = node
@@ -22683,6 +22763,15 @@ impl Sema:
                 if arg_node > 0:
                     self.mark_moved_if_consumed(arg_node)
 
+        // #1856: a variant constructor's payload keeps the type this call
+        // checked it at. check_expr does not self-record every node kind (a
+        // `++` result is unrecorded), and the join that names
+        // `Result[A, B]` from bare `Ok(a)`/`Err(b)` arms reads it here.
+        if variant_payload_owner != 0 and resolved_arg_count == 1 and arg_types.len() as i32 >= 1 and arg_types[0] != 0:
+            let payload_node = if has_resolved != 0: self.get_resolved_call_arg(node, 0) else: self.ast.get_extra(resolved_extra_start)
+            if payload_node > 0 and not self.typed_expr_types.contains(payload_node):
+                self.typed_expr_types.insert(payload_node, arg_types[0])
+
         if self.check_comptime_call_restriction(fn_sym, node) != 0:
             return 0
         if self.fn_symbol_is_std_thread_spawn_os(fn_sym) != 0:
@@ -23241,6 +23330,53 @@ impl Sema:
         if node > 0 and self.ast.kind(node) == NodeKind.NK_BLOCK and self.ast.get_data2(node) != 0:
             return self.join_arm_value_node(self.ast.get_data2(node))
         node
+
+    // #1856: the `Result[A, B]` a join of bare-`Result` arms names, or 0
+    // when some reaching arm is not an `Ok(..)`/`Err(..)` constructor call
+    // or the arms do not fix both arguments (all `Ok`: the binding stays
+    // pending for a later demand, as before). The constructor calls are
+    // retyped to the instance, which MIR then lowers.
+    mut fn infer_result_join_from_variant_arms(join_ty: i32, arm_nodes: &Vec[i32]) -> i32:
+        let resolved = self.resolve_alias(join_ty as TypeId)
+        if self.get_type_kind(resolved) != TypeKind.TY_ENUM or self.get_type_d0(resolved) != self.syms.result:
+            return 0
+        var ok_ty = 0
+        var err_ty = 0
+        let retyped: Vec[i32] = Vec.new()
+        for ai in 0..arm_nodes.len() as i32:
+            let arm = arm_nodes[ai]
+            if arm <= 0 or self.body_can_fall_through(arm) == 0:
+                continue
+            let leaf = self.join_arm_value_node(arm)
+            if leaf <= 0 or self.ast.kind(leaf) != NodeKind.NK_CALL or self.ast.get_data2(leaf) != 1:
+                return 0
+            let callee = self.ast.get_data0(leaf)
+            if self.ast.kind(callee) != NodeKind.NK_IDENT:
+                return 0
+            let variant: str = self.pool_resolve(self.ast.get_data0(callee))
+            let payload = self.ast.get_extra(self.ast.get_data1(leaf))
+            let payload_ty = self.typed_expr_types.get(payload) ?? 0
+            if payload_ty == 0:
+                return 0
+            if variant == "Ok":
+                ok_ty = self.merge_contextual_owned_join_types(ok_ty, payload_ty)
+                if ok_ty == 0:
+                    return 0
+            else if variant == "Err":
+                err_ty = self.merge_contextual_owned_join_types(err_ty, payload_ty)
+                if err_ty == 0:
+                    return 0
+            else:
+                return 0
+            retyped.push(leaf)
+            if arm != leaf:
+                retyped.push(arm)
+        if ok_ty == 0 or err_ty == 0:
+            return 0
+        let inst = self.ensure_result_type_for(ok_ty, err_ty)
+        for ri in 0..retyped.len() as i32:
+            self.typed_expr_types.insert(retyped[ri], inst)
+        inst
 
     mut fn reject_implicit_numeric_narrowing(node: i32, expected: i32, actual: i32) -> bool:
         if node <= 0 or expected == 0 or actual == 0:
