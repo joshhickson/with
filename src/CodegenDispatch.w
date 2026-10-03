@@ -1128,6 +1128,46 @@ impl Codegen:
 
         -1
 
+    // D65 (#1647): a field projection's index is the position of the field
+    // in the declaration Sema resolved the owner to — never a lookup of the
+    // name in whichever LLVM struct the owner's representation happens to
+    // be. -1 when the owner has no Sema struct declaration to read (a tuple
+    // element, a variant payload, a compiler-laid-out record): those
+    // indices are positional already.
+    // An aggregate's named field operand: its position in the struct
+    // declaration of the aggregate's Sema type (Sema's record).
+    fn mir_sema_field_index(source_type: i32, field_token: i32) -> i32:
+        var text = with_str_clone_ref(self.intern.resolve(field_token))
+        if text.len() == 0: text = self.sema_symbol_text(field_token)
+        let sema_field = if text.len() > 0: self.sema.pool_lookup_symbol(text) else: 0
+        self.sema.struct_field_decl_index(source_type, sema_field)
+
+    // A field projection's GEP index: the declaration index MIR carries
+    // from Sema (`decl`); the LLVM registry's lookup by name verifies it
+    // under analysis. A positional projection (decl -1: a variant payload, a
+    // tuple-like record) keeps its position through the registry; a named
+    // one MIR lowered without Sema's index is reported (audit:codegen).
+    mut fn mir_projection_field_index(agg_ty: i64, field_token: i32, decl: i32, source_type: i32, active_variant: i32, fn_sym: i32, subject: i32) -> i32:
+        if decl >= 0:
+            let derived = if self.analysis_enabled != 0: self.mir_resolve_field_index(agg_ty, field_token, source_type) else: decl
+            return self.fact_decide(MODE_SITE_FIELD_INDEX, decl as i64, derived as i64, fn_sym, subject) as i32
+        if active_variant < 0:
+            let named = self.mir_sema_field_index(source_type, field_token)
+            if self.analysis_enabled != 0:
+                self.mode_record(MODE_SITE_FIELD_DECL_CARRIED, named < 0, fn_sym, subject, f"MIR carried no declaration index; Sema's record has {named}")
+            if named >= 0:
+                return named
+        self.mir_resolve_field_index(agg_ty, field_token, source_type)
+
+    // The index a field projection GEPs: Sema's declaration index when the
+    // owner has a Sema struct declaration; the LLVM registry's lookup by
+    // name is then the verification. Positional owners keep the registry.
+    mut fn mir_field_index_decided(agg_ty: i64, field_token: i32, source_type: i32, active_variant: i32, fn_sym: i32, subject: i32) -> i32:
+        let sema_fi = if active_variant < 0: self.mir_sema_field_index(source_type, field_token) else: -1
+        if sema_fi < 0: return self.mir_resolve_field_index(agg_ty, field_token, source_type)
+        let derived = if self.analysis_enabled != 0: self.mir_resolve_field_index(agg_ty, field_token, source_type) else: sema_fi
+        self.fact_decide(MODE_SITE_FIELD_INDEX, sema_fi as i64, derived as i64, fn_sym, subject) as i32
+
     // `src as tgt` where src is a transparent std Box and tgt is a raw
     // pointer to its payload type: the box value itself (#1280).
     fn mir_cast_is_box_payload_pointer(src_sema_ty: i32, tgt_sema_ty: i32) -> bool:
@@ -1246,7 +1286,7 @@ impl Codegen:
                 // (LLVMGetTypeKind(null) segfaulted the #1280 audit).
                 if cur_ty == 0:
                     return 0
-                let fi = self.mir_resolve_field_index(cur_ty, pd, variant_owner_sema_ty)
+                let fi = self.mir_projection_field_index(cur_ty, pd, body.proj_decl_index(p_start + i), variant_owner_sema_ty, active_variant_idx, body.fn_sym, place_id)
                 if fi < 0:
                     return 0
                 let union_idx = self.find_struct_index_by_type(cur_ty)
@@ -1444,7 +1484,7 @@ impl Codegen:
                         cur_ty = payload_ty
                         active_variant_idx = -1
                         continue
-                let fi = self.mir_resolve_field_index(cur_ty, pd, variant_owner_sema_ty)
+                let fi = self.mir_projection_field_index(cur_ty, pd, body.proj_decl_index(p_start + i), variant_owner_sema_ty, active_variant_idx, body.fn_sym, place_id)
                 if fi < 0:
                     return 0
                 let union_idx = self.find_struct_index_by_type(cur_ty)
@@ -3986,7 +4026,7 @@ impl Codegen:
                         if (agg_start + i) < body.agg_field_name_syms.len() as i32:
                             let name_sym = body.agg_field_name_syms[(agg_start + i)]
                             if name_sym != 0:
-                                let resolved_fi = self.mir_resolve_field_index(struct_ty, name_sym, dest_sema_ty)
+                                let resolved_fi = self.mir_field_index_decided(struct_ty, name_sym, dest_sema_ty, -1, body.fn_sym, i)
                                 if resolved_fi >= 0:
                                     fi = resolved_fi
                         let bp_info = self.get_bitpacked_field_info(struct_ty, fi)
@@ -4022,7 +4062,7 @@ impl Codegen:
                     if (agg_start + i) < body.agg_field_name_syms.len() as i32:
                         let name_sym = body.agg_field_name_syms[(agg_start + i)]
                         if name_sym != 0:
-                            let resolved_fi = self.mir_resolve_field_index(struct_ty, name_sym, dest_sema_ty)
+                            let resolved_fi = self.mir_field_index_decided(struct_ty, name_sym, dest_sema_ty, -1, body.fn_sym, i)
                             if resolved_fi >= 0:
                                 fi = resolved_fi
                     let union_idx = self.find_struct_index_by_type(struct_ty)
@@ -6155,75 +6195,48 @@ impl Codegen:
                 wl_position_at_end(self.builder, ubb)
                 wl_build_unreachable(self.builder)
 
+    // The pointer a reference to this operand's place is: the place's
+    // address, or — when the local's storage holds a pointer value — that
+    // pointer. Which one is the local's category (D65): FnAbi passing it by
+    // address (an indirect local), a by-place capture of a pointer-valued
+    // binding, or Sema typing it as a thin reference or raw pointer
+    // (mir_local_slot_holds_pointer). The slot's LLVM type is verification:
+    // it once decided, with the local's name (`self`) and the LLVM shape of
+    // its Sema type.
     mut fn mir_try_place_ptr_for_ref(body: &MirBody, operand_id: i32) -> i64:
         if operand_id < 0 or operand_id >= body.operand_kinds.len() as i32:
             return 0
         let ok = body.operand_kinds[operand_id]
         let od = body.operand_d0[operand_id]
-        if (ok == OperandKind.OK_COPY or ok == OperandKind.OK_MOVE) and od >= 0 and od < body.place_locals.len() as i32:
-            let local_id = body.place_locals[od]
-            let p_count = body.place_proj_counts[od]
-            if p_count == 0:
-                let value_opt = self.mir_local_values.get(local_id)
-                if value_opt.is_some():
-                    let value = value_opt.unwrap() as i64
-                    if value != 0 and wl_get_type_kind(wl_type_of(value)) == wl_pointer_type_kind():
-                        var value_is_indirect = self.mir_indirect_value_local_types.get(local_id).is_some()
-                        if not value_is_indirect and local_id >= 0 and local_id < body.local_names.len() as i32:
-                            let local_name = body.local_names[local_id]
-                            if local_name == self.sym_self:
-                                value_is_indirect = true
-                            else:
-                                let local_text = self.sema_symbol_text(local_name)
-                                if local_text == "self":
-                                    value_is_indirect = true
-                        if not value_is_indirect and local_id >= 0 and local_id < body.local_type_ids.len() as i32:
-                            let local_sema_ty = body.local_type_ids[local_id]
-                            if local_sema_ty > 0:
-                                let semantic_ty = self.mir_sema_type_to_llvm(local_sema_ty)
-                                if semantic_ty != 0 and wl_get_type_kind(semantic_ty) != wl_pointer_type_kind():
-                                    value_is_indirect = true
-                        if value_is_indirect:
-                            return value
-            let ptr = self.mir_place_ptr(body, od, false, 0)
-            if ptr == 0:
-                return 0
-            if p_count == 0:
-                let alloc_ty = wl_get_allocated_type(ptr)
-                if alloc_ty != 0 and wl_get_type_kind(alloc_ty) == wl_pointer_type_kind():
-                    // A by-place capture of a pointer-valued binding (`&T`,
-                    // `*mut T`): the slot holds the outer binding's address,
-                    // the pointer value is one load further (§12.4).
-                    if self.mir_ref_capture_local_types.get(local_id).is_some():
-                        let outer_slot = wl_build_load(self.builder, alloc_ty, ptr)
-                        return wl_build_load(self.builder, alloc_ty, outer_slot)
-                    return wl_build_load(self.builder, alloc_ty, ptr)
-                let ptr_ty_opt = self.mir_local_types.get(local_id)
-                if ptr_ty_opt.is_some():
-                    let ptr_ty = ptr_ty_opt.unwrap() as i64
-                    if ptr_ty != 0 and wl_get_type_kind(ptr_ty) == wl_pointer_type_kind():
-                        return wl_build_load(self.builder, ptr_ty, ptr)
-            var is_indirect_value_local = self.mir_indirect_value_local_types.get(local_id).is_some()
-            if not is_indirect_value_local and p_count == 0 and local_id >= 0 and local_id < body.local_names.len() as i32:
-                let local_name = body.local_names[local_id]
-                if local_name == self.sym_self:
-                    is_indirect_value_local = true
-                else:
-                    let local_text = self.sema_symbol_text(local_name)
-                    if local_text == "self":
-                        is_indirect_value_local = true
-            if not is_indirect_value_local and p_count == 0 and local_id >= 0 and local_id < body.local_type_ids.len() as i32:
-                let local_sema_ty = body.local_type_ids[local_id]
-                if local_sema_ty > 0:
-                    let semantic_ty = self.mir_sema_type_to_llvm(local_sema_ty)
-                    if semantic_ty != 0 and wl_get_type_kind(semantic_ty) != wl_pointer_type_kind():
-                        is_indirect_value_local = true
-            if p_count == 0 and is_indirect_value_local:
-                let indirect_ptr = self.mir_indirect_value_local_ptr(local_id, ptr)
-                if indirect_ptr != 0:
-                    return indirect_ptr
+        if (ok != OperandKind.OK_COPY and ok != OperandKind.OK_MOVE) or od < 0 or od >= body.place_locals.len() as i32:
+            return 0
+        let local_id = body.place_locals[od]
+        let p_count = body.place_proj_counts[od]
+        if p_count == 0:
+            // A local held as an SSA value: an indirect local's value IS the
+            // address of its value.
+            let value_opt = self.mir_local_values.get(local_id)
+            if value_opt.is_some():
+                let value = value_opt.unwrap() as i64
+                let indirect = self.mir_indirect_value_local_types.contains(local_id)
+                if value != 0 and self.mode_decide(MODE_SITE_REF_VALUE_IS_ADDRESS, indirect, indirect and wl_get_type_kind(wl_type_of(value)) == wl_pointer_type_kind(), body.fn_sym, local_id):
+                    return value
+        let ptr = self.mir_place_ptr(body, od, false, 0)
+        if ptr == 0 or p_count != 0:
             return ptr
-        0
+        let alloc_ty = wl_get_allocated_type(ptr)
+        let local_ty: i64 = self.mir_local_types.get(local_id) ?? 0
+        let llvm_holds_pointer = (alloc_ty != 0 and wl_get_type_kind(alloc_ty) == wl_pointer_type_kind()) or (local_ty != 0 and wl_get_type_kind(local_ty) == wl_pointer_type_kind())
+        if not self.mode_decide(MODE_SITE_REF_SLOT_HOLDS_POINTER, self.mir_local_slot_holds_pointer(body, local_id), llvm_holds_pointer, body.fn_sym, local_id):
+            return ptr
+        let ptr_ty = wl_ptr_type(self.context)
+        // A by-place capture of a pointer-valued binding (`&T`, `*mut T`):
+        // the slot holds the outer binding's address, the pointer value is
+        // one load further (§12.4).
+        if self.mir_ref_capture_local_types.contains(local_id):
+            let outer_slot = wl_build_load(self.builder, ptr_ty, ptr)
+            return wl_build_load(self.builder, ptr_ty, outer_slot)
+        wl_build_load(self.builder, ptr_ty, ptr)
 
     // #627: the ADDRESS of a receiver operand's place, without the
     // `mir_try_place_ptr_for_ref` load heuristic. A transparent single-pointer
@@ -6337,15 +6350,30 @@ impl Codegen:
         self.marshal_ref_addr(body, operand_id, val)
 
     // Whether a COPY/MOVE operand of an unprojected local names a local whose
-    // LLVM slot holds a pointer (so a ref marshal loads that pointer).
-    fn mir_operand_local_holds_pointer(body: &MirBody, operand_id: i32) -> bool:
+    // storage holds a pointer value (so a ref marshal loads that pointer).
+    mut fn mir_operand_local_holds_pointer(body: &MirBody, operand_id: i32) -> bool:
         if operand_id < 0 or operand_id >= body.operand_kinds.len() as i32: return false
         let ok = body.operand_kinds[operand_id]
         let od = body.operand_d0[operand_id]
         if (ok != OperandKind.OK_COPY and ok != OperandKind.OK_MOVE) or od < 0 or od >= body.place_locals.len() as i32: return false
         if body.place_proj_counts[od] != 0: return false
-        let ptr_ty_opt = self.mir_local_types.get(body.place_locals[od])
-        ptr_ty_opt.is_some() and wl_get_type_kind(ptr_ty_opt.unwrap() as i64) == wl_pointer_type_kind()
+        let local_id = body.place_locals[od]
+        let local_ty: i64 = self.mir_local_types.get(local_id) ?? 0
+        let fact = self.mir_local_slot_holds_pointer(body, local_id)
+        self.mode_decide(MODE_SITE_REF_SLOT_HOLDS_POINTER, fact, local_ty != 0 and wl_get_type_kind(local_ty) == wl_pointer_type_kind(), body.fn_sym, local_id)
+
+    // Whether an unprojected local's storage holds a pointer value rather
+    // than the value itself: a local FnAbi passes by address (an indirect
+    // local, its slot holds the value's address), a by-place capture of a
+    // pointer-valued binding, or a local whose type TypeLayout lays out as
+    // one address — a thin reference or raw pointer, an `extern fn`, a
+    // `Box[T]`, an `Option` over one of those (with-abi.md §3). D65: the
+    // category is its owners'; the slot's LLVM type is verification.
+    fn mir_local_slot_holds_pointer(body: &MirBody, local_id: i32) -> bool:
+        if self.mir_indirect_value_local_types.contains(local_id) or self.mir_ref_capture_local_types.contains(local_id):
+            return true
+        let sema_ty = if local_id >= 0 and local_id < body.local_type_ids.len() as i32: body.local_type_ids[local_id] else: 0
+        sema_ty > 0 and (self.sema.type_layout_is_single_address(sema_ty) or self.sema.type_layout_option_is_nullable(sema_ty))
 
     // Evaluating wrapper for call paths that have not pre-computed the value.
     mut fn mir_ref_arg_ptr(body: &MirBody, operand_id: i32) -> i64:
@@ -16701,6 +16729,8 @@ impl Codegen:
         let saved_tb_syms = move self.type_binding_syms
         let saved_tb_tys = move self.type_binding_types
         let saved_tb_len: i32 = self.type_bindings_len
+        let saved_body_owner_sym: i32 = self.current_body_owner_sym
+        self.current_body_owner_sym = name_sym
         self.set_mono_type_bindings(name_sym)
         let fn_has_sret_opt = self.fn_abi_has_sret(name_sym)
         let fn_has_sret = if fn_has_sret_opt.is_some(): fn_has_sret_opt.unwrap() else: 0
@@ -17074,6 +17104,7 @@ impl Codegen:
         self.tailrec_body_bb = saved_tailrec_bb
         self.tailrec_fn_sym = saved_tailrec_sym
         self.type_binding_syms = saved_tb_syms
+        self.current_body_owner_sym = saved_body_owner_sym
         self.type_binding_types = saved_tb_tys
         self.type_bindings_len = saved_tb_len
 
@@ -17157,6 +17188,8 @@ impl Codegen:
         let saved_tb_syms = move self.type_binding_syms
         let saved_tb_tys = move self.type_binding_types
         let saved_tb_len: i32 = self.type_bindings_len
+        let saved_body_owner_sym: i32 = self.current_body_owner_sym
+        self.current_body_owner_sym = mono_sym
         self.set_mono_type_bindings(mono_sym)
         let fn_has_sret_opt = self.fn_abi_has_sret(mono_sym)
         let fn_has_sret = if fn_has_sret_opt.is_some(): fn_has_sret_opt.unwrap() else: 0
@@ -17530,6 +17563,7 @@ impl Codegen:
         self.tailrec_fn_sym = saved_tail_sym
         self.tailrec_param_allocas = saved_tail_allocas
         self.type_binding_syms = saved_tb_syms
+        self.current_body_owner_sym = saved_body_owner_sym
         self.type_binding_types = saved_tb_tys
         self.type_bindings_len = saved_tb_len
         self.restore_loop_state(saved_loops)
@@ -17858,24 +17892,24 @@ impl Codegen:
             if self.find_binding_type(bind_syms, bind_tys, tp_syms[ti]) == 0:
                 return 0
 
-        let saved_bind_syms = move self.type_binding_syms
-        let saved_bind_tys = move self.type_binding_types
-        let saved_bind_len: i32 = self.type_bindings_len
-        let fresh_bind_syms: Vec[i32] = Vec.new()
-        let fresh_bind_tys: Vec[i64] = Vec.new()
-        self.type_binding_syms = fresh_bind_syms
-        self.type_binding_types = fresh_bind_tys
-        self.type_bindings_len = 0
+        // #1647 (D65): the owner is the instance Sema created for the bound
+        // arguments, laid out from Sema's record.
+        let inst_args: Vec[i32] = Vec.new()
         for ti in 0..tp_syms.len() as i32:
-            let tp_sym = tp_syms[ti]
-            let bty = self.find_binding_type(bind_syms, bind_tys, tp_sym)
-            self.type_binding_syms.push(tp_sym)
-            self.type_binding_types.push(bty)
-            self.type_bindings_len = self.type_bindings_len + 1
-        let mono_ty = self.monomorphize_struct(owner_sym, 0, 0)
-        self.type_binding_syms = saved_bind_syms
-        self.type_binding_types = saved_bind_tys
-        self.type_bindings_len = saved_bind_len
+            var arg_sema = 0
+            for bi in 0..bind_syms.len() as i32:
+                if bind_syms[bi] == tp_syms[ti]:
+                    arg_sema = bind_sema_tys[bi]
+                    break
+            if arg_sema <= 0:
+                return 0
+            inst_args.push(arg_sema)
+        let owner_text = with_str_clone_ref(self.intern.resolve(owner_sym))
+        let sema_owner_sym = if owner_text.len() > 0: self.sema.pool_lookup_symbol(owner_text) else: 0
+        let inst_tid = self.sema.find_generic_inst_type(sema_owner_sym, inst_args, tp_syms.len() as i32) as i32
+        if inst_tid <= 0:
+            return 0
+        let mono_ty = self.get_or_create_generic_struct_type(inst_tid)
 
         let mono_sym = self.find_struct_type_by_llvm(mono_ty)
         if mono_sym != 0:
@@ -18287,16 +18321,18 @@ impl Codegen:
         // §12.4 / #1481: every non-move closure captures a non-Copy value by
         // place (a pointer to the outer slot), let-bound or direct argument;
         // only `move ||` copies the bytes into the environment.
-        let can_capture_by_ref = self.pool.is_move_closure(node) == 0
-        let force_by_place_capture = self.pool.is_by_place_closure(node) == 1 and self.pool.is_move_closure(node) == 0
         let capture_ref_modes: Vec[i32] = Vec.new()
         for ci in 0..capture_count:
-            let sym = captures[ci]
             // §12.4: "Captures are by place regardless of whether the type
             // is Copy" — a Copy capture is a pointer to the outer slot too;
             // a read through it copies. Only `move ||` copies into the
-            // environment.
-            let by_ref = if force_by_place_capture or can_capture_by_ref: 1 else: 0
+            // environment. The mode is Sema's capture record (D62, D65);
+            // the closure's spelling is verification. A protocol capture MIR
+            // adds after Sema's (a gen-loop's flag, return slot, producer) is
+            // MIR's own, by place.
+            let protocol = ci < closure_body.anonymous_capture_kinds.len() as i32 and closure_body.anonymous_capture_kinds[ci] == MIR_CAPTURE_PROTOCOL
+            let by_place = protocol or self.sema.closure_capture_by_place(node, ci)
+            let by_ref = if self.mode_decide(MODE_SITE_CAPTURE_BY_PLACE, by_place, self.pool.is_move_closure(node) == 0, self.current_function_name_sym, node): 1 else: 0
             capture_ref_modes.push(by_ref)
 
         // Build capture struct type from captured variable types
@@ -18387,7 +18423,7 @@ impl Codegen:
         // {drop_fn, clone_fn, env} whose captures the body works on IN PLACE
         // (a consuming body blanks the slot it moved out of, so the cell's
         // drop fn never drops it again).
-        let owned_env = not is_extern_closure and capture_count > 0 and self.pool.is_move_closure(node) == 1
+        let owned_env = not is_extern_closure and capture_count > 0 and self.mode_decide(MODE_SITE_CLOSURE_OWNED_ENV, self.sema.closure_env_owned(node), self.pool.is_move_closure(node) == 1, self.current_function_name_sym, node)
         let cap_sema_types: Vec[i32] = Vec.new()
         for ci in 0..capture_count:
             cap_sema_types.push(closure_body.local_type_ids[ci + 1])
@@ -19436,6 +19472,22 @@ impl Codegen:
         if dtm_debug:
             with_eprint(f"[mono-bind] fn={self.intern.resolve(fn_sym)} sym={fn_sym} no-specialization")
 
+    // The type argument of a type-level builtin call (`sizeof[T]()`) as Sema
+    // checked it in the body being emitted (#1983, D65): for a
+    // specialization, the type recorded under its substitution; otherwise
+    // frozen resolution. Codegen never re-resolves the node itself.
+    fn sema_type_level_arg(type_node: i32) -> i32:
+        let owner = if self.current_body_owner_sym != 0: self.sema.pool_lookup_symbol(self.intern.resolve(self.current_body_owner_sym)) else: 0
+        self.sema.type_level_arg_in_body(owner, type_node)
+
+    // Its LLVM type. Under analysis the node's own resolution (which binds
+    // the instance's type parameters codegen-side) is the verification
+    // audit:codegen compares.
+    mut fn sema_type_level_arg_llvm(sema_tid: i32, type_node: i32) -> i64:
+        let fact = if sema_tid > 0: self.sema_type_to_llvm(sema_tid) else: 0
+        let derived = if self.analysis_enabled != 0: self.resolve_type(type_node) else: fact
+        self.fact_decide(MODE_SITE_SIZEOF_TYPE_ARG, fact, derived, self.current_function_name_sym, type_node)
+
     mut fn gen_sizeof_alignof(name_sym: i32, node: i32) -> i64:
         let callee_node = self.pool.get_data0(node)
         let callee_kind = self.pool.kind(callee_node)
@@ -19453,23 +19505,17 @@ impl Codegen:
             self.pool.get_extra(tp_start)
         else:
             self.pool.get_data1(callee_node)
+        // The type argument is Sema's (D65, #1983): the type it checked the
+        // call with in this body — a specialization's own instance included.
+        let sema_tid = self.sema_type_level_arg(tp_node)
         // §4.3d: a vector's size and alignment are Sema's layout facts
         // (TypeLayout), which on AArch64 differ from LLVM's `<N x T>`
         // alignment for vectors over 16 bytes.
-        let tp_arg_kind = self.pool.kind(tp_node)
-        var tp_base_sym = 0
-        if tp_arg_kind == NodeKind.NK_TYPE_GENERIC:
-            tp_base_sym = self.pool.get_data0(tp_node)
-        else if tp_arg_kind == NodeKind.NK_INDEX and self.pool.kind(self.pool.get_data0(tp_node)) == NodeKind.NK_IDENT:
-            tp_base_sym = self.pool.get_data0(self.pool.get_data0(tp_node))
-        let tp_base_text = if tp_base_sym != 0: self.intern.resolve(tp_base_sym).clone() else: ""
-        let tp_names_type = tp_arg_kind == NodeKind.NK_IDENT or tp_arg_kind == NodeKind.NK_TYPE_NAMED or tp_base_text == "Vector" or tp_base_text == "Mask"
-        let vector_tid = if tp_names_type: self.sema.resolve_type_level_arg_expr_frozen(tp_node) else: 0
-        if vector_tid > 0 and self.cg_sema_is_vector_or_mask(vector_tid):
-            let vector_size = self.sema.type_layout_vector_size_of(self.sema.resolve_alias(vector_tid as TypeId) as i32)
+        if sema_tid > 0 and self.cg_sema_is_vector_or_mask(sema_tid):
+            let vector_size = self.sema.type_layout_vector_size_of(self.sema.resolve_alias(sema_tid as TypeId) as i32)
             let vector_value = if name_sym == self.sym_sizeof or name_sym == self.sym_size_of: vector_size else: type_layout_vector_align(vector_size)
             return wl_const_int(wl_i64_type(self.context), vector_value, 0)
-        let type_val = self.resolve_type(tp_node)
+        let type_val = self.sema_type_level_arg_llvm(sema_tid, tp_node)
         if type_val == 0:
             with_eprint(f"error: sizeof/alignof type argument did not resolve (node={tp_node}, fn={self.intern.resolve(self.current_function_name_sym)})")
             self.had_error = 1
@@ -19480,13 +19526,13 @@ impl Codegen:
         // alignof: report the layout-model alignment, which honors §16.4 @[align]
         // field annotations (LLVM's i8-padded struct representation keeps the
         // correct size/stride but reports only the member ABI alignment).
-        let tp_kind = self.pool.kind(tp_node)
-        if tp_kind == NodeKind.NK_IDENT or tp_kind == NodeKind.NK_TYPE_NAMED:
-            let ty_sym = self.pool.get_data0(tp_node)
-            if self.sema.named_types.contains(ty_sym):
-                let model_align = self.sema.type_layout_align_of_frozen(self.sema.named_types.get(ty_sym).unwrap())
-                if model_align > 0:
-                    return wl_const_int(wl_i64_type(self.context), model_align, 0)
+        // The declaration is Sema's resolution of the argument, never a
+        // lookup of its spelling (a name two modules declare is two types).
+        let align_kind = self.sema.get_type_kind(self.sema.resolve_alias(sema_tid as TypeId))
+        if align_kind == TypeKind.TY_STRUCT or align_kind == TypeKind.TY_ENUM:
+            let model_align = self.sema.type_layout_align_of_frozen(sema_tid)
+            if model_align > 0:
+                return wl_const_int(wl_i64_type(self.context), model_align, 0)
         wl_const_int(wl_i64_type(self.context), wl_abi_align_of(dl, type_val) as i64, 0)
 
     // ── nameof/type_name intrinsic ─────────────────────────────────────

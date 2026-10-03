@@ -924,6 +924,32 @@ pub fn mir_test_resolution_places():
     assert(mir_call_arg_transfer_verdict(OperandKind.OK_COPY, true, true, false) == "")
     // A statement temporary (an explicit `move x` or `copy x`) is not judged.
     assert(mir_call_arg_transfer_verdict(OperandKind.OK_MOVE, false, true, false) == "")
+    // An index place: agreement, the D27 view's referent, a non-index
+    // projection, an element type Sema did not give the node, and a base
+    // MIR indexed that is not Sema's.
+    assert(mir_index_place_verdict(ProjKind.PK_INDEX, 10, 10, 0, 20, 20) == "")
+    assert(mir_index_place_verdict(ProjKind.PK_INDEX, 10, 11, 10, 20, 20) == "")
+    assert(mir_index_place_verdict(ProjKind.PK_FIELD, 10, 10, 0, 20, 20).contains("not an index"))
+    assert(mir_index_place_verdict(ProjKind.PK_INDEX, 12, 10, 0, 20, 20).contains("disagrees with Sema's type"))
+    assert(mir_index_place_verdict(ProjKind.PK_INDEX, 10, 10, 0, 21, 20).contains("indexed base"))
+    // #1647: a named field projection carries Sema's declaration index.
+    assert(mir_field_decl_verdict(2, 2) == "")
+    assert(mir_field_decl_verdict(-1, 2).contains("carries no declaration index"))
+    assert(mir_field_decl_verdict(1, 2).contains("carries declaration index 1"))
+    // A view `let` rooted at a binding Sema did not record as its origin;
+    // no recorded origins, or an unnamed root, are not judged.
+    assert(mir_view_origin_verdict(true, true, false).contains("did not record"))
+    assert(mir_view_origin_verdict(true, true, true) == "")
+    assert(mir_view_origin_verdict(false, true, false) == "")
+    assert(mir_view_origin_verdict(true, false, false) == "")
+    // A closure capture: a snapshot of a by-place capture (D62), a
+    // reference for a by-value one, and the agreements.
+    assert(mir_capture_verdict(MIR_CAPTURE_SNAPSHOT, true).contains("snapshots"))
+    assert(mir_capture_verdict(MIR_CAPTURE_PLACE_REF, false).contains("by value"))
+    assert(mir_capture_verdict(MIR_CAPTURE_SNAPSHOT, false) == "")
+    assert(mir_capture_verdict(MIR_CAPTURE_PLACE_REF, true) == "")
+    assert(mir_capture_verdict(MIR_CAPTURE_LOCAL, true) == "")
+    assert(mir_capture_verdict(MIR_CAPTURE_PROTOCOL, false) == "")
 
 // #1627: an enum aggregate whose `&T` payload slot receives the `T` value
 // itself — `Option[&Ctx].Some(ctx)` lowered `move ctx` there, and every

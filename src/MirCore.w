@@ -441,6 +441,12 @@ pub type MirBody {
     // The creating body's local each capture (locals 1..count) is taken
     // from, by id (codegen builds the environment from these).
     anonymous_capture_sources: Vec[i32],
+    // ... and how MIR materialized each (MIR_CAPTURE_*): the local itself,
+    // a snapshot copy, a reference to an alias place, or a protocol capture
+    // MIR adds by place (a gen-loop's flag, return slot and producer).
+    // audit:resolution judges the first three against Sema's capture mode
+    // (D62); a protocol capture is MIR's own and follows Sema's record.
+    anonymous_capture_kinds: Vec[i32],
 
     // Locals
     local_type_ids: Vec[i32],
@@ -485,6 +491,12 @@ pub type MirBody {
     place_proj_counts: Vec[i32],
     proj_kinds: Vec[i32],
     proj_d0: Vec[i32],
+    // A PK_FIELD projection of a named struct field: the field's position in
+    // the struct declaration Sema resolved its owner to (D65, #1647); -1 for
+    // every other projection (a tuple element, a variant payload, a
+    // compiler-laid-out record's positional field), whose proj_d0 is the
+    // position.
+    proj_decl: Vec[i32],
 
     // Rvalues
     rval_kinds: Vec[i32],
@@ -561,6 +573,19 @@ pub type MirBody {
     // name aliases a place, 0 when it owns a local.
     let_binding_nodes: Vec[i32],
     let_binding_aliases: Vec[i32],
+    // ... the place an aliasing `let` names (-1 for an owning local), whose
+    // root audit:resolution joins to Sema's view origins for the value.
+    let_binding_places: Vec[i32],
+    // ... and each place lowered from a source index expression, with the
+    // base place it indexes.
+    index_place_nodes: Vec[i32],
+    index_place_places: Vec[i32],
+    index_place_bases: Vec[i32],
+    // The Sema symbol of the specialization whose body this is, or that
+    // encloses it (a closure, a gen loop body, a generator's producer); 0
+    // outside a specialization. Sema keys the facts it records per instance
+    // (index_element_in_body, type_level_arg_in_body) by it (#1647, D65).
+    instance_sym: i32,
 
     // Stage 4 (spec §2.5.2): locals that are ever moved — and therefore
     // reset-on-move (§2.5.1) — recorded at the single pending_reset_locals.push
@@ -751,6 +776,7 @@ fn MirBody.init_for_fn(fn_sym: i32) -> MirBody:
         anonymous_type: 0,
         anonymous_capture_count: 0,
         anonymous_capture_sources: Vec.new(),
+        anonymous_capture_kinds: Vec.new(),
         local_type_ids: Vec.new(),
         local_mutables: Vec.new(),
         local_names: Vec.new(),
@@ -780,6 +806,7 @@ fn MirBody.init_for_fn(fn_sym: i32) -> MirBody:
         place_proj_counts: Vec.new(),
         proj_kinds: Vec.new(),
         proj_d0: Vec.new(),
+        proj_decl: Vec.new(),
         rval_kinds: Vec.new(),
         rval_d0: Vec.new(),
         rval_d1: Vec.new(),
@@ -816,6 +843,11 @@ fn MirBody.init_for_fn(fn_sym: i32) -> MirBody:
         field_place_bases: Vec.new(),
         let_binding_nodes: Vec.new(),
         let_binding_aliases: Vec.new(),
+        let_binding_places: Vec.new(),
+        index_place_nodes: Vec.new(),
+        index_place_places: Vec.new(),
+        index_place_bases: Vec.new(),
+        instance_sym: 0,
         ever_moved_locals: Vec.new(),
     }
 
@@ -928,6 +960,9 @@ impl MirBody:
         id
 
     mut fn new_place_with_projection(base: i32, proj_kind: i32, proj_data: i32, sema_ty: i32) -> i32:
+        self.new_place_with_projection_decl(base, proj_kind, proj_data, -1, sema_ty)
+
+    mut fn new_place_with_projection_decl(base: i32, proj_kind: i32, proj_data: i32, decl: i32, sema_ty: i32) -> i32:
         if base < 0 or base >= self.place_locals.len():
             return self.new_place(0)
 
@@ -939,9 +974,11 @@ impl MirBody:
         for i in 0..base_proj_count:
             self.proj_kinds.push(self.proj_kinds[(base_proj_start + i)])
             self.proj_d0.push(self.proj_d0[(base_proj_start + i)])
+            self.proj_decl.push(self.proj_decl[(base_proj_start + i)])
 
         self.proj_kinds.push(proj_kind)
         self.proj_d0.push(proj_data)
+        self.proj_decl.push(decl)
 
         let id = self.place_locals.len() as i32
         self.place_locals.push(base_local)
@@ -950,8 +987,18 @@ impl MirBody:
         self.place_proj_counts.push(base_proj_count + 1)
         id
 
+    // A positional field: a variant payload, a tuple-like record's slot.
     mut fn new_field_place(base: i32, field_idx: i32, sema_ty: i32) -> i32:
         self.new_place_with_projection(base, ProjKind.PK_FIELD, field_idx, sema_ty)
+
+    // A named struct field: its symbol, and its declaration index from Sema
+    // (-1 when the owner has no struct declaration with it).
+    mut fn new_named_field_place(base: i32, field_sym: i32, decl: i32, sema_ty: i32) -> i32:
+        self.new_place_with_projection_decl(base, ProjKind.PK_FIELD, field_sym, decl, sema_ty)
+
+    fn proj_decl_index(proj_idx: i32) -> i32:
+        if proj_idx < 0 or proj_idx >= self.proj_decl.len() as i32: return -1
+        self.proj_decl[proj_idx]
 
     mut fn new_tuple_index_place(base: i32, elem_idx: i32, sema_ty: i32) -> i32:
         self.new_place_with_projection(base, ProjKind.PK_TUPLE_INDEX, elem_idx, sema_ty)
@@ -1099,10 +1146,17 @@ impl MirBody:
     mut fn note_elided_call_node(node: i32):
         if node > 0: self.elided_call_nodes.push(node)
 
-    mut fn note_let_binding(node: i32, alias: i32):
+    mut fn note_let_binding(node: i32, alias_place: i32):
         if node <= 0: return
         self.let_binding_nodes.push(node)
-        self.let_binding_aliases.push(alias)
+        self.let_binding_aliases.push(if alias_place >= 0: 1 else: 0)
+        self.let_binding_places.push(alias_place)
+
+    mut fn note_index_place(node: i32, place: i32, base: i32):
+        if node <= 0: return
+        self.index_place_nodes.push(node)
+        self.index_place_places.push(place)
+        self.index_place_bases.push(base)
 
     mut fn note_field_place(node: i32, place: i32, base: i32):
         if node <= 0: return
@@ -3037,6 +3091,28 @@ fn validate_use_after_kill_body(body: &MirBody, pool: &InternPool) -> str:
 pub fn validate_use_after_kill(body: &MirBody, pool: &InternPool) -> str:
     validate_use_after_kill_body(body, pool)
 
+// A validator verdict names bodies `fn sym<N>`; the reader needs the
+// function. Each `fn sym<N>` gains its name, as --dump-mir prints it.
+pub fn mir_name_fn_syms(text: &str, pool: &InternPool) -> str:
+    var out = StringBuilder.new()
+    var i = 0
+    let n = text.len() as i32
+    while i < n:
+        if i + 6 <= n and text.slice(i as i64, (i + 6) as i64) == "fn sym":
+            var j = i + 6
+            var sym = 0
+            while j < n and text[j] >= '0' and text[j] <= '9':
+                sym = sym * 10 + (text[j] - '0') as i32
+                j += 1
+            out.push_str(text.slice(i as i64, j as i64))
+            if j > i + 6:
+                out.push_str(f"({pool.resolve(sym)})")
+            i = j
+            continue
+        out.push_byte(text[i])
+        i += 1
+    out.to_str()
+
 pub fn validate_all_mir_module(mir_mod: &MirModule) -> str:
     let shape = validate_mir_module(mir_mod)
     if shape.len() > 0:
@@ -4113,6 +4189,53 @@ pub fn mir_let_binding_verdict(mir_alias: bool, sema_place_view: bool) -> str:
         return "MIR binds the name as an alias of a place; Sema bound it as an owner"
     if sema_place_view and not mir_alias:
         return "Sema bound the name as a view of a place; MIR gives it an owning local"
+    ""
+
+// #1647 (D65): a place lowered from a source index expression against
+// Sema's facts for the node. Types arrive alias-resolved: `sema_ty` is
+// Sema's type of the node and `sema_view_target` its referent when Sema
+// typed the element read as a view (D27: `xs[i]` denotes the element
+// place, typed `&T` where a view is demanded); bases with references and
+// raw pointers peeled. "" when they agree.
+pub fn mir_index_place_verdict(proj_kind: i32, mir_ty: i32, sema_ty: i32, sema_view_target: i32, mir_base: i32, sema_base: i32) -> str:
+    if proj_kind != ProjKind.PK_INDEX:
+        return f"index expression lowered to a place whose last projection is not an index (kind {proj_kind})"
+    if sema_ty > 0 and mir_ty > 0 and mir_ty != sema_ty and mir_ty != sema_view_target:
+        return f"element place type (ty {mir_ty}) disagrees with Sema's type for the node (ty {sema_ty})"
+    if sema_base > 0 and mir_base > 0 and sema_base != mir_base:
+        return f"indexed base is ty {mir_base} in MIR, ty {sema_base} in Sema"
+    ""
+
+// #1647 (D65): a named field projection's declaration index against the
+// index Sema resolved the source field access to. "" when they agree.
+pub fn mir_field_decl_verdict(mir_decl: i32, sema_decl: i32) -> str:
+    if mir_decl < 0:
+        return f"field projection carries no declaration index; Sema resolved the field to declaration index {sema_decl}"
+    if mir_decl != sema_decl:
+        return f"field projection carries declaration index {mir_decl}; Sema resolved the field to {sema_decl}"
+    ""
+
+// #1647 (D65): the place an aliasing `let` names against Sema's view
+// origins for its value — the bindings Sema recorded the view depends on.
+// `root_name_in_origins`: the alias place's root local is one of them.
+pub fn mir_view_origin_verdict(sema_has_origins: bool, root_named: bool, root_name_in_origins: bool) -> str:
+    if sema_has_origins and root_named and not root_name_in_origins:
+        return "MIR aliases a place rooted at a binding Sema did not record as the view's origin"
+    ""
+
+// MirBody.anonymous_capture_kinds.
+pub const MIR_CAPTURE_LOCAL: i32 = 0
+pub const MIR_CAPTURE_SNAPSHOT: i32 = 1
+pub const MIR_CAPTURE_PLACE_REF: i32 = 2
+pub const MIR_CAPTURE_PROTOCOL: i32 = 3
+
+// #1647 (D62/D65): one closure capture's MIR materialization against
+// Sema's capture mode. "" when they agree.
+pub fn mir_capture_verdict(mir_kind: i32, sema_by_place: bool) -> str:
+    if mir_kind == MIR_CAPTURE_SNAPSHOT and sema_by_place:
+        return "MIR snapshots a capture Sema holds by place: the closure reads a copy the creating frame never sees written"
+    if mir_kind == MIR_CAPTURE_PLACE_REF and not sema_by_place:
+        return "MIR captures a reference to a place Sema has the closure take by value"
     ""
 
 pub fn mir_resolution_check_call(mir_mod: &MirModule, body: &MirBody, bb: i32, answer: &CalleeResolution) -> str:

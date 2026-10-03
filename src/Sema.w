@@ -1776,6 +1776,19 @@ pub type Sema {
     // substitution, which needs the mutable substitution stack.
     current_specialization_sym: i32,
     specialization_type_args: HashMap[i64, i32],
+    // #1647 (D65): each runtime index expression's element place type and
+    // the type of the base it indexes, as checked in the body that holds it,
+    // keyed pair(specialization symbol or 0, index node). typed_expr_types
+    // holds one type per node — a template's nodes carry whichever instance
+    // was checked last — so MIR and the audit read the instance's answer
+    // here (index_element_in_body).
+    index_element_types: HashMap[i64, i32],
+    index_base_types: HashMap[i64, i32],
+    // ... and each source field access's position in the struct
+    // declaration Sema resolved its owner to (field_decl_index_in_body).
+    field_access_decl_indexes: HashMap[i64, i32],
+    field_access_types: HashMap[i64, i32],
+    field_access_owners: HashMap[i64, i32],
 
     // Current state
     source_text: str,
@@ -3347,6 +3360,11 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         current_fn_symbol: 0,
         current_specialization_sym: 0,
         specialization_type_args: sema_new_map_i64_i32(),
+        index_element_types: sema_new_map_i64_i32(),
+        index_base_types: sema_new_map_i64_i32(),
+        field_access_decl_indexes: sema_new_map_i64_i32(),
+        field_access_types: sema_new_map_i64_i32(),
+        field_access_owners: sema_new_map_i64_i32(),
         source_text: "",
         tracked_input_root: "",
         tracked_input_paths: sema_new_vec_str(),
@@ -5831,7 +5849,25 @@ impl Sema:
             return 0
         if self.generic_inst_templates.contains(resolved):
             return self.generic_inst_templates.get(resolved).unwrap()
-        self.type_reflection_base_template(self.get_type_d0(resolved))
+        // #1647 / #1745: only a generic declaration can be an instance's
+        // template. Name visibility from wherever the question is asked (a
+        // user module's `type PullCore { .. }` beside std.task's private
+        // `PullCore[G]`) must not pick a non-generic namesake.
+        let base_sym = self.get_type_d0(resolved)
+        var generic_only = 0
+        var i = self.named_type_candidate_head(base_sym)
+        while i >= 0:
+            let candidate_tid = self.resolve_alias(self.named_type_candidate_tids[i] as TypeId) as i32
+            let decl = self.type_decl_nodes_by_tid.get(candidate_tid) ?? 0
+            if decl != 0 and self.type_decl_tp_count(decl) > 0 and candidate_tid != generic_only:
+                if generic_only != 0:
+                    generic_only = -1
+                    break
+                generic_only = candidate_tid
+            i = self.named_type_candidate_next[i]
+        if generic_only > 0:
+            return generic_only
+        self.type_reflection_base_template(base_sym)
 
     // The declaring node of a generic instance's template: by the recorded
     // template's identity first; the flat symbol-keyed map (the newest
@@ -8081,6 +8117,20 @@ impl Sema:
     // guard, since the body blanks the place through the capture (#1481).
     fn closure_capture_consumes(closure_node: i32, idx: i32) -> i32:
         if (self.closure_capture_summary_eff(closure_node, idx) & (EFF_CONSUME | EFF_ESCAPE_VALUE)) != 0: 1 else: 0
+
+    // D62/D65: Sema's capture mode for capture `idx` of a closure — by place
+    // (a pointer to the creating frame's slot, Copy or not) unless the
+    // closure is `move`, which takes the value. Every downstream stage reads
+    // this; none re-reads the closure's spelling.
+    fn closure_capture_by_place(closure_node: i32, idx: i32) -> bool:
+        (self.closure_capture_summary_eff(closure_node, idx) & EFF_CAPTURE_BY_PLACE) != 0
+
+    // D63: the closure value owns its environment — some capture is held by
+    // value, not by place (a `move` closure with captures).
+    fn closure_env_owned(closure_node: i32) -> bool:
+        for ci in 0..self.closure_capture_summary_count(closure_node):
+            if not self.closure_capture_by_place(closure_node, ci): return true
+        false
 
     fn closure_capture_summary_eff(closure_node: i32, idx: i32) -> i32:
         if not self.closure_capture_summary_starts.contains(closure_node):

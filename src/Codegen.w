@@ -135,6 +135,11 @@ pub type Codegen {
     // being emitted: the function's own, or a specialization's template
     // (#1745). Closures and drop glue emitted inside keep it.
     current_function_tier_node: i32,
+    // #1983/D65: the codegen symbol of the top-level body being emitted (a
+    // specialization's mono symbol, or the function's own); closures
+    // emitted inside keep it. Sema keys the facts it recorded while checking
+    // an instance (specialization_type_args) by that symbol.
+    current_body_owner_sym: i32,
     current_method_owner_sym: i32,
     current_drop_origin_ptr: i64,
     current_drop_origin_len: i64,
@@ -288,6 +293,8 @@ pub type Codegen {
     enum_by_llvm: HashMap[i64, i32],
     generic_enum_inst_types: HashMap[i32, i64],
     generic_enum_inst_syms: HashMap[i32, i32],
+    // #1647: a user generic struct instance's LLVM struct, by Sema TypeId.
+    generic_struct_inst_types: HashMap[i32, i64],
 
     // Discriminant enums: sym → index into disc_enum_* arrays
     disc_enum_type_map: HashMap[i32, i32],
@@ -831,16 +838,27 @@ impl Codegen:
     // and the LLVM type is verification only.
     mut fn mode_decide(site: i32, fact: bool, llvm: bool, fn_sym: i32, subject: i32) -> bool:
         if self.analysis_enabled != 0:
-            while self.mode_site_decisions.len() as i32 < MODE_SITE_COUNT:
-                self.mode_site_decisions.push(0)
-                self.mode_site_disagree.push(0)
-                self.mode_site_first.push("")
-            self.mode_site_decisions[site] = self.mode_site_decisions[site] + 1
-            if fact != llvm:
-                if self.mode_site_disagree[site] == 0:
-                    self.mode_site_first[site] = f"{self.sema_symbol_text(fn_sym)} subject {subject}: fact={fact} llvm-pointer={llvm}"
-                self.mode_site_disagree[site] = self.mode_site_disagree[site] + 1
+            self.mode_record(site, fact == llvm, fn_sym, subject, f"fact={fact} llvm-pointer={llvm}")
         fact
+
+    // The same rule for a fact that is a value (a field index, an LLVM
+    // type): the owner's answer is the decision, the re-derivation the
+    // site once used is verification only.
+    mut fn fact_decide(site: i32, fact: i64, derived: i64, fn_sym: i32, subject: i32) -> i64:
+        if self.analysis_enabled != 0:
+            self.mode_record(site, fact == derived, fn_sym, subject, f"owner={fact} derived={derived}")
+        fact
+
+    mut fn mode_record(site: i32, agree: bool, fn_sym: i32, subject: i32, detail: str):
+        while self.mode_site_decisions.len() as i32 < MODE_SITE_COUNT:
+            self.mode_site_decisions.push(0)
+            self.mode_site_disagree.push(0)
+            self.mode_site_first.push("")
+        self.mode_site_decisions[site] = self.mode_site_decisions[site] + 1
+        if not agree:
+            if self.mode_site_disagree[site] == 0:
+                self.mode_site_first[site] = f"{self.sema_symbol_text(fn_sym)} subject {subject}: {detail}"
+            self.mode_site_disagree[site] = self.mode_site_disagree[site] + 1
 
     // One verdict per site: an owner fact the LLVM representation
     // contradicts is a violation — either the fact or the representation is
@@ -851,7 +869,7 @@ impl Codegen:
         for site in 0..self.mode_site_decisions.len() as i32:
             let name = mode_site_name(site)
             if self.mode_site_disagree[site] > 0:
-                self.analysis_fail(f"mode-provenance: {name}: {mode_site_owner(site)} and the LLVM type disagree in {self.mode_site_disagree[site]} of {self.mode_site_decisions[site]} decisions; first: {self.mode_site_first[site]}")
+                self.analysis_fail(f"mode-provenance: {name}: {mode_site_owner(site)} and {mode_site_derivation(site)} disagree in {self.mode_site_disagree[site]} of {self.mode_site_decisions[site]} decisions; first: {self.mode_site_first[site]}")
             self.analysis_report.note(f"mode-provenance: {name} decisions={self.mode_site_decisions[site]} disagree={self.mode_site_disagree[site]}")
 
     mut fn audit_codegen_call_coverage():
@@ -1012,6 +1030,7 @@ fn Codegen.init_with_opt(module_name: &str, opt_level: i32) -> Codegen:
         current_function_name_sym: 0,
         current_function_node: 0,
         current_function_tier_node: 0,
+        current_body_owner_sym: 0,
         current_method_owner_sym: 0,
         current_drop_origin_ptr: 0,
         current_drop_origin_len: 0,
@@ -1081,6 +1100,7 @@ fn Codegen.init_with_opt(module_name: &str, opt_level: i32) -> Codegen:
         enum_by_llvm: HashMap.new(),
         generic_enum_inst_types: HashMap.new(),
         generic_enum_inst_syms: HashMap.new(),
+        generic_struct_inst_types: HashMap.new(),
         disc_enum_type_map: HashMap.new(),
         disc_enum_name_syms: Vec.new(),
         disc_enum_repr_types: Vec.new(),
@@ -3209,7 +3229,21 @@ impl Codegen:
             let resolved = self.sema_type_to_llvm(sema_tid)
             if resolved != 0: return resolved
         if self.generic_structs.contains(name_sym):
-            return self.monomorphize_struct_nodes(name_sym, args)
+            // #1647 (D65): a generic struct instance is Sema's. The arguments
+            // name it through the active bindings; an LLVM layout never does.
+            let inst_args: Vec[i32] = Vec.new()
+            for ai in 0..count:
+                let arg_sema = self.type_expr_to_sema_type(args[ai])
+                if arg_sema <= 0: break
+                inst_args.push(arg_sema)
+            let base_text = with_str_clone_ref(self.intern.resolve(name_sym))
+            let sema_base = if base_text.len() > 0: self.sema.pool_lookup_symbol(base_text) else: 0
+            let inst = if inst_args.len() == count: self.sema.find_generic_inst_type(sema_base, inst_args, count as i32) as i32 else: 0
+            if inst > 0:
+                return self.get_or_create_generic_struct_type(inst)
+            with_eprint(f"error: BUG: generic struct type `{base_text}` at node {type_node} names no instance Sema created")
+            self.had_error = 1
+            return self.type_fallback()
         0
 
     fn resolve_primitive_named_type(sym: i32) -> i64:
@@ -3921,35 +3955,9 @@ impl Codegen:
                 let base_tid: i32 = self.sema.named_types.get(base_sym).unwrap()
                 if self.sema.get_type_kind(base_tid) == TypeKind.TY_ENUM:
                     return self.get_or_create_generic_enum_type(resolved_tid)
-            // User-defined generic structs: monomorphize via type bindings
+            // User-defined generic structs: Sema's instance (#1647).
             if cg_base_sym != 0 and self.generic_structs.contains(cg_base_sym):
-                let saved_len: i32 = self.type_bindings_len
-                let saved_syms = move self.type_binding_syms
-                let saved_types = move self.type_binding_types
-                let tp_syms: Vec[i32] = Vec.new()
-                let tp_types: Vec[i64] = Vec.new()
-                let gs_node: i32 = self.generic_structs.get(cg_base_sym).unwrap()
-                let tp_count = self.type_decl_tp_count(gs_node)
-                var tp_pos = self.type_decl_tp_start(gs_node)
-                for ti in 0..tp_count:
-                    let tp_sym = self.pool.get_extra(tp_pos)
-                    tp_syms.push(tp_sym)
-                    let bc = self.pool.get_extra(tp_pos + 1)
-                    tp_pos = tp_pos + 2 + bc
-                    var arg_ty: i64 = 0
-                    if ti < arg_count:
-                        arg_ty = self.sema_type_to_llvm(self.sema.get_generic_inst_arg(resolved_tid, ti))
-                    if arg_ty == 0:
-                        arg_ty = self.type_fallback()
-                    tp_types.push(arg_ty)
-                self.type_binding_syms = tp_syms
-                self.type_binding_types = tp_types
-                self.type_bindings_len = tp_count
-                let mono_ty = self.monomorphize_struct(cg_base_sym, 0, 0)
-                self.type_bindings_len = saved_len
-                self.type_binding_syms = saved_syms
-                self.type_binding_types = saved_types
-                return mono_ty
+                return self.get_or_create_generic_struct_type(resolved_tid)
             return 0
         if tk == TypeKind.TY_FLOAT:
             let width = self.sema.get_type_d0(resolved_tid)
@@ -4645,16 +4653,8 @@ impl Codegen:
             let offset = extra_start + 1 + fi * 3
             let f_name = self.pool.get_extra(offset)
             let f_type_node = self.pool.get_extra(offset + 1)
-            // #1984 (D65): a generic-instance field is the LLVM type of Sema's
-            // field type, the identity every MIR read of the field lowers.
-            // Resolving the node instead monomorphized the instance under a
-            // name built from its arguments' LLVM layouts
-            // (`HashMap__str__struct{ptr,i64,i64,i64}` beside
-            // `__with.HashMap.str.__with.Vec.str`): one Sema type, two LLVM
-            // structs.
             let f_sema_ty = if struct_tid > 0: self.sema.type_reflection_field_type_frozen(struct_tid, fi) else: 0
-            let f_is_generic_inst = f_sema_ty > 0 and self.sema.get_type_kind(self.sema.resolve_alias(f_sema_ty as TypeId)) == TypeKind.TY_GENERIC_INST
-            let f_ty = if f_is_generic_inst: self.sema_type_to_llvm(f_sema_ty) else: self.resolve_type(f_type_node)
+            let f_ty = self.field_llvm_type(f_sema_ty, f_type_node, name_sym, fi, false)
             self.debug_type_layout_field(name_str, fi, f_name, f_type_node, f_ty)
 
             if f_ty == 0:
@@ -4830,17 +4830,18 @@ impl Codegen:
         var max_align_ty: i64 = 0
         var max_align_size: i64 = 0
         var invalid_layout = 0
+        let union_tid = self.type_decl_sema_tid(type_node)
         for fi in 0..field_count:
             let offset = extra_start + 1 + fi * 3
             let f_name = self.pool.get_extra(offset)
             let f_type_node = self.pool.get_extra(offset + 1)
-            let f_ty = self.resolve_type(f_type_node)
+            let f_tid = if union_tid > 0: self.sema.type_reflection_field_type_frozen(union_tid, fi) else: 0
+            let f_ty = self.field_llvm_type(f_tid, f_type_node, name_sym, fi, false)
             if f_ty == 0:
                 with_eprint("error: unresolved type for field '" ++ self.intern.resolve(f_name) ++ "' in union '" ++ name_str ++ "'")
                 invalid_layout = 1
                 self.had_error = 1
             self.struct_field_types[field_start + fi] = f_ty
-            let f_tid = self.sema.resolve_type_expr_frozen(f_type_node)
             let f_size = if f_tid > 0: self.sema.type_layout_size_of_frozen(f_tid) else: self.abi_size_of(f_ty)
             let f_align = if f_tid > 0: self.sema.type_layout_align_of_frozen(f_tid) else: 1
             if f_size > max_size:
@@ -5073,6 +5074,40 @@ impl Codegen:
 
     // ── Declare enum type ─────────────────────────────────────────────
 
+    // #1647 (D65): a field's LLVM type — of a struct, a union, an enum
+    // variant's payload — is the LLVM type of Sema's type for that field: the
+    // type every MIR read of the field lowers. Resolving the field's AST type
+    // node again was a second derivation of one fact (#1984: for a generic
+    // instance it named a second LLVM struct for one Sema type). Under
+    // analysis the node's resolution is the verification audit:codegen
+    // compares; a generic instance's node is not resolved at all, since that
+    // path is the duplicate #1984 removed.
+    //
+    // A generic declaration's own body (`enum Slot[T]: Full(T)`) is not a
+    // type: a payload naming its parameter has no concrete Sema type, and
+    // its instances are Sema's generic-instance types with their own facts.
+    // The template keeps the node's codegen resolution, unjudged.
+    mut fn field_llvm_type(sema_ty: i32, type_node: i32, owner_sym: i32, subject: i32, template: bool) -> i64:
+        let fact = if sema_ty > 0: self.sema_type_to_llvm(sema_ty) else: 0
+        if fact == 0:
+            return if template: self.resolve_type(type_node) else: 0
+        let generic_inst = self.sema.get_type_kind(self.sema.resolve_alias(sema_ty as TypeId)) == TypeKind.TY_GENERIC_INST
+        let derived = if self.analysis_enabled != 0 and not generic_inst: self.resolve_type(type_node) else: fact
+        self.fact_decide(MODE_SITE_STRUCT_FIELD_TYPE, fact, derived, owner_sym, subject)
+
+    // Sema's type of payload `pi` of variant `vi` of an enum declaration
+    // (its TY_ENUM record: name, count, payload types per variant).
+    fn sema_enum_payload_type(enum_tid: i32, vi: i32, pi: i32) -> i32:
+        let resolved = self.sema.resolve_alias(enum_tid as TypeId)
+        if enum_tid <= 0 or self.sema.get_type_kind(resolved) != TypeKind.TY_ENUM: return 0
+        var pos = self.sema.get_type_d1(resolved)
+        for v in 0..self.sema.get_type_d2(resolved):
+            let count: i32 = self.sema.type_extra[(pos + 1)]
+            if v == vi:
+                return if pi < count: self.sema.type_extra[(pos + 2 + pi)] else: 0
+            pos = pos + 2 + count
+        0
+
     mut fn declare_enum_type(name_sym: i32, type_node: i32):
         let extra_start = self.pool.get_data1(type_node)
         let variant_count = self.pool.get_extra(extra_start)
@@ -5100,7 +5135,7 @@ impl Codegen:
                 let payload_fields: Vec[i64] = Vec.new()
                 for pi in 0..v_payload_count:
                     let payload_type_node = self.pool.get_extra(offset + pi)
-                    let field_ty = self.resolve_type(payload_type_node)
+                    let field_ty = self.field_llvm_type(self.sema_enum_payload_type(sema_tid, vi, pi), payload_type_node, name_sym, vi * 1000 + pi, self.type_decl_tp_count(type_node) > 0)
                     if field_ty == 0:
                         with_eprint("error: unresolved payload type for enum variant '" ++ self.intern.resolve(v_name) ++ "' in '" ++ enum_name ++ "'")
                         self.had_error = 1
@@ -5186,13 +5221,22 @@ impl Codegen:
             let payload_count = self.pool.get_extra(offset + 2)
             var payload_ty: i64 = 0
             if payload_count > 0:
+                let template = self.type_decl_tp_count(type_node) > 0
                 let payload_fields: Vec[i64] = Vec.new()
+                var payload_ok = true
                 for pi in 0..payload_count:
                     let payload_type_node = self.pool.get_extra(offset + 3 + pi)
-                    let field_ty = self.resolve_type(payload_type_node)
-                    if field_ty != 0:
-                        payload_fields.push(field_ty)
-                if payload_fields.len() as i32 == payload_count:
+                    let field_ty = self.field_llvm_type(self.sema_enum_payload_type(sema_tid, vi, pi), payload_type_node, name_sym, vi * 1000 + pi, template)
+                    // A generic declaration's payload naming its own parameter has
+                    // no layout: the template declares no payload struct (its
+                    // instances are Sema's generic-instance types).
+                    if field_ty == 0 and not template:
+                        with_eprint("error: unresolved payload type for enum variant '" ++ self.intern.resolve(v_name) ++ "' in '" ++ self.intern.resolve(name_sym) ++ "'")
+                        self.had_error = 1
+                    if field_ty == 0:
+                        payload_ok = false
+                    payload_fields.push(field_ty)
+                if payload_ok:
                     payload_ty = self.tuple_type_from_elems(&payload_fields)
             offset = offset + 3 + payload_count
             self.disc_enum_variant_names[v_start + vi] = v_name
@@ -5275,7 +5319,19 @@ pub const MODE_SITE_EVAL_INDIRECT_LOCAL: i32 = 4
 pub const MODE_SITE_MARSHAL_EXISTING_POINTER: i32 = 5
 pub const MODE_SITE_PARAM_BY_ADDRESS: i32 = 6
 pub const MODE_SITE_PARAM_PLACE_ALIAS: i32 = 7
-pub const MODE_SITE_COUNT: i32 = 8
+// #1647: a reference's place pointer (mir_try_place_ptr_for_ref).
+pub const MODE_SITE_REF_VALUE_IS_ADDRESS: i32 = 8
+pub const MODE_SITE_REF_SLOT_HOLDS_POINTER: i32 = 9
+// #1647: values a site once re-derived — a type-level argument, a field's
+// LLVM type, a field's index — and a closure's capture record.
+pub const MODE_SITE_SIZEOF_TYPE_ARG: i32 = 10
+pub const MODE_SITE_STRUCT_FIELD_TYPE: i32 = 11
+pub const MODE_SITE_FIELD_INDEX: i32 = 12
+pub const MODE_SITE_CAPTURE_BY_PLACE: i32 = 13
+pub const MODE_SITE_CLOSURE_OWNED_ENV: i32 = 14
+// #1647: a named field projection carries Sema's declaration index in MIR.
+pub const MODE_SITE_FIELD_DECL_CARRIED: i32 = 15
+pub const MODE_SITE_COUNT: i32 = 16
 
 pub fn mode_site_name(site: i32) -> str:
     if site == MODE_SITE_FIELD_TYPE_THROUGH_ADDRESS: return "projected-type field through an address"
@@ -5286,12 +5342,33 @@ pub fn mode_site_name(site: i32) -> str:
     if site == MODE_SITE_MARSHAL_EXISTING_POINTER: return "marshal_ref_addr existing pointer"
     if site == MODE_SITE_PARAM_BY_ADDRESS: return "prologue parameter passed by address"
     if site == MODE_SITE_PARAM_PLACE_ALIAS: return "prologue share-place parameter alias"
+    if site == MODE_SITE_REF_VALUE_IS_ADDRESS: return "place-for-ref local value is the address"
+    if site == MODE_SITE_REF_SLOT_HOLDS_POINTER: return "place-for-ref slot holds a pointer value"
+    if site == MODE_SITE_SIZEOF_TYPE_ARG: return "sizeof/alignof type argument"
+    if site == MODE_SITE_STRUCT_FIELD_TYPE: return "struct field LLVM type"
+    if site == MODE_SITE_FIELD_INDEX: return "field projection index"
+    if site == MODE_SITE_CAPTURE_BY_PLACE: return "closure capture by place"
+    if site == MODE_SITE_CLOSURE_OWNED_ENV: return "closure owns its environment"
+    if site == MODE_SITE_FIELD_DECL_CARRIED: return "field projection declaration index carried by MIR"
     "unknown"
 
 pub fn mode_site_owner(site: i32) -> str:
     if site == MODE_SITE_MARSHAL_EXISTING_POINTER: return "the operand's Sema category"
-    if site == MODE_SITE_PARAM_BY_ADDRESS or site == MODE_SITE_PARAM_PLACE_ALIAS or site == MODE_SITE_EVAL_INDIRECT_LOCAL: return "FnAbi's PassMode"
+    if site == MODE_SITE_PARAM_BY_ADDRESS or site == MODE_SITE_PARAM_PLACE_ALIAS or site == MODE_SITE_EVAL_INDIRECT_LOCAL or site == MODE_SITE_REF_VALUE_IS_ADDRESS: return "FnAbi's PassMode"
+    if site == MODE_SITE_SIZEOF_TYPE_ARG: return "Sema's type argument"
+    if site == MODE_SITE_STRUCT_FIELD_TYPE: return "Sema's field type"
+    if site == MODE_SITE_FIELD_INDEX: return "Sema's field declaration"
+    if site == MODE_SITE_CAPTURE_BY_PLACE or site == MODE_SITE_CLOSURE_OWNED_ENV: return "Sema's capture facts"
+    if site == MODE_SITE_FIELD_DECL_CARRIED: return "MIR's projection"
     "Sema's place category"
+
+// What a site re-derived its fact from before it read the owner.
+pub fn mode_site_derivation(site: i32) -> str:
+    if site == MODE_SITE_SIZEOF_TYPE_ARG or site == MODE_SITE_STRUCT_FIELD_TYPE: return "the AST type node"
+    if site == MODE_SITE_FIELD_INDEX: return "the LLVM struct registry"
+    if site == MODE_SITE_CAPTURE_BY_PLACE or site == MODE_SITE_CLOSURE_OWNED_ENV: return "the closure's AST spelling"
+    if site == MODE_SITE_FIELD_DECL_CARRIED: return "a lookup of the field's name in Sema's record"
+    "the LLVM type"
 
 // Symbol-naming rules live in src/FnAbi.w (docs/spec/abi/with-abi.md §5); this is
 // the adapter that feeds them the codegen mode.
@@ -5544,11 +5621,13 @@ impl Codegen:
         if method_owner_sym != 0:
             self.current_method_owner_sym = method_owner_sym
 
+        // #1647 (D65): the return type is Sema's signature's; the AST type
+        // node is read only for a function Sema holds no signature for.
         var ret_ty_raw: i64 = 0
-        if ret_type_node != 0:
-            ret_ty_raw = self.resolve_return_type(ret_type_node)
-        else if sema_sig_idx >= 0:
+        if sema_sig_idx >= 0:
             ret_ty_raw = self.sema_type_to_llvm(self.sema.sig_return_type(sema_sig_idx))
+        else if ret_type_node != 0:
+            ret_ty_raw = self.resolve_return_type(ret_type_node)
         let ret_ty = if ret_ty_raw != 0: ret_ty_raw else: self.type_fallback()
 
         // Check if this returns Result
@@ -7116,133 +7195,97 @@ impl Codegen:
             self.slotmap_cache_map.insert(sema_tid as i64, sm_ty)
         sm_ty
 
-    // ── Monomorphize struct (stub) ────────────────────────────────────
-
-    mut fn monomorphize_struct(name_sym: i32, extra_start: i32, arg_count: i32) -> i64:
-        let args: Vec[i32] = Vec.new()
-        for i in 0..arg_count: args.push(self.pool.get_extra(extra_start + i))
-        self.monomorphize_struct_nodes(name_sym, args)
-
-    mut fn monomorphize_struct_nodes(name_sym: i32, args: &Vec[i32]) -> i64:
-        let arg_count = args.len() as i32
-        let gs_opt = self.generic_structs.get(name_sym)
+    // #1647 (D65): a user generic struct instance is Sema's instance — its
+    // TypeId, arguments and field types — laid out once per TypeId. The
+    // removed path (monomorphize_struct_nodes) resolved the declaration's
+    // AST field types under codegen's LLVM type bindings and mapped LLVM
+    // types back to Sema types (llvm_type_to_sema_type).
+    mut fn get_or_create_generic_struct_type(sema_tid: i32) -> i64:
+        let resolved = self.sema.resolve_alias(sema_tid) as i32
+        if resolved <= 0 or self.sema.get_type_kind(resolved as TypeId) != TypeKind.TY_GENERIC_INST:
+            return 0
+        let cached = self.generic_struct_inst_types.get(resolved)
+        if cached.is_some():
+            return cached.unwrap()
+        let cg_base_sym = self.sema_sym_to_codegen_sym(self.sema.get_type_d0(resolved as TypeId))
+        let gs_opt = self.generic_structs.get(cg_base_sym)
         if not gs_opt.is_some():
             return 0
         let type_node: i32 = gs_opt.unwrap()
         let tp_count = self.type_decl_tp_count(type_node)
         if tp_count <= 0:
-            let st_opt = self.struct_type_map.get(name_sym)
+            let st_opt = self.struct_type_map.get(cg_base_sym)
             if st_opt.is_some():
                 return self.struct_llvm_types[st_opt.unwrap()]
             return 0
+        let arg_count = self.sema.get_generic_inst_arg_count(resolved)
+        if arg_count != tp_count:
+            with_eprint(f"error: BUG: generic struct instance {self.sema.type_name(resolved)} has {arg_count} type arguments; its declaration has {tp_count}")
+            self.had_error = 1
+            return self.type_fallback()
 
         let tp_syms: Vec[i32] = Vec.new()
         var tp_pos = self.type_decl_tp_start(type_node)
         for ti in 0..tp_count:
-            let tp_sym = self.pool.get_extra(tp_pos)
-            tp_syms.push(tp_sym)
-            let bound_count = self.pool.get_extra(tp_pos + 1)
-            tp_pos = tp_pos + 2 + bound_count
-
+            tp_syms.push(self.pool.get_extra(tp_pos))
+            tp_pos = tp_pos + 2 + self.pool.get_extra(tp_pos + 1)
         let arg_types: Vec[i64] = Vec.new()
-        let arg_sema_types: Vec[i32] = Vec.new()
-        if arg_count > 0:
-            for ai in 0..arg_count:
-                let arg_node = args[ai]
-                let arg_ty = self.resolve_type(arg_node)
-                let arg_sema = self.type_expr_to_sema_type(arg_node)
-                if arg_ty != 0:
-                    arg_types.push(arg_ty)
-                else:
-                    arg_types.push(wl_i32_type(self.context))
-                if arg_sema != 0:
-                    arg_sema_types.push(arg_sema)
-                else:
-                    arg_sema_types.push(self.llvm_type_to_sema_type(arg_types[ai]))
-        else:
-            for ti in 0..tp_count:
-                let tp_sym = tp_syms[ti]
-                var bound_ty: i64 = 0
-                for bi in 0..self.type_bindings_len:
-                    if self.type_binding_syms[bi] == tp_sym:
-                        bound_ty = self.type_binding_types[bi]
-                        break
-                if bound_ty == 0:
-                    bound_ty = self.type_fallback()
-                arg_types.push(bound_ty)
-                arg_sema_types.push(self.llvm_type_to_sema_type(bound_ty))
-        while arg_types.len() as i32 < tp_count:
-            let fallback_ty = self.type_fallback()
-            arg_types.push(fallback_ty)
-            arg_sema_types.push(self.llvm_type_to_sema_type(fallback_ty))
-
-        let base_name: str = with_str_clone_ref(self.intern.resolve(name_sym))
+        let base_name: str = with_str_clone_ref(self.intern.resolve(cg_base_sym))
         var mangled = with_str_clone_ref(base_name)
         for ti in 0..tp_count:
-            let arg_ty = arg_types[ti]
+            let arg_ty = self.sema_type_to_llvm(self.sema.get_generic_inst_arg(resolved, ti))
+            if arg_ty == 0:
+                with_eprint(f"error: BUG: type argument {ti} of {self.sema.type_name(resolved)} has no LLVM type")
+                self.had_error = 1
+                return self.type_fallback()
+            arg_types.push(arg_ty)
             mangled = mangled ++ "__" ++ self.llvm_type_mangle(arg_ty)
         let mono_sym = self.intern.intern(mangled)
-
-        let mono_idx_opt = self.struct_type_map.get(mono_sym)
-        if mono_idx_opt.is_some():
-            return self.struct_llvm_types[mono_idx_opt.unwrap()]
+        let existing = self.struct_type_map.get(mono_sym)
+        if existing.is_some():
+            let existing_ty = self.struct_llvm_types[existing.unwrap()]
+            self.generic_struct_inst_types.insert(resolved, existing_ty)
+            return existing_ty
 
         self.predeclare_struct_type(mono_sym)
-        self.mono_struct_base.insert(mono_sym, name_sym)
+        let mono_idx: i32 = self.struct_type_map.get(mono_sym).unwrap()
+        let mono_ty: i64 = self.struct_llvm_types[mono_idx]
+        self.generic_struct_inst_types.insert(resolved, mono_ty)
+        self.mono_struct_base.insert(mono_sym, cg_base_sym)
         let tp_flat_start = self.mono_struct_tp_flat_syms.len() as i32
         for ti in 0..tp_count:
             self.mono_struct_tp_flat_syms.push(tp_syms[ti])
             self.mono_struct_tp_flat_types.push(arg_types[ti])
-            self.mono_struct_tp_flat_sema_types.push(arg_sema_types[ti])
+            self.mono_struct_tp_flat_sema_types.push(self.sema.get_generic_inst_arg(resolved, ti))
         self.mono_struct_tp_starts.insert(mono_sym, tp_flat_start)
         self.mono_struct_tp_counts.insert(mono_sym, tp_count)
-        let mono_idx: i32 = self.struct_type_map.get(mono_sym).unwrap()
-        let mono_ty: i64 = self.struct_llvm_types[mono_idx]
-
-        let saved_bind_syms = move self.type_binding_syms
-        let saved_bind_tys = move self.type_binding_types
-        let saved_bind_len: i32 = self.type_bindings_len
-        let fresh_bind_syms: Vec[i32] = Vec.new()
-        let fresh_bind_tys: Vec[i64] = Vec.new()
-        self.type_binding_syms = fresh_bind_syms
-        self.type_binding_types = fresh_bind_tys
-        self.type_bindings_len = 0
-        for ti in 0..tp_count:
-            self.type_binding_syms.push(tp_syms[ti])
-            self.type_binding_types.push(arg_types[ti])
-            self.type_bindings_len = self.type_bindings_len + 1
 
         let decl_extra_start = self.pool.get_data1(type_node)
         let field_count = self.pool.get_extra(decl_extra_start)
+        if self.sema.type_reflection_field_count(resolved) != field_count:
+            with_eprint(f"error: BUG: Sema's {self.sema.type_name(resolved)} has {self.sema.type_reflection_field_count(resolved)} fields; its declaration has {field_count}")
+            self.had_error = 1
+            return mono_ty
         let field_start = self.reserve_struct_fields(mono_idx, decl_extra_start, field_count, false)
-
         let ft_vec: Vec[i64] = Vec.new()
         var invalid_layout = 0
         for fi in 0..field_count:
-            let offset = decl_extra_start + 1 + fi * 3
-            let f_name = self.pool.get_extra(offset)
-            let f_type_node = self.pool.get_extra(offset + 1)
-            var f_ty = self.resolve_type(f_type_node)
-            self.debug_type_layout_field(mangled, fi, f_name, f_type_node, f_ty)
+            let f_sema = self.sema.type_reflection_field_type_frozen(resolved, fi)
+            var f_ty = if f_sema > 0: self.sema_type_to_llvm(f_sema) else: 0
+            self.debug_type_layout_field(mangled, fi, self.pool.get_extra(decl_extra_start + 1 + fi * 3), self.pool.get_extra(decl_extra_start + 2 + fi * 3), f_ty)
             if f_ty == 0:
-                with_eprint("error: unresolved type for field '" ++ self.intern.resolve(f_name) ++ "' in struct '" ++ base_name ++ "'")
+                with_eprint("error: unresolved type for field '" ++ self.intern.resolve(self.pool.get_extra(decl_extra_start + 1 + fi * 3)) ++ "' in struct '" ++ base_name ++ "'")
                 invalid_layout = 1
                 self.had_error = 1
                 f_ty = self.type_fallback()
             self.struct_field_types[field_start + fi] = f_ty
             ft_vec.push(f_ty)
-
         if invalid_layout == 0:
             // D72: decided per declaration, so every instance agrees.
-            if self.sema.struct_liveness_byte_frozen(self.codegen_sema_sym_for(name_sym)) != 0:
+            if self.sema.struct_liveness_byte_frozen(self.codegen_sema_sym_for(cg_base_sym)) != 0:
                 ft_vec.push(wl_i8_type(self.context))
                 self.liveness_byte_indices.insert(mono_ty, field_count)
             wl_struct_set_body(mono_ty, vec_data_i64(&ft_vec), ft_vec.len() as i32, 0)
-
-        self.type_binding_syms = saved_bind_syms
-        self.type_binding_types = saved_bind_tys
-        self.type_bindings_len = saved_bind_len
-
         mono_ty
 
 // ── Monomorphize generic struct method ───────────────────────────
