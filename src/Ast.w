@@ -666,6 +666,11 @@ type AstPoolState {
     impl_type_params: Vec[i32],
     impl_target_type_nodes: Vec[i32],
     impl_trait_type_args: Vec[i32],
+    // A parameterized type-parameter bound's arguments (`G: Gen[T]`):
+    // (extra index of the bound's trait symbol, start in
+    // type_bound_arg_nodes, count) triples.
+    type_bound_args: Vec[i32],
+    type_bound_arg_nodes: Vec[i32],
     fn_meta_map: HashMap[i32, i32],
     // For `x in collection` / `x not in collection` binary nodes: the extra-array
     // index of the pre-reserved `collection.contains(x)` argument. Allocated at
@@ -683,6 +688,7 @@ type AstPoolState {
     impl_type_params_map: HashMap[i32, i32],
     impl_target_type_nodes_map: HashMap[i32, i32],
     impl_trait_type_args_map: HashMap[i32, i32],
+    type_bound_args_map: HashMap[i32, i32],
     fn_param_pattern_meta_map: HashMap[i32, i32],
     for_meta_map: HashMap[i32, i32],
     for_carrier_alt_map: HashMap[i32, i32],
@@ -728,7 +734,8 @@ type AstPoolState {
     // D70 (§18.2): `use m as n` / `use c_import(...) as n` — import decl → n.
     use_alias_map: HashMap[i32, i32],
     // D70: field-access nodes Sema resolved through an import namespace and
-    // rewrote into the declaration's ident (Sema.rewrite_namespace_access).
+    // rewrote into the declaration's ident (Sema.rewrite_namespace_access),
+    // mapped to the module's type when the member is a type (#1757), else 0.
     namespace_bound_set: HashMap[i32, i32],
     frozen: i32,
 }
@@ -785,6 +792,8 @@ fn AstPool.new -> AstPool:
             impl_type_params: Vec.new(),
             impl_target_type_nodes: Vec.new(),
             impl_trait_type_args: Vec.new(),
+            type_bound_args: Vec.new(),
+            type_bound_arg_nodes: Vec.new(),
             fn_meta_map: HashMap.new(),
             membership_arg_map: HashMap.new(),
             pattern_binding_keys: HashMap.new(),
@@ -795,6 +804,7 @@ fn AstPool.new -> AstPool:
             impl_type_params_map: HashMap.new(),
             impl_target_type_nodes_map: HashMap.new(),
             impl_trait_type_args_map: HashMap.new(),
+            type_bound_args_map: HashMap.new(),
             fn_param_pattern_meta_map: HashMap.new(),
             for_meta_map: HashMap.new(),
             for_carrier_alt_map: HashMap.new(),
@@ -1483,15 +1493,21 @@ impl AstPool:
 
     // D70: Sema resolved `ns.member` to the declaration `sym`; the node
     // becomes that ident, marked so no later check re-resolves its short
-    // name by import precedence.
-    mut fn bind_namespace_ident(idx: NodeId, sym: i32):
+    // name by import precedence. A type member carries its identity `tid`
+    // (#1757): types keep their short names, so the ident alone could name
+    // another module's type of that name.
+    mut fn bind_namespace_ident(idx: NodeId, sym: i32, tid: i32):
         self.state.kinds[(idx as i32)] = NodeKind.NK_IDENT
         self.state.data0[(idx as i32)] = sym
         self.state.data1[(idx as i32)] = 0
         self.state.data2[(idx as i32)] = 0
-        self.state.namespace_bound_set.insert(idx as i32, 1)
+        self.state.namespace_bound_set.insert(idx as i32, tid)
 
     fn is_namespace_bound(idx: NodeId) -> bool: self.state.namespace_bound_set.contains(idx as i32)
+
+    // The type a namespace-bound ident names (#1757), 0 when it names a
+    // value or fn, or is no namespace access.
+    fn namespace_bound_type(idx: NodeId) -> i32: self.state.namespace_bound_set.get(idx as i32) ?? 0
 
     mut fn set_data0(idx: NodeId, val: i32):
         self.state.data0[(idx as i32)] = val
@@ -1954,6 +1970,28 @@ impl AstPool:
         if opt.is_some():
             return opt.unwrap()
         -1
+
+    // A type-parameter bound's trait arguments, keyed by the extra index
+    // that holds the bound's trait symbol: `G: Gen[T]` records `[T]`, so a
+    // call can infer T from the type G is bound to (#1732).
+    fn add_type_bound_args(bound_extra_idx: i32, arg_nodes: Vec[i32]):
+        let idx = self.state.type_bound_args.len() as i32
+        self.state.type_bound_args.push(bound_extra_idx)
+        self.state.type_bound_args.push(self.state.type_bound_arg_nodes.len() as i32)
+        self.state.type_bound_args.push(arg_nodes.len() as i32)
+        for n in arg_nodes:
+            self.state.type_bound_arg_nodes.push(n)
+        self.state.type_bound_args_map.insert(bound_extra_idx, idx)
+
+    fn find_type_bound_args(bound_extra_idx: i32) -> i32: self.state.type_bound_args_map.get(bound_extra_idx) ?? -1
+
+    // The argument type nodes of the bound record `meta`.
+    fn type_bound_arg_nodes(meta: i32) -> Vec[i32]:
+        var out: Vec[i32] = Vec.new()
+        let start: i32 = self.state.type_bound_args[(meta + 1)]
+        for i in 0..self.state.type_bound_args[(meta + 2)]:
+            out.push(self.state.type_bound_arg_nodes[(start + i)])
+        out
 
     fn impl_trait_type_args_start(meta: i32) -> i32: self.state.impl_trait_type_args[(meta + 1)]
     fn impl_trait_type_args_count(meta: i32) -> i32: self.state.impl_trait_type_args[(meta + 2)]

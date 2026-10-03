@@ -66,6 +66,11 @@ pub enum VarState: i32:
 
 pub type BindingProvenance {
     view_origin_mask: i32,
+    // The subset of view_origin_mask whose parameters' OWN storage the
+    // binding may point into (SemaCheck.compute_expr_storage_origin_mask);
+    // set_binding_view_deps resets it to the whole mask (unproven is
+    // storage), record_view_binding_from_expr narrows it.
+    view_storage_mask: i32,
     view_dep_start: i32,
     view_dep_count: i32,
     effect_dep_sym: i32,
@@ -79,7 +84,7 @@ pub type BindingProvenance {
 impl Copy for BindingProvenance
 
 fn binding_provenance_empty -> BindingProvenance:
-    BindingProvenance { view_origin_mask: 0, view_dep_start: 0, view_dep_count: 0, effect_dep_sym: 0, is_ephemeral_value: 0, is_ephemeral_task: 0, is_non_send_task: 0, poisoned_origin_sym: 0, poisoned_origin_node: 0, poisoned_binding_node: 0 }
+    BindingProvenance { view_origin_mask: 0, view_storage_mask: 0, view_dep_start: 0, view_dep_count: 0, effect_dep_sym: 0, is_ephemeral_value: 0, is_ephemeral_task: 0, is_non_send_task: 0, poisoned_origin_sym: 0, poisoned_origin_node: 0, poisoned_binding_node: 0 }
 
 // D39 declared view origin (SemaCheck.declared_view_origin): a parameter
 // index, or one of these.
@@ -670,6 +675,12 @@ pub type Sema {
     // Parallel to sig_param_effects: bitmask of signature parameter indices that a returned
     // view may originate from when this parameter participates in escape_view.
     sig_param_view_origins: Vec[i32],
+    // Parallel to sig_param_view_origins: the origin parameters whose own
+    // storage the returned view provably never points into — the result
+    // views only what they view (SemaCheck.compute_expr_storage_origin_mask;
+    // §21.1 Rule 6). A call records such a parameter's argument by its views
+    // alone, never by its own place; 0 (unproven) keeps the place an origin.
+    sig_param_view_through: Vec[i32],
     // D63 call-once: 1 when the body invokes this parameter more than once
     // (twice, or once inside a loop) — a consuming closure may not be
     // passed to it.
@@ -898,6 +909,12 @@ pub type Sema {
     impl_extra_is_std: Vec[i32],
     type_decl_nodes_by_tid: HashMap[i32, i32],
     type_tid_is_std: HashMap[i32, i32],
+    // #751 / #1745: the template declaration (its TY_STRUCT/TY_ENUM tid) a
+    // generic instance was made from — identity, not the short name, since
+    // a user `type PullCore` beside std.task's `PullCore[G]` shares the
+    // symbol. Recorded by resolve_generic_type and carried through
+    // substitution; read by generic_inst_template_tid.
+    generic_inst_templates: HashMap[i32, i32],
     type_sym_tier_mask: HashMap[i32, i32],
     // Generic inst impls: impl Trait for Type[Args]
     // Key: pair(type_id, trait_sym) → 1
@@ -1558,6 +1575,10 @@ pub type Sema {
     generator_local_view_yields: HashMap[i32, i32],
     generator_local_view_origins: HashMap[i32, i32],
     gen_pull_nodes: Vec[i32],
+    // The `g.pull()` calls of a generator value that is ephemeral (§13.4,
+    // #1732): the pulled iterator views what the generator's view arguments
+    // view, so the call carries those origins and is an ephemeral value.
+    gen_pull_view_nodes: HashMap[i32, i32],
     // A method-call node Sema resolved to a free function that takes the
     // receiver as its first argument, by that parameter's declared mode
     // (§13.4 `g.pull()` is `gen_pull(g)`); MIR lowers the receiver as an
@@ -1626,6 +1647,7 @@ pub type Sema {
     current_fn_param_effs: Vec[i32],   // accumulated effect bits per param
     current_fn_param_direct_effs: Vec[i32], // body-local effects, excluding propagated calls
     current_fn_param_origins: Vec[i32],// accumulated escape_view origin masks per param
+    current_fn_param_storage_origins: Vec[i32], // the subset of those whose own storage the returned view may point into
     current_fn_param_view_nodes: Vec[i32], // representative return/view node for escape_view diagnostics
     current_fn_sig_idx: i32,           // sig index of current function (-1 if not in a fn body)
     current_fn_variadic: i32,          // 1 while checking a `...` definition body (never a closure in it)
@@ -1656,6 +1678,11 @@ pub type Sema {
     binding_view_dep_data: Vec[i32],
     // Expression-level view metadata for call expressions and view-producing nodes.
     expr_view_param_origins: HashMap[i32, i32],
+    // The subset of a node's expr_view_param_origins whose parameters' own
+    // storage the value may point into, recorded only where a recorder
+    // proved it narrower (compute_expr_storage_origin_mask); absent means
+    // the whole mask.
+    expr_view_storage_origins: HashMap[i32, i32],
     // #962: a view produced from a statement temporary (`split(..).get(1)`,
     // `split(..)[1]`): node → the temporary's type. Fine inside the statement,
     // a use-after-free once bound or returned.
@@ -2682,6 +2709,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         sig_param_effects: Vec.new(),
         sig_param_direct_effects: Vec.new(),
         sig_param_view_origins: Vec.new(),
+        sig_param_view_through: Vec.new(),
         sig_param_invoke_many: Vec.new(),
         fn_param_invocations: sema_new_map_i32_i32(),
         fn_param_many_nodes: sema_new_map_i32_i32(),
@@ -2783,6 +2811,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         impl_extra_is_std: Vec.new(),
         type_decl_nodes_by_tid: HashMap.new(),
         type_tid_is_std: HashMap.new(),
+        generic_inst_templates: HashMap.new(),
         type_sym_tier_mask: HashMap.new(),
         impl_starts: Vec.new(),
         impl_counts: Vec.new(),
@@ -3132,6 +3161,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         generator_local_view_yields: sema_new_map_i32_i32(),
         generator_local_view_origins: sema_new_map_i32_i32(),
         gen_pull_nodes: Vec.new(),
+        gen_pull_view_nodes: sema_new_map_i32_i32(),
         receiver_arg_call_nodes: sema_new_map_i32_i32(),
         gen_pull_fns: Vec.new(),
         eph_task_visiting: sema_new_map_i32_i32(),
@@ -3173,6 +3203,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         current_fn_param_effs: Vec.new(),
         current_fn_param_direct_effs: Vec.new(),
         current_fn_param_origins: Vec.new(),
+        current_fn_param_storage_origins: Vec.new(),
         current_fn_param_view_nodes: Vec.new(),
         current_fn_sig_idx: -1,
         current_fn_variadic: 0,
@@ -3186,6 +3217,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         deferred_callable_forwards: Vec.new(),
         binding_view_dep_data: Vec.new(),
         expr_view_param_origins: sema_new_map_i32_i32(),
+        expr_view_storage_origins: sema_new_map_i32_i32(),
         expr_view_into_temporary: sema_new_map_i32_i32(),
         expr_view_dep_starts: sema_new_map_i32_i32(),
         expr_view_dep_counts: sema_new_map_i32_i32(),
@@ -5646,7 +5678,10 @@ impl Sema:
             gi_args.push(gi_arg_tid as i32)
         if self.validate_atomic_payload_type(gi_base_sym, &gi_args, gi_arg_count, node) == 0:
             return 0
-        self.ensure_generic_inst_type(gi_base_sym, gi_args, gi_arg_count) as i32
+        let inst = self.ensure_generic_inst_type(gi_base_sym, gi_args, gi_arg_count) as i32
+        if inst != 0 and gi_base_tid != 0 and not self.generic_inst_templates.contains(inst):
+            self.generic_inst_templates.insert(inst, gi_base_tid)
+        inst
 
     // The inst accessors are kind-guarded: reading base/count/args from a
     // NON-inst type returned whatever number lived in its d-slots — garbage
@@ -5657,6 +5692,38 @@ impl Sema:
         if self.get_type_kind(tid as TypeId) != TypeKind.TY_GENERIC_INST:
             return 0
         self.get_type_d0(tid)
+
+    // The template declaration's tid of a generic instance (#751, #1745):
+    // the one recorded when the instance was resolved, else the symbol's
+    // template as reflection finds it (an instance minted without a type
+    // expression — an intrinsic's result, a builtin container).
+    fn generic_inst_template_tid(tid: i32) -> i32:
+        let resolved = self.resolve_alias(tid as TypeId) as i32
+        if self.get_type_kind(resolved as TypeId) != TypeKind.TY_GENERIC_INST:
+            return 0
+        if self.generic_inst_templates.contains(resolved):
+            return self.generic_inst_templates.get(resolved).unwrap()
+        self.type_reflection_base_template(self.get_type_d0(resolved))
+
+    // The declaring node of a generic instance's template: by the recorded
+    // template's identity first; the flat symbol-keyed map (the newest
+    // declaration of that name in any module) only for an instance with no
+    // recorded template.
+    fn generic_inst_decl_node(tid: i32) -> i32:
+        let resolved = self.resolve_alias(tid as TypeId) as i32
+        let template = self.generic_inst_template_tid(resolved)
+        if template != 0:
+            let template_resolved = self.resolve_alias(template as TypeId) as i32
+            if self.type_decl_nodes_by_tid.contains(template_resolved):
+                return self.type_decl_nodes_by_tid.get(template_resolved).unwrap()
+        var base_sym = self.get_generic_inst_base(resolved)
+        if base_sym == 0:
+            return 0
+        if not self.type_decl_nodes.contains(base_sym):
+            let canonical = self.canonical_symbol_by_text(base_sym)
+            if canonical != 0 and self.type_decl_nodes.contains(canonical):
+                base_sym = canonical
+        if self.type_decl_nodes.contains(base_sym): self.type_decl_nodes.get(base_sym).unwrap() else: 0
 
     fn get_generic_inst_arg_count(tid: i32) -> i32:
         if self.get_type_kind(tid as TypeId) != TypeKind.TY_GENERIC_INST:
@@ -5951,7 +6018,11 @@ impl Sema:
                 if subbed != orig: changed = 1
                 sub_args.push(subbed)
             if changed == 0: return tid
-            return self.ensure_generic_inst_type(d0, sub_args, gi_ac) as i32
+            let subbed_inst = self.ensure_generic_inst_type(d0, sub_args, gi_ac) as i32
+            // The substituted instance is of the same declaration.
+            if subbed_inst != 0 and self.generic_inst_templates.contains(tid) and not self.generic_inst_templates.contains(subbed_inst):
+                self.generic_inst_templates.insert(subbed_inst, self.generic_inst_templates.get(tid).unwrap())
+            return subbed_inst
         // TypeKind.TY_PTR / TypeKind.TY_REF: substitute pointee
         if kind == TypeKind.TY_PTR or kind == TypeKind.TY_REF:
             let pointee = d0
@@ -7033,6 +7104,7 @@ impl Sema:
             with self.bind_provenance.slot(slot_idx) as mut slot:
                 var provenance = slot.get()
                 provenance.view_origin_mask = 0
+                provenance.view_storage_mask = 0
                 provenance.view_dep_start = 0
                 provenance.view_dep_count = 0
                 provenance.poisoned_origin_sym = 0
@@ -7056,12 +7128,32 @@ impl Sema:
             with self.bind_provenance.slot(slot_idx) as mut slot:
                 var provenance = slot.get()
                 provenance.view_origin_mask = param_mask
+                provenance.view_storage_mask = param_mask
                 provenance.view_dep_start = start
                 provenance.view_dep_count = deps.len() as i32
                 provenance.poisoned_origin_sym = 0
                 provenance.poisoned_origin_node = 0
                 provenance.poisoned_binding_node = 0
                 slot.set(provenance)
+
+    // Narrows the storage subset of a binding's origin mask; called after
+    // set_binding_view_deps, which resets it to the whole mask.
+    fn set_binding_view_storage_mask(sym: i32, storage_mask: i32):
+        let opt = self.scope_name_map.get(sym)
+        if opt.is_none():
+            return
+        let slot_idx = opt.unwrap() as i64
+        with self.bind_provenance.slot(slot_idx) as mut slot:
+            var provenance = slot.get()
+            if provenance.view_origin_mask >= 0 and storage_mask >= 0:
+                provenance.view_storage_mask = storage_mask & provenance.view_origin_mask
+                slot.set(provenance)
+
+    fn binding_view_storage_mask(sym: i32) -> i32:
+        let opt = self.scope_name_map.get(sym)
+        if opt.is_some():
+            return self.bind_provenance[opt.unwrap()].view_storage_mask
+        0
 
     // #625 (viral-escape): union additional view origins into a binding that
     // already exists — used when a store (Vec.push / HashMap.insert) adds the
@@ -7777,6 +7869,7 @@ impl Sema:
     fn set_expr_view_deps(expr_node: i32, param_mask: i32, deps: &Vec[i32]):
         if expr_node == 0:
             return
+        self.expr_view_storage_origins.remove(expr_node)
         if param_mask == 0 and deps.len() == 0:
             self.expr_view_param_origins.remove(expr_node)
             self.expr_view_dep_starts.remove(expr_node)
@@ -7793,6 +7886,21 @@ impl Sema:
         if self.expr_view_param_origins.contains(expr_node):
             return self.expr_view_param_origins.get(expr_node).unwrap()
         0
+
+    // Narrows the storage subset of a node's recorded origins; called after
+    // set_expr_view_deps, which resets it to the whole mask.
+    fn set_expr_view_storage_mask(expr_node: i32, storage_mask: i32):
+        if expr_node == 0 or not self.expr_view_param_origins.contains(expr_node):
+            return
+        let whole = self.expr_view_origin_mask(expr_node)
+        if whole < 0 or storage_mask < 0:
+            return
+        self.expr_view_storage_origins.insert(expr_node, storage_mask & whole)
+
+    fn expr_view_storage_mask(expr_node: i32) -> i32:
+        if self.expr_view_storage_origins.contains(expr_node):
+            return self.expr_view_storage_origins.get(expr_node).unwrap()
+        self.expr_view_origin_mask(expr_node)
 
     fn expr_view_dep_count(expr_node: i32) -> i32:
         if self.expr_view_dep_counts.contains(expr_node):
@@ -7906,6 +8014,7 @@ impl Sema:
             self.sig_param_effects.push(0)
             self.sig_param_direct_effects.push(0)
             self.sig_param_view_origins.push(0)
+            self.sig_param_view_through.push(0)
             self.sig_param_invoke_many.push(0)
             self.sig_value_ref_abi_params.push(0)
         self.sig_receiver_modes.push(ReceiverMode.None as i32)
@@ -8041,6 +8150,24 @@ impl Sema:
             return
         self.sig_param_view_origins[(start + pi)] = mask
 
+    fn sig_param_view_through(si: i32, pi: i32) -> i32:
+        if si < 0 or si >= self.sig_param_eff_starts.len() as i32:
+            return 0
+        let start = self.sig_param_eff_starts[si]
+        let count = self.sig_param_counts[si]
+        if pi < 0 or pi >= count:
+            return 0
+        self.sig_param_view_through[(start + pi)]
+
+    mut fn set_sig_param_view_through(si: i32, pi: i32, mask: i32):
+        if si < 0 or si >= self.sig_param_eff_starts.len() as i32:
+            return
+        let start: i32 = self.sig_param_eff_starts[si]
+        let count = self.sig_param_counts[si]
+        if pi < 0 or pi >= count:
+            return
+        self.sig_param_view_through[(start + pi)] = mask
+
     fn param_index_for_sym(sym: i32) -> i32:
         let name = self.pool_resolve(sym)
         for pi in 0..self.current_fn_param_syms.len() as i32:
@@ -8106,13 +8233,17 @@ impl Sema:
             return
         self.effect_prov.insert(key, effect_prov_val(kind, a, b))
 
-    mut fn note_param_view_origin(sym: i32, mask: i32, origin_node: i32):
+    // `mask`: the parameters the returned view may originate from;
+    // `storage_mask`: the subset whose own storage it may point into.
+    mut fn note_param_view_origin(sym: i32, mask: i32, storage_mask: i32, origin_node: i32):
         if self.current_fn_sig_idx < 0 or sym == 0 or mask == 0:
             return
         let pi = self.param_index_for_sym(sym)
         if pi >= 0:
             let cur: i32 = self.current_fn_param_origins[pi]
             self.current_fn_param_origins[pi] = cur | mask
+            let cur_storage: i32 = self.current_fn_param_storage_origins[pi]
+            self.current_fn_param_storage_origins[pi] = cur_storage | storage_mask
             if origin_node != 0 and self.current_fn_param_view_nodes[pi] == 0:
                 self.current_fn_param_view_nodes[pi] = origin_node
             return
@@ -8758,6 +8889,7 @@ impl Sema:
         for pi in 0..param_count:
             self.set_sig_param_effect(alias_sig, pi, self.sig_param_effect(source_sig, pi))
             self.set_sig_param_view_origin(alias_sig, pi, self.sig_param_view_origin(source_sig, pi))
+            self.set_sig_param_view_through(alias_sig, pi, self.sig_param_view_through(source_sig, pi))
             self.set_sig_param_value_ref_abi(alias_sig, pi, self.sig_param_uses_value_ref_abi(source_sig, pi))
 
     fn signatures_match(a_sig: i32, b_sig: i32) -> i32:

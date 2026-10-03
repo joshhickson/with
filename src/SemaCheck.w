@@ -1501,6 +1501,20 @@ impl Sema:
             if base_sym == self.syms.self_type:
                 if self.assoc_type_bindings.contains(assoc_sym):
                     return self.assoc_type_bindings.get(assoc_sym).unwrap() as TypeId
+            // D70 (§18.2) / #1757: `shapes.Pt` names the import's type by
+            // identity, whatever `Pt` resolves to here.
+            let ns_tid = self.namespace_type_annotation(base_sym, assoc_sym)
+            if ns_tid != 0:
+                let ni = self.clause_namespace(self.pool_resolve(base_sym))
+                let assoc_name: str = with_str_clone_ref(self.pool_resolve(assoc_sym))
+                if ns_tid < 0:
+                    self.emit_error(f"{self.namespace_import_text(ni)} provides no type '{assoc_name}' (through the namespace '{self.pool_resolve(base_sym)}')", node)
+                    return 0 as TypeId
+                let path: str = with_str_clone_ref(self.module_paths[self.ns_targets[ni]])
+                if not self.named_type_visible_in(assoc_sym, path):
+                    self.emit_error(f"'{assoc_name}' is private to module '{path}'", node)
+                    return 0 as TypeId
+                return ns_tid as TypeId
             // Type parameter: look up concrete type via generic substitution
             let concrete = self.lookup_generic_subst(base_sym)
             if concrete != 0:
@@ -1780,6 +1794,11 @@ impl Sema:
             let assoc_sym = self.ast.get_data1(node)
             if base_sym == self.syms.self_type and self.assoc_type_bindings.contains(assoc_sym):
                 return self.assoc_type_bindings.get(assoc_sym).unwrap() as TypeId
+            // #1757: a namespaced type annotation resolves by identity, as
+            // the mutable twin did.
+            let ns_tid = self.namespace_type_annotation(base_sym, assoc_sym)
+            if ns_tid > 0:
+                return ns_tid as TypeId
             sema_phase_bug("BUG: frozen associated type resolution needs preregistered type-node answer")
         if kind == NodeKind.NK_TYPE_GENERIC:
             return self.resolve_generic_type_frozen(node) as TypeId
@@ -3714,6 +3733,7 @@ impl Sema:
         let saved_eff_param_effs = sema_clone_i32_vec(&self.current_fn_param_effs)
         let saved_eff_param_direct_effs = sema_clone_i32_vec(&self.current_fn_param_direct_effs)
         let saved_eff_param_origins = sema_clone_i32_vec(&self.current_fn_param_origins)
+        let saved_eff_param_storage_origins = sema_clone_i32_vec(&self.current_fn_param_storage_origins)
         let saved_eff_param_view_nodes = sema_clone_i32_vec(&self.current_fn_param_view_nodes)
         // D63: the invocation counts are this body's. A generic callee's
         // specialization is checked in the middle of its caller's body, and
@@ -3727,6 +3747,7 @@ impl Sema:
             self.current_fn_param_effs.pop()
             self.current_fn_param_direct_effs.pop()
             self.current_fn_param_origins.pop()
+            self.current_fn_param_storage_origins.pop()
             self.current_fn_param_view_nodes.pop()
         if meta >= 0:
             let eff_ps = self.ast.fn_meta_param_start(meta)
@@ -3740,6 +3761,7 @@ impl Sema:
                 self.current_fn_param_effs.push(0)
                 self.current_fn_param_direct_effs.push(0)
                 self.current_fn_param_origins.push(0)
+                self.current_fn_param_storage_origins.push(0)
                 self.current_fn_param_view_nodes.push(0)
         self.current_fn_sig_idx = sig_idx
         self.current_fn_variadic = self.sig_is_variadic(sig_idx)
@@ -3907,7 +3929,7 @@ impl Sema:
                 self.note_returned_transparent_view_effects(body)
                 let body_root = self.place_root_sym(body)
                 if body_root != 0:
-                    self.note_param_view_origin(body_root, self.compute_expr_view_origin_mask(body), body)
+                    self.note_param_view_origin(body_root, self.compute_expr_view_origin_mask(body), self.compute_expr_storage_origin_mask(body), body)
                 self.check_returned_view_origins(body, body)
             else if body_materializes_copy == 0 and (self.type_is_ephemeral_value(body_ty as i32) != 0 or self.expr_is_ephemeral_value(body) != 0):
                 self.note_returned_transparent_view_effects(body)
@@ -4014,9 +4036,19 @@ impl Sema:
                 self.set_sig_param_direct_effect(sig_idx, pi, direct_eff)
                 let declared_origin = if facade_declared: self.sig_param_view_origin(sig_idx, pi) else: 0
                 if (eff & EFF_ESCAPE_VIEW) != 0:
-                    self.set_sig_param_view_origin(sig_idx, pi, self.current_fn_param_origins[pi] | declared_origin)
+                    let body_origins: i32 = self.current_fn_param_origins[pi]
+                    let body_storage: i32 = self.current_fn_param_storage_origins[pi]
+                    self.set_sig_param_view_origin(sig_idx, pi, body_origins | declared_origin)
+                    // The origins the body's returned views reach only
+                    // through what the parameter views, never its own
+                    // storage (§21.1 Rule 6). A declared origin (facade,
+                    // interface) is the parameter's storage; an overflowed
+                    // mask proves nothing.
+                    let through = if body_origins < 0 or body_storage < 0 or declared_origin < 0: 0 else: body_origins & ~body_storage & ~declared_origin
+                    self.set_sig_param_view_through(sig_idx, pi, through)
                 else:
                     self.set_sig_param_view_origin(sig_idx, pi, declared_origin)
+                    self.set_sig_param_view_through(sig_idx, pi, 0)
             // D63 call-once: published for every parameter — a callable
             // parameter that is only invoked accrues no effect bits, so this
             // sits outside the `eff != 0` guard above.
@@ -4064,12 +4096,14 @@ impl Sema:
             self.current_fn_param_effs.pop()
             self.current_fn_param_direct_effs.pop()
             self.current_fn_param_origins.pop()
+            self.current_fn_param_storage_origins.pop()
             self.current_fn_param_view_nodes.pop()
         for i in 0..saved_eff_param_syms.len() as i32:
             self.current_fn_param_syms.push(saved_eff_param_syms[i])
             self.current_fn_param_effs.push(saved_eff_param_effs[i])
             self.current_fn_param_direct_effs.push(saved_eff_param_direct_effs[i])
             self.current_fn_param_origins.push(saved_eff_param_origins[i])
+            self.current_fn_param_storage_origins.push(saved_eff_param_storage_origins[i])
             self.current_fn_param_view_nodes.push(saved_eff_param_view_nodes[i])
         self.current_return_type = saved_ret
         self.current_gen_yield_type = saved_gen_yield_type
@@ -4136,6 +4170,7 @@ impl Sema:
             self.set_sig_param_effect(sig_idx, pi, eff)
             self.set_sig_param_direct_effect(sig_idx, pi, eff)
             self.set_sig_param_view_origin(sig_idx, pi, 0)
+            self.set_sig_param_view_through(sig_idx, pi, 0)
         let origin = self.declared_view_origin(sig_idx)
         if origin == DECLARED_ORIGIN_NONE:
             return
@@ -5653,6 +5688,7 @@ impl Sema:
                 self.sig_param_effects.push(0)
                 self.sig_param_direct_effects.push(0)
                 self.sig_param_view_origins.push(0)
+                self.sig_param_view_through.push(0)
                 self.sig_param_invoke_many.push(0)
                 self.sig_value_ref_abi_params.push(0)
             for svi in 0..saved_vra_count:
@@ -7320,10 +7356,26 @@ impl Sema:
             let op = self.ast.get_data0(node)
             if op == UnaryOp.UOP_REF or op == UnaryOp.UOP_RAW_REF_CONST or op == UnaryOp.UOP_RAW_REF_MUT:
                 return 1
+            // `*r` is the pointee read out as a value: it holds a view only
+            // when its own type can (`**rr`, `*r` of a `&Vec[&T]`). A Copy
+            // read through a reference (`*r` of a `&i32`) owns what it holds
+            // (#1783); the operand's reference is not the value's.
+            if op == UnaryOp.UOP_DEREF:
+                let operand = self.ast.get_data1(node)
+                let operand_ty = if self.ast.kind(operand) == NodeKind.NK_IDENT: self.scope_lookup(self.ast.get_data0(operand)) else: self.typed_expr_types.get(operand) ?? 0
+                if operand_ty > 0:
+                    let resolved_operand = self.resolve_alias(operand_ty as TypeId)
+                    let operand_tk = self.get_type_kind(resolved_operand)
+                    if operand_tk == TypeKind.TY_REF or operand_tk == TypeKind.TY_PTR:
+                        return self.type_is_ephemeral_value(self.get_type_d0(resolved_operand))
             return self.expr_is_ephemeral_value(self.ast.get_data1(node))
         if kind == NodeKind.NK_SLICE:
             return 1
         if kind == NodeKind.NK_CALL:
+            // §13.4 (#1732): the iterator pulled from an ephemeral generator
+            // value is as ephemeral as that value.
+            if self.gen_pull_view_nodes.contains(node):
+                return 1
             // A variant constructor call carrying an ephemeral payload
             // (`Some(f)`, rule 10) recorded its payload's origins on the
             // call; it is ephemeral as a value whatever its type says.
@@ -9607,6 +9659,12 @@ impl Sema:
 // ── Expression checking helpers ──────────────────────────────────
 impl Sema:
     mut fn check_ident(ident_sym: i32, node: i32) -> i32:
+        // D70 / #1757: `ns.T` names the import's type by identity, whatever
+        // the short name resolves to here.
+        let ns_tid = self.ast.namespace_bound_type(node as NodeId)
+        if ns_tid != 0:
+            self.typed_expr_types.insert(node, ns_tid)
+            return ns_tid
         let sym = self.resolve_displaced_fn_ident(ident_sym, node)
         if sym == self.syms.file_magic:
             self.magic_ident_kinds.insert(node, SemaMagicIdentKind.FILE)
@@ -10392,7 +10450,7 @@ impl Sema:
     // collection's body formats the user's element type), so the lookup
     // cannot depend on which names that module imports.
     fn debug_fmt_template(resolved: i32) -> i32:
-        let base_tid = self.type_reflection_base_template(self.get_generic_inst_base(resolved))
+        let base_tid = self.generic_inst_template_tid(resolved)
         if base_tid == 0: 0 else: self.resolve_alias(base_tid as TypeId) as i32
 
     fn debug_fmt_generic_struct(resolved: i32) -> bool:
@@ -12378,6 +12436,14 @@ impl Sema:
                 // Only the body block's tail is the return (#1406): an inner
                 // block's tail escapes just that block's own bindings.
                 self.check_view_escape_origins(tail, tail, if node == self.body_tail_block: -1 else: block_scope_start)
+            else if tail_materializes == 0 and node != self.body_tail_block and tail_is_value != 0 and (self.type_is_ephemeral_value(tail_type as i32) != 0 or self.expr_is_ephemeral_value(tail) != 0):
+                // An inner block's tail that is an ephemeral VALUE — a stage
+                // over a generator viewing the block's `v`, a view-holding
+                // struct — leaves the block exactly as a tail view does: its
+                // origins declared inside the block die at its end (#1737:
+                // `let s = { let v = …; over(&v) |> map(f) }` ran over freed
+                // storage).
+                self.check_view_escape_origins(tail, tail, block_scope_start)
             else if tail_materializes == 0 and (self.type_is_ephemeral_value(tail_type as i32) != 0 or self.expr_is_ephemeral_value(tail) != 0) and tail_is_value != 0 and self.stmt_pos_depth == 0 and self.current_return_type != 0 and self.current_return_type != self.ty_void:
                 // #625 (decisions.md D2): a tail-position return of an ephemeral value
                 // (struct or container) is escape-checked HERE, in-scope, while the
@@ -13237,6 +13303,10 @@ impl Sema:
             if ty > 0:
                 let tk = self.get_type_kind(self.resolve_alias(ty as TypeId))
                 // A callable parameter is a view of itself (§12.4, #1698).
+                // A by-value parameter of an ephemeral type is an origin
+                // through the parameter mask (compute_expr_view_origin_mask),
+                // never a local dep: its views are the caller's, its own
+                // storage dies with the call (#1737).
                 if tk == TypeKind.TY_REF or self.callable_param_is_view(sym, ty):
                     out = self.push_unique_i32(move out, sym)
             return out
@@ -13438,6 +13508,17 @@ impl Sema:
             for ti in 0..tuple_count:
                 tuple_mask = tuple_mask | self.compute_expr_view_origin_mask(self.ast.get_extra(tuple_start + ti))
             return tuple_mask
+        // A struct literal carries its field initializers' origins, as a
+        // tuple does its elements' (collect_expr_view_deps already walks
+        // them): `MapStage { g, f }` returned from a stage views what `g`
+        // views (#1737).
+        if kind == NodeKind.NK_STRUCT_LIT:
+            let sl_start = self.ast.get_data1(node)
+            let sl_count = self.ast.get_data2(node)
+            var sl_mask = if self.expr_view_param_origins.contains(node): self.expr_view_origin_mask(node) else: 0
+            for fi in 0..sl_count:
+                sl_mask = sl_mask | self.compute_expr_view_origin_mask(self.ast.get_extra(sl_start + fi * 2 + 1))
+            return sl_mask
         if kind == NodeKind.NK_ENUM_VARIANT:
             let variant_start = self.ast.get_data2(node)
             let variant_count = self.ast.get_extra(variant_start)
@@ -13456,6 +13537,164 @@ impl Sema:
             return self.expr_view_origin_mask(node)
         0
 
+    // ── Storage origins (§21.1 Rule 6, §5.5) ──────────────────────────────
+    //
+    // compute_expr_view_origin_mask names every parameter a value may view
+    // THROUGH: the parameter's own storage and the views the parameter
+    // carries alike. These three split out the first: the parameters whose
+    // own storage the value may point into. `&self.n`, `self` held as a
+    // reference, a non-Copy field place of self view self's storage;
+    // `self.src` read out of a `&i32` field views what self views, never
+    // self. The in-place receiver's bit is what decides whether a call's
+    // result dies with its receiver (record_call_view_origins_args): a
+    // `mut fn` child built from self's references outlives self, a facade
+    // child or a view of self's fields does not. Every shape these do not
+    // prove is answered as the origin mask answers it: unproven is storage.
+
+    // Whether a value of this type is a handle read out of a place — a
+    // reference, slice or raw pointer — rather than the place's contents.
+    fn type_is_view_handle(tid: i32) -> bool:
+        tid > 0 and self.param_type_is_by_value(tid) == 0
+
+    // The parameters whose own storage the VALUE of `node` may point into.
+    fn compute_expr_storage_origin_mask(node: i32) -> i32:
+        if node == 0:
+            return 0
+        if self.has_contextual_copy_adjustment(node) != 0:
+            return 0
+        let kind = self.ast.kind(node)
+        if kind == NodeKind.NK_IDENT:
+            let sym = self.ast.get_data0(node)
+            let direct_pi = self.param_index_for_sym(sym)
+            if direct_pi >= 0:
+                let param_ty = self.scope_lookup(sym)
+                var param_mask = self.binding_view_storage_mask(sym)
+                if param_ty > 0 and (self.type_is_ephemeral_value(param_ty) != 0 or self.callable_param_is_view(sym, param_ty)):
+                    param_mask = param_mask | sema_param_origin_bit(direct_pi)
+                return param_mask
+            if self.binding_view_origin_mask(sym) != 0:
+                return self.binding_view_storage_mask(sym)
+            return self.expr_view_storage_mask(node)
+        if kind == NodeKind.NK_GROUPED or kind == NodeKind.NK_CAST or kind == NodeKind.NK_COMPTIME or kind == NodeKind.NK_UNSAFE_BLOCK or kind == NodeKind.NK_NO_SUSPEND:
+            return self.compute_expr_storage_origin_mask(self.ast.get_data0(node))
+        if kind == NodeKind.NK_ASSIGN:
+            return self.compute_expr_storage_origin_mask(self.ast.get_data0(node)) | self.compute_expr_storage_origin_mask(self.ast.get_data1(node))
+        if kind == NodeKind.NK_FIELD_ACCESS or kind == NodeKind.NK_COMPUTED_FIELD_ACCESS or kind == NodeKind.NK_INDEX:
+            // A handle read out of the place views what the place holds.
+            if self.type_is_view_handle(self.typed_expr_types.get(node) ?? 0):
+                return 0
+            return self.compute_place_storage_origin_mask(node)
+        if kind == NodeKind.NK_UNARY:
+            let op = self.ast.get_data0(node)
+            if op == UnaryOp.UOP_REF or op == UnaryOp.UOP_RAW_REF_CONST or op == UnaryOp.UOP_RAW_REF_MUT:
+                return self.compute_place_storage_origin_mask(self.ast.get_data1(node))
+            if op == UnaryOp.UOP_DEREF:
+                if self.type_is_view_handle(self.typed_expr_types.get(node) ?? 0):
+                    return 0
+                return self.compute_place_storage_origin_mask(node)
+            return self.compute_expr_storage_origin_mask(self.ast.get_data1(node))
+        if kind == NodeKind.NK_BINARY:
+            return self.compute_expr_storage_origin_mask(self.ast.get_data1(node)) | self.compute_expr_storage_origin_mask(self.ast.get_data2(node))
+        if kind == NodeKind.NK_BLOCK:
+            return self.compute_expr_storage_origin_mask(self.ast.get_data2(node))
+        if kind == NodeKind.NK_IF_EXPR:
+            return self.compute_expr_storage_origin_mask(self.ast.get_data1(node)) | self.compute_expr_storage_origin_mask(self.ast.get_data2(node))
+        if kind == NodeKind.NK_TUPLE:
+            let tuple_start = self.ast.get_data0(node)
+            var tuple_mask = 0
+            for ti in 0..self.ast.get_data1(node):
+                tuple_mask = tuple_mask | self.compute_expr_storage_origin_mask(self.ast.get_extra(tuple_start + ti))
+            return tuple_mask
+        if kind == NodeKind.NK_STRUCT_LIT:
+            let sl_start = self.ast.get_data1(node)
+            var sl_mask = if self.expr_view_param_origins.contains(node): self.expr_view_storage_mask(node) else: 0
+            for fi in 0..self.ast.get_data2(node):
+                sl_mask = sl_mask | self.compute_expr_storage_origin_mask(self.ast.get_extra(sl_start + fi * 2 + 1))
+            return sl_mask
+        if kind == NodeKind.NK_ENUM_VARIANT:
+            let variant_start = self.ast.get_data2(node)
+            var variant_mask = 0
+            for vi in 0..self.ast.get_extra(variant_start):
+                variant_mask = variant_mask | self.compute_expr_storage_origin_mask(self.ast.get_extra(variant_start + 1 + vi))
+            return variant_mask
+        if kind == NodeKind.NK_VARIANT_SHORTHAND:
+            let shorthand_start = self.ast.get_data1(node)
+            var shorthand_mask = 0
+            for vi in 0..self.ast.get_data2(node):
+                shorthand_mask = shorthand_mask | self.compute_expr_storage_origin_mask(self.ast.get_extra(shorthand_start + vi))
+            return shorthand_mask
+        if self.expr_view_param_origins.contains(node):
+            return self.expr_view_storage_mask(node)
+        0
+
+    // The parameters whose own storage the PLACE `node` lies in: a field
+    // reached through a handle lies in what the handle's value views.
+    fn compute_place_storage_origin_mask(node: i32) -> i32:
+        if node == 0:
+            return 0
+        let kind = self.ast.kind(node)
+        if kind == NodeKind.NK_GROUPED:
+            return self.compute_place_storage_origin_mask(self.ast.get_data0(node))
+        if kind == NodeKind.NK_FIELD_ACCESS or kind == NodeKind.NK_COMPUTED_FIELD_ACCESS or kind == NodeKind.NK_INDEX:
+            let base = self.ast.get_data0(node)
+            if self.type_is_view_handle(self.typed_expr_types.get(base) ?? 0):
+                return self.compute_expr_storage_origin_mask(base)
+            return self.compute_place_storage_origin_mask(base)
+        if kind == NodeKind.NK_UNARY and self.ast.get_data0(node) == UnaryOp.UOP_DEREF:
+            return self.compute_expr_storage_origin_mask(self.ast.get_data1(node))
+        self.compute_expr_storage_origin_mask(node)
+
+    // The parameters whose own storage the CONTENTS of the place `node`
+    // may view: what a receiver place holds, which a callee that views
+    // only "what self views" hands back. A parameter's contents are the
+    // caller's (its origin bit says so), a local's are its own storage
+    // mask; through a handle the pointee's contents are unknown, so the
+    // handle's own answer stands.
+    fn compute_contents_storage_origin_mask(node: i32) -> i32:
+        if node == 0:
+            return 0
+        let kind = self.ast.kind(node)
+        if kind == NodeKind.NK_GROUPED:
+            return self.compute_contents_storage_origin_mask(self.ast.get_data0(node))
+        if kind == NodeKind.NK_IDENT:
+            if self.param_index_for_sym(self.ast.get_data0(node)) >= 0:
+                return 0
+            return self.compute_expr_storage_origin_mask(node)
+        if kind == NodeKind.NK_FIELD_ACCESS or kind == NodeKind.NK_COMPUTED_FIELD_ACCESS or kind == NodeKind.NK_INDEX:
+            let base = self.ast.get_data0(node)
+            if self.type_is_view_handle(self.typed_expr_types.get(base) ?? 0):
+                return self.compute_expr_storage_origin_mask(base)
+            return self.compute_contents_storage_origin_mask(base)
+        self.compute_expr_storage_origin_mask(node)
+
+    // The storage a call argument hands the callee's parameter: a receiver
+    // place (auto-dereferenced through a handle), any other argument by its
+    // value — `&x` is x's storage, a reference local's is what it views.
+    fn arg_storage_origin_mask(arg: i32, is_receiver: bool) -> i32:
+        if is_receiver and not self.type_is_view_handle(self.typed_expr_types.get(arg) ?? 0):
+            return self.compute_place_storage_origin_mask(arg)
+        self.compute_expr_storage_origin_mask(arg)
+
+    // What a call argument's parameter VIEWS, for a callee whose result
+    // views only that: the receiver place's contents; the pointee's
+    // contents behind `&place`; nothing behind a parameter handed on.
+    fn arg_viewed_storage_origin_mask(arg: i32, is_receiver: bool) -> i32:
+        if arg == 0:
+            return 0
+        if is_receiver:
+            return self.compute_contents_storage_origin_mask(arg)
+        var peeled = arg
+        while peeled != 0 and self.ast.kind(peeled) == NodeKind.NK_GROUPED:
+            peeled = self.ast.get_data0(peeled)
+        if peeled == 0:
+            return 0
+        let kind = self.ast.kind(peeled)
+        if kind == NodeKind.NK_UNARY and self.ast.get_data0(peeled) == UnaryOp.UOP_REF:
+            return self.compute_contents_storage_origin_mask(self.ast.get_data1(peeled))
+        if kind == NodeKind.NK_IDENT and self.param_index_for_sym(self.ast.get_data0(peeled)) >= 0:
+            return 0
+        self.compute_expr_storage_origin_mask(peeled)
+
     mut fn record_transparent_view_origins(result_node: i32, source_node: i32):
         if result_node == 0 or source_node == 0 or self.has_contextual_copy_adjustment(result_node) != 0:
             return
@@ -13463,6 +13702,7 @@ impl Sema:
         var deps: Vec[i32] = Vec.new()
         deps = self.collect_expr_view_deps(source_node, move deps)
         self.set_expr_view_deps(result_node, param_mask, deps)
+        self.set_expr_view_storage_mask(result_node, self.compute_expr_storage_origin_mask(source_node))
         // #962: a carrier of a view into a temporary is a view into it too.
         let temp_ty = self.view_into_temporary_type(source_node)
         if temp_ty != 0:
@@ -13497,13 +13737,16 @@ impl Sema:
         if result_node == 0 or self.has_contextual_copy_adjustment(result_node) != 0:
             return
         var param_mask = 0
+        var storage_mask = 0
         var deps: Vec[i32] = Vec.new()
         for si in 0..source_nodes.len() as i32:
             let source_node = source_nodes[si]
             if source_node > 0:
                 param_mask = param_mask | self.compute_expr_view_origin_mask(source_node)
+                storage_mask = storage_mask | self.compute_expr_storage_origin_mask(source_node)
                 deps = self.collect_expr_view_deps(source_node, move deps)
         self.set_expr_view_deps(result_node, param_mask, deps)
+        self.set_expr_view_storage_mask(result_node, storage_mask)
 
     mut fn record_view_producer_origins(result_node: i32, receiver_node: i32):
         if result_node == 0 or receiver_node == 0:
@@ -13514,6 +13757,9 @@ impl Sema:
         if deps.len() == 0:
             deps = self.push_unique_i32(move deps, self.place_root_sym(receiver_node))
         self.set_expr_view_deps(result_node, param_mask, deps)
+        // The view points into the receiver place (an element of `self.items`);
+        // through a handle, into what the handle views.
+        self.set_expr_view_storage_mask(result_node, self.arg_storage_origin_mask(receiver_node, true))
         // #962: the receiver is a temporary (a call result, not a place) that
         // owns storage: it is freed when this statement ends, so the view has
         // no origin that outlives the statement. Remember it; a binding or a
@@ -13563,6 +13809,7 @@ impl Sema:
                 if root != 0 and root != sym:
                     deps = self.push_unique_i32(move deps, root)
         self.set_binding_view_deps(sym, param_mask, deps)
+        self.set_binding_view_storage_mask(sym, self.compute_expr_storage_origin_mask(expr_node))
         self.register_view_binding_borrows(sym, expr_node)
 
     // #1302 (§2.2, §9.7, D22/D27/D32): a pattern is structural projection, so a
@@ -13760,9 +14007,6 @@ impl Sema:
         if arg_count != 0:
             self.emit_error(f"g.pull() takes no arguments, found {arg_count}", node)
             return 0
-        if self.type_is_ephemeral_value(gen_ty as TypeId) != 0:
-            self.emit_error("g.pull() of a generator whose arguments are views is not implemented yet (#1732): the pulled iterator would have to be as ephemeral as the generator value; consume the generator with `for`", node)
-            return 0
         let fn_sym = self.pool_lookup_symbol("gen_pull")
         let fn_node = self.generic_fn_node_for_symbol(fn_sym)
         if fn_node == 0 or not self.fn_symbol_source_path(fn_sym).ends_with("std/task.w"):
@@ -13784,7 +14028,52 @@ impl Sema:
         self.typed_expr_types.insert(node, ret)
         self.gen_pull_nodes.push(node)
         self.gen_pull_fns.push(self.generator_state_fns.get(gen_ty).unwrap())
+        // §13.4, §5.3 (#1732): a generator whose arguments are views is an
+        // ephemeral value, and the iterator pulled from it runs that
+        // generator — an iterator over borrowed data. The Pulled's type
+        // cannot say so (its generator is behind a raw pointer), so the
+        // call carries the generator value's origins: its deps, and the
+        // value's own storage when it is a place (a binding holding the
+        // generator), as record_call_view_origins does for an escaping
+        // view parameter.
+        if self.type_is_ephemeral_value(gen_ty as TypeId) != 0:
+            var deps: Vec[i32] = Vec.new()
+            deps = self.collect_expr_view_deps(recv, move deps)
+            if deps.len() == 0 or self.expr_type_is_value(recv):
+                deps = self.push_unique_i32(move deps, self.place_root_sym(recv))
+            self.set_expr_view_deps(node, self.compute_expr_view_origin_mask(recv), deps)
+            self.gen_pull_view_nodes.insert(node, 1)
         ret
+
+    // §13.4 (#1732): the element a Pulled yields is as ephemeral as the
+    // Pulled. `next()` on a pulled iterator that carries a generator's view
+    // origins (the `g.pull()` call above) returns an element viewing them
+    // when the element type holds views. The Pulled's body cannot say so —
+    // the element crosses the coroutine through a raw slot — so the call
+    // carries the receiver's origins, as the `g.pull()` call carried the
+    // generator's.
+    mut fn note_pulled_next_view_origins(node: i32, recv: i32, method_fn_sym: i32, ret_ty: i32):
+        if recv == 0 or ret_ty == 0 or not self.pool_resolve(method_fn_sym).ends_with("next"):
+            return
+        let recv_ty = self.recorded_expr_type_or_zero(recv)
+        if recv_ty == 0 or self.type_is_std_pulled_inst(recv_ty) == 0:
+            return
+        if self.type_is_ephemeral_value(ret_ty) == 0 or self.type_is_ephemeral_value(recv_ty) == 0:
+            return
+        var deps: Vec[i32] = Vec.new()
+        deps = self.collect_expr_view_deps(recv, move deps)
+        let mask = self.compute_expr_view_origin_mask(recv)
+        if deps.len() == 0 and mask == 0:
+            return
+        self.set_expr_view_deps(node, mask, deps)
+
+    // std.task's `Pulled[T]`, by the instance's recorded declaration.
+    fn type_is_std_pulled_inst(tid: i32) -> i32:
+        let resolved = self.resolve_alias(tid as TypeId) as i32
+        if self.get_type_kind(resolved as TypeId) != TypeKind.TY_GENERIC_INST or self.pool_resolve(self.get_type_d0(resolved)) != "Pulled":
+            return 0
+        let template = self.resolve_alias(self.generic_inst_template_tid(resolved) as TypeId) as i32
+        if self.type_tid_is_std.contains(template): self.type_tid_is_std.get(template).unwrap() else: 0
 
     // D69 (§13.4 Pulling): next() returns an element its caller keeps and
     // resumes the generator on its own fiber, so a generator that yields a
@@ -13932,6 +14221,10 @@ impl Sema:
         if expr_node == 0 or self.current_fn_sig_idx < 0:
             return
         var origin_mask = self.compute_expr_view_origin_mask(expr_node)
+        // The parameters whose own storage the carrier may point into. A
+        // parameter the structural walk did not reach, found only as a
+        // concrete dep below, is unproven: storage.
+        var storage_mask = self.compute_expr_storage_origin_mask(expr_node)
         var deps: Vec[i32] = Vec.new()
         deps = self.collect_expr_view_deps(expr_node, move deps)
         for pi in 0..self.current_fn_param_syms.len() as i32:
@@ -13943,6 +14236,7 @@ impl Sema:
                 let dep_sym = deps[di]
                 if dep_sym == param_sym or self.pool_resolve(dep_sym) == param_name:
                     origin_mask = origin_mask | sema_param_origin_bit(pi)
+                    storage_mask = storage_mask | sema_param_origin_bit(pi)
                     break
         if origin_mask == 0:
             return
@@ -13953,7 +14247,7 @@ impl Sema:
             self.effect_note_origin_node = expr_node
             self.note_param_effect(param_sym, EFF_ESCAPE_VIEW)
             self.effect_note_origin_node = 0
-            self.note_param_view_origin(param_sym, origin_mask, expr_node)
+            self.note_param_view_origin(param_sym, origin_mask, storage_mask, expr_node)
 
     mut fn record_builtin_receiver_view_origins(call_node: i32, recv_node: i32):
         self.record_view_producer_origins(call_node, recv_node)
@@ -13961,27 +14255,58 @@ impl Sema:
     fn record_call_view_origins(call_node: i32, sig_idx: i32, param_offset: i32, recv_node: i32, extra_start: i32, arg_count: i32, has_resolved: i32):
         if call_node == 0 or sig_idx < 0:
             return
+        // The call's arguments by PARAMETER index: the receiver first when
+        // the signature has one, then the (resolved) argument list.
+        let param_count = self.sig_get_param_count(sig_idx)
+        let args: Vec[i32] = Vec.new()
+        for pi in 0..param_count:
+            var arg = 0
+            if param_offset == 1 and pi == 0:
+                arg = recv_node
+            else:
+                let arg_index = if param_offset == 1: pi - 1 else: pi
+                if arg_index >= 0 and arg_index < arg_count:
+                    arg = if has_resolved != 0: self.get_resolved_call_arg(call_node, arg_index) else: self.ast.get_extra(extra_start + arg_index)
+            args.push(arg)
+        self.record_call_view_origins_args(call_node, sig_idx, param_offset == 1, args)
+        let fx = self.facade_call_effect_for(sig_idx)
+        if fx >= 0:
+            self.facade_apply_call_touches(fx, call_node, sig_idx, param_offset, recv_node, extra_start, arg_count, has_resolved)
+
+    // The result of the call `call_node` views what the signature's
+    // escape_view parameters' arguments view. `args` is the argument node
+    // per parameter (0 for a missing one), the receiver at index 0 when
+    // `has_receiver`. A generic call records through this directly: its
+    // arguments (a pipeline's lhs first) are not a contiguous AST run.
+    fn record_call_view_origins_args(call_node: i32, sig_idx: i32, has_receiver: bool, args: &Vec[i32]):
         let param_count = self.sig_get_param_count(sig_idx)
         var union_mask = 0
+        var storage_mask = 0
         var concrete_deps: Vec[i32] = Vec.new()
         for pi in 0..param_count:
             if (self.sig_param_effect(sig_idx, pi) & EFF_ESCAPE_VIEW) == 0:
                 continue
             let param_origin_mask = self.sig_param_view_origin(sig_idx, pi)
+            let param_through_mask = self.sig_param_view_through(sig_idx, pi)
             for origin_pi in 0..param_count:
                 if sema_param_origin_mask_contains(param_origin_mask, origin_pi) == 0:
                     continue
-                if self.param_type_is_by_value(self.sig_param_type(sig_idx, origin_pi)) != 0:
+                // A by-value parameter is no origin — unless its type is
+                // ephemeral: the value holds views, and the result that
+                // views the parameter views what the argument did (#1737).
+                let origin_param_ty = self.sig_param_type(sig_idx, origin_pi)
+                if self.param_type_is_by_value(origin_param_ty) != 0 and self.type_is_ephemeral_value(origin_param_ty) == 0:
                     continue
-                var origin_arg = 0
-                if param_offset == 1 and origin_pi == 0:
-                    origin_arg = recv_node
-                else:
-                    let arg_index = if param_offset == 1: origin_pi - 1 else: origin_pi
-                    if arg_index >= 0 and arg_index < arg_count:
-                        origin_arg = if has_resolved != 0: self.get_resolved_call_arg(call_node, arg_index) else: self.ast.get_extra(extra_start + arg_index)
+                let origin_arg = if origin_pi < args.len() as i32: args[origin_pi] else: 0
                 if origin_arg > 0:
+                    let is_recv = has_receiver and origin_pi == 0
+                    // Whether the callee's result points into this
+                    // parameter's own storage, or only into what the
+                    // parameter views (the signature's through mask, from
+                    // the callee's body; unproven is storage).
+                    let views_storage = sema_param_origin_mask_contains(param_through_mask, origin_pi) == 0
                     union_mask = union_mask | self.compute_expr_view_origin_mask(origin_arg)
+                    storage_mask = storage_mask | (if views_storage: self.arg_storage_origin_mask(origin_arg, is_recv) else: self.arg_viewed_storage_origin_mask(origin_arg, is_recv))
                     let dep_len_before = concrete_deps.len() as i32
                     concrete_deps = self.collect_expr_view_deps(origin_arg, move concrete_deps)
                     // The result may reference the origin argument's own
@@ -13991,8 +14316,18 @@ impl Sema:
                     // Only a reference argument is transparent: its storage
                     // is the pointee, whose origins the collect found. An
                     // ephemeral receiver's deps alone let a view of it
-                    // outlive it (§21.1 Rule 6, §5.5).
-                    if concrete_deps.len() as i32 == dep_len_before or self.expr_type_is_value(origin_arg):
+                    // outlive it (§21.1 Rule 6, §5.5). The exception is an
+                    // in-place receiver (`fn`/`mut fn` self: a borrowed
+                    // place, not a value the call received) whose callee
+                    // proved its result views only what self views, never
+                    // self's own storage (`var c = Builder.mk(self.src); c`):
+                    // that result outlives the receiver, and
+                    // `self.finish(move child)` after `self.child()` is no
+                    // mutation under a live view. A result that views self's
+                    // storage — `V { origin: self }`, `&self.n`, a facade
+                    // child `borrows param 0` — dies with the receiver place.
+                    let in_place_recv = is_recv and self.sig_receiver_mode(sig_idx) != ReceiverMode.Move
+                    if (not in_place_recv or views_storage) and (concrete_deps.len() as i32 == dep_len_before or self.expr_type_is_value(origin_arg)):
                         concrete_deps = self.push_unique_i32(move concrete_deps, self.place_root_sym(origin_arg))
         // A facade operation (D51 stage 7, ruling §33-§38): its result may
         // borrow from a foreign-state domain, and the call invalidates the
@@ -14005,22 +14340,17 @@ impl Sema:
         // own storage when it is a value, its origins through a reference.
         if fx >= 0 and self.facade_call_effects[fx].borrow_param >= 0 and self.facade_presented_calls.contains(call_node):
             let bp = self.facade_call_effects[fx].borrow_param
-            let arg_index = if param_offset == 1: bp - 1 else: bp
-            var origin_arg = 0
-            if param_offset == 1 and bp == 0:
-                origin_arg = recv_node
-            else if arg_index >= 0 and arg_index < arg_count:
-                origin_arg = if has_resolved != 0: self.get_resolved_call_arg(call_node, arg_index) else: self.ast.get_extra(extra_start + arg_index)
+            let origin_arg = if bp >= 0 and bp < args.len() as i32: args[bp] else: 0
             if origin_arg > 0:
                 union_mask = union_mask | self.compute_expr_view_origin_mask(origin_arg)
+                storage_mask = storage_mask | self.arg_storage_origin_mask(origin_arg, has_receiver and bp == 0)
                 let dep_len_before = concrete_deps.len() as i32
                 concrete_deps = self.collect_expr_view_deps(origin_arg, move concrete_deps)
                 if concrete_deps.len() as i32 == dep_len_before or self.expr_type_is_value(origin_arg):
                     concrete_deps = self.push_unique_i32(move concrete_deps, self.place_root_sym(origin_arg))
         if union_mask != 0 or concrete_deps.len() > 0:
             self.set_expr_view_deps(call_node, union_mask, concrete_deps)
-        if fx >= 0:
-            self.facade_apply_call_touches(fx, call_node, sig_idx, param_offset, recv_node, extra_start, arg_count, has_resolved)
+            self.set_expr_view_storage_mask(call_node, storage_mask)
 
     // Ruling §38: "Unknown effect means invalidate." Every live view borrowed
     // from a resource this call receives without `preserves param N`, or
@@ -14295,7 +14625,7 @@ impl Sema:
                 self.note_returned_transparent_view_effects(value)
                 let root = self.place_root_sym(value)
                 if root != 0:
-                    self.note_param_view_origin(root, self.compute_expr_view_origin_mask(value), value)
+                    self.note_param_view_origin(root, self.compute_expr_view_origin_mask(value), self.compute_expr_storage_origin_mask(value), value)
                 self.check_returned_view_origins(value, node)
             else if self.has_contextual_copy_adjustment(value) == 0 and (self.type_is_ephemeral_value(val_type as i32) != 0 or self.expr_is_ephemeral_value(value) != 0):
                 self.note_returned_transparent_view_effects(value)
@@ -15449,8 +15779,10 @@ impl Sema:
             let gi_base_raw = self.get_type_d0(resolved)
             let gi_base_canonical = self.canonical_symbol_by_text(gi_base_raw)
             let gi_base_sym = if self.type_decl_nodes.contains(gi_base_raw): gi_base_raw else: gi_base_canonical
-            if self.type_decl_nodes.contains(gi_base_sym):
-                let td_node: i32 = self.type_decl_nodes.get(gi_base_sym).unwrap()
+            // The instance's own declaration (#1745): a user `type PullCore`
+            // must not answer for std.task's `PullCore[G]` inside std's body.
+            let td_node = self.generic_inst_decl_node(resolved as i32)
+            if td_node != 0:
                 let td_extra = self.ast.get_data1(td_node)
                 let td_packed = self.ast.get_data2(td_node)
                 if type_decl_sub_kind(td_packed) == TypeDeclKind.Struct:
@@ -15553,7 +15885,7 @@ impl Sema:
             if static_prim != 0:
                 obj_type = static_prim as TypeId
             else:
-                let static_named = self.lookup_named_type_visible(static_type_sym)
+                let static_named = self.static_receiver_named_type(expr, static_type_sym)
                 if static_named != 0:
                     obj_type = static_named as TypeId
         else if static_type_sym != 0 and self.static_receiver_type_is_known(expr) != 0 and static_expr_kind == NodeKind.NK_INDEX:
@@ -15873,7 +16205,7 @@ impl Sema:
             if static_prim != 0:
                 obj_type = static_prim as TypeId
             else:
-                let static_named = self.lookup_named_type_visible(static_type_sym)
+                let static_named = self.static_receiver_named_type(expr, static_type_sym)
                 if static_named != 0:
                     obj_type = static_named as TypeId
             // docs/completed/mut.md Rev 8 §5.3 / §15.4 — `Vec.push` (etc.) parsed as a
@@ -16773,6 +17105,11 @@ impl Sema:
             let resolved = self.resolve_alias(tid as TypeId) as i32
             if self.type_decl_nodes_by_tid.contains(resolved):
                 return self.type_decl_nodes_by_tid.get(resolved).unwrap()
+            // A generic instance names its own template (#1745).
+            if self.get_type_kind(resolved as TypeId) == TypeKind.TY_GENERIC_INST:
+                let gi_node = self.generic_inst_decl_node(resolved)
+                if gi_node != 0:
+                    return gi_node
         if self.type_decl_nodes.contains(name):
             return self.type_decl_nodes.get(name).unwrap()
         0
@@ -17583,7 +17920,7 @@ impl Sema:
         if tk == TypeKind.TY_STRUCT:
             return self.get_type_d2(r)
         if tk == TypeKind.TY_GENERIC_INST:
-            let base_tid = self.type_reflection_base_template(self.get_generic_inst_base(r as i32))
+            let base_tid = self.generic_inst_template_tid(r as i32)
             if base_tid != 0 and self.get_type_kind(self.resolve_alias(base_tid as TypeId)) == TypeKind.TY_STRUCT:
                 return self.get_type_d2(self.resolve_alias(base_tid as TypeId))
         -1
@@ -19709,18 +20046,21 @@ impl Sema:
         let saved_capture_effs: Vec[i32] = Vec.new()
         let saved_capture_direct_effs: Vec[i32] = Vec.new()
         let saved_capture_origins: Vec[i32] = Vec.new()
+        let saved_capture_storage_origins: Vec[i32] = Vec.new()
         let saved_capture_view_nodes: Vec[i32] = Vec.new()
         for i in 0..self.current_fn_param_syms.len() as i32:
             saved_capture_syms.push(self.current_fn_param_syms[i])
             saved_capture_effs.push(self.current_fn_param_effs[i])
             saved_capture_direct_effs.push(self.current_fn_param_direct_effs[i])
             saved_capture_origins.push(self.current_fn_param_origins[i])
+            saved_capture_storage_origins.push(self.current_fn_param_storage_origins[i])
             saved_capture_view_nodes.push(self.current_fn_param_view_nodes[i])
         while self.current_fn_param_syms.len() > 0:
             self.current_fn_param_syms.pop()
             self.current_fn_param_effs.pop()
             self.current_fn_param_direct_effs.pop()
             self.current_fn_param_origins.pop()
+            self.current_fn_param_storage_origins.pop()
             self.current_fn_param_view_nodes.pop()
         let closure_capture_syms: Vec[i32] = Vec.new()
         for ci in 0..outer_count:
@@ -19733,6 +20073,7 @@ impl Sema:
                 self.current_fn_param_effs.push(0)
                 self.current_fn_param_direct_effs.push(0)
                 self.current_fn_param_origins.push(0)
+                self.current_fn_param_storage_origins.push(0)
                 self.current_fn_param_view_nodes.push(0)
         self.current_fn_sig_idx = if closure_capture_syms.len() > 0: 0 else: saved_capture_sig_idx
         // #1819: the body's writes and calls are the closure's: they happen
@@ -19904,6 +20245,7 @@ impl Sema:
                 self.current_fn_param_effs.push(0)
                 self.current_fn_param_direct_effs.push(0)
                 self.current_fn_param_origins.push(0)
+                self.current_fn_param_storage_origins.push(0)
                 self.current_fn_param_view_nodes.push(0)
         if expected_ret_ty != 0 and expected_ret_ty != self.ty_void and body_ty != 0 and body_ty != self.ty_never:
             if body_ty == self.ty_void:
@@ -19939,7 +20281,7 @@ impl Sema:
                 self.note_returned_transparent_view_effects(body)
                 let body_root = self.place_root_sym(body)
                 if body_root != 0:
-                    self.note_param_view_origin(body_root, self.compute_expr_view_origin_mask(body), body)
+                    self.note_param_view_origin(body_root, self.compute_expr_view_origin_mask(body), self.compute_expr_storage_origin_mask(body), body)
             else if self.type_is_ephemeral_value(body_ty as i32) != 0:
                 self.note_returned_transparent_view_effects(body)
 
@@ -19966,12 +20308,14 @@ impl Sema:
             self.current_fn_param_effs.pop()
             self.current_fn_param_direct_effs.pop()
             self.current_fn_param_origins.pop()
+            self.current_fn_param_storage_origins.pop()
             self.current_fn_param_view_nodes.pop()
         for i in 0..saved_capture_syms.len() as i32:
             self.current_fn_param_syms.push(saved_capture_syms[i])
             self.current_fn_param_effs.push(saved_capture_effs[i])
             self.current_fn_param_direct_effs.push(saved_capture_direct_effs[i])
             self.current_fn_param_origins.push(saved_capture_origins[i])
+            self.current_fn_param_storage_origins.push(saved_capture_storage_origins[i])
             self.current_fn_param_view_nodes.push(saved_capture_view_nodes[i])
         self.current_fn_sig_idx = saved_capture_sig_idx
         self.current_fn_variadic = saved_capture_fn_variadic
@@ -20129,6 +20473,7 @@ impl Sema:
         for pi in 0..arg_count:
             if pi < param_count and pi != arg_index and arg_types[pi] != 0:
                 self.bind_type_params_from_type_expr(self.ast.fn_param_type(param_start, pi), arg_types[pi], tp_start, tp_count, call_node)
+        self.bind_type_params_from_bounds(tp_start, tp_count, call_node)
         let fp_start = self.ast.get_data0(p_node)
         let fp_count = self.ast.get_data1(p_node)
         let ret_node = self.ast.get_data2(p_node)
@@ -20164,6 +20509,84 @@ impl Sema:
             self.check_closure_arg_against_param(arg_node, fn_sym, -1, ai, call_node)
             types[ai] = ty as i32
         types
+
+    // §13.3 (#1746): the std.traits adapter `iter_<name>` a method call
+    // `recv.<name>(…)` on an Iter[T] implementor resolves to — a type with
+    // a declared `next()` and no method of that name of its own; 0 for the
+    // compiler's built-in iterator types (their intrinsics stay) and every
+    // other receiver.
+    mut fn user_iter_adapter_fn(recv_type: i32, method: i32) -> i32:
+        if recv_type == 0 or method == 0:
+            return 0
+        let name: str = with_str_clone_ref(self.pool_resolve(method))
+        if not sema_iter_adapter_name(name):
+            return 0
+        let resolved = self.auto_deref_method_type(recv_type as TypeId, method, 0, 0)
+        // A built-in iterator (VecIter, the intrinsic adapter types) declares
+        // `next()` in std too, but its adapters are the compiler's intrinsics
+        // (builtin_intrinsic_method_return_type), with their own diagnostics
+        // (`unsupported collect target`) and lowering: this dispatch is only
+        // for a receiver that has no intrinsic adapter.
+        if self.iterator_owner_symbol(resolved as i32) != 0:
+            return 0
+        var owner = self.method_owner_symbol_for_type(resolved as i32)
+        if owner == 0:
+            return 0
+        if not self.type_decl_nodes.contains(owner):
+            let canon = self.canonical_symbol_by_text(owner)
+            if canon != 0 and self.type_decl_nodes.contains(canon):
+                owner = canon
+        if self.lookup_method_fn(owner, method) != 0 or self.lookup_generic_method_fn(owner, method) != 0 or self.lookup_method_sig(owner, method) >= 0:
+            return 0
+        let next_sym = self.pool_lookup_symbol("next")
+        if next_sym <= 0 or (self.lookup_method_fn(owner, next_sym) == 0 and self.lookup_generic_method_fn(owner, next_sym) == 0 and self.lookup_method_sig(owner, next_sym) < 0):
+            return 0
+        let fn_sym = self.pool_lookup_symbol("iter_" ++ name)
+        if fn_sym <= 0:
+            return 0
+        let fn_node = self.generic_fn_node_for_symbol(fn_sym)
+        let fn_path = self.fn_symbol_source_path(fn_sym)
+        if fn_node == 0 or not (fn_path.ends_with("std/traits.w") or fn_path.ends_with("std/collections.w")):
+            return 0
+        fn_node
+
+    // `recv.<name>(args)` on an Iter[T] implementor: the call
+    // `iter_<name>(recv, args)` (user_iter_adapter_fn), typed as
+    // check_generic_pipeline_call types `recv |> stage(args)`. The
+    // receiver is an ordinary by-value argument (receiver_arg_call_nodes).
+    mut fn check_user_iter_method(node: i32, expr: i32, recv_type: i32, field: i32, extra_start: i32, arg_count: i32) -> i32:
+        let fn_sym = self.pool_lookup_symbol("iter_" ++ self.pool_resolve(field))
+        var arg_types: Vec[i32] = Vec.new()
+        let arg_nodes: Vec[i32] = Vec.new()
+        let deferred: Vec[i32] = Vec.new()
+        arg_types.push(recv_type)
+        arg_nodes.push(expr)
+        for ai in 0..arg_count:
+            let arg_node = self.ast.get_extra(extra_start + ai)
+            arg_nodes.push(arg_node)
+            if self.closure_has_untyped_param(arg_node):
+                deferred.push(ai + 1)
+                arg_types.push(0)
+            else:
+                arg_types.push(self.check_expr_value_context(arg_node) as i32)
+        let fn_node = self.select_generic_fn_node(fn_sym, arg_types, arg_count + 1, node)
+        if fn_node == 0:
+            return 0
+        if deferred.len() > 0:
+            arg_types = self.check_deferred_generic_closure_args(fn_node, fn_sym, &deferred, move arg_types, &arg_nodes, node)
+        self.resolved_generic_call_nodes.insert(node, fn_node)
+        let ret = self.check_generic_call(fn_sym, fn_node, arg_types, arg_nodes, arg_count + 1, node)
+        if ret == 0:
+            return 0
+        // Every adapter takes its iterator by value: the receiver is consumed.
+        self.note_place_effect(expr, EFF_CONSUME)
+        for ai in 0..arg_nodes.len() as i32:
+            if arg_nodes[ai] > 0:
+                self.mark_moved_if_consumed(arg_nodes[ai])
+        self.comp_resolved.insert(node, fn_sym)
+        self.receiver_arg_call_nodes.insert(node, 1)
+        self.typed_expr_types.insert(node, ret)
+        ret
 
     mut fn check_generic_pipeline_call(node: i32, lhs: i32, lhs_ty: i32, rhs: i32) -> i32:
         var callee = rhs
@@ -20264,7 +20687,16 @@ impl Sema:
                     let method = rhs_method
                     if self.pipeline_method_exists(lhs_ty as i32, method) != 0:
                         var ret = 0
-                        if method == self.syms.collect and self.ast.kind(rhs_callee) == NodeKind.NK_INDEX:
+                        if method == self.syms.collect and self.ast.kind(rhs_callee) == NodeKind.NK_INDEX and self.user_iter_adapter_fn(lhs_ty as i32, method) != 0:
+                            // `it |> collect[Vec]()` over an Iter[T] implementor:
+                            // the bracket names what iter_collect builds.
+                            let target_node = self.ast.get_data1(rhs_callee)
+                            let target_sym = if self.ast.kind(target_node) == NodeKind.NK_IDENT: self.ast.get_data0(target_node) else: 0
+                            if target_sym != self.syms.vec:
+                                self.emit_error(f"`collect[{self.pool_resolve(target_sym)}]` over a {self.type_name(lhs_ty as i32)} is not available: an Iter[T] implementor collects into a Vec (§13.3)", rhs_callee)
+                                return 0
+                            ret = self.check_method_call_parts(lhs, method, self.ast.get_data1(rhs), self.ast.get_data2(rhs), node, lhs_ty as i32)
+                        else if method == self.syms.collect and self.ast.kind(rhs_callee) == NodeKind.NK_INDEX:
                             ret = self.collect_target_type_from_callee(rhs_callee, lhs_ty as i32, node)
                         else:
                             ret = self.check_method_call_parts(lhs, method, self.ast.get_data1(rhs), self.ast.get_data2(rhs), node, lhs_ty as i32)
@@ -20493,6 +20925,10 @@ impl Sema:
     mut fn pipeline_method_exists(recv_type: i32, method: i32) -> i32:
         if recv_type == 0 or method == 0:
             return 0
+        // §13.3 (#1746): `it |> map(f)` over an Iter[T] implementor is the
+        // trait adapter, as `it.map(f)` is.
+        if self.user_iter_adapter_fn(recv_type, method) != 0:
+            return 1
         var resolved = self.auto_deref_method_type(recv_type as TypeId, method, 0, 0)
         let owner = self.method_owner_symbol_for_type(resolved as i32)
         if owner == 0:
@@ -21334,7 +21770,7 @@ impl Sema:
             let member_name: str = with_str_clone_ref(self.pool_resolve(member))
             self.emit_error(f"{self.namespace_import_text(found)} provides no '{member_name}' (through the namespace '{text}')", node)
             return -1
-        self.ast.bind_namespace_ident(node as NodeId, sym)
+        self.ast.bind_namespace_ident(node as NodeId, sym, self.namespace_type_member(found, member))
         1
 
     // `a` or `a.b.c` when `node` is an identifier or a field-access chain of
@@ -21383,14 +21819,10 @@ impl Sema:
                 if self.decl_visible_from_current(path, self.decl_visibility_pub[i]) == 0:
                     self.emit_error(f"'{member_name}' is private to module '{path}'", node)
                     return -1
-                let decl = self.decl_visibility_nodes[i]
                 // A type keeps its short name (types are not displaced): the
-                // rewritten ident reaches the target's type only when that is
-                // the one the name resolves to here. Otherwise fail loudly
-                // rather than bind another module's type (#1757).
-                if decl != 0 and self.ast.kind(decl) == NodeKind.NK_TYPE_DECL and self.lookup_named_type_visible(member) != self.named_type_candidate_tid_in(member, path):
-                    self.emit_error(f"'{self.ns_names[ni]}.{member_name}' names module '{path}'s type, but '{member_name}' here resolves to another declaration; a namespaced type that another visible declaration shadows is not reachable yet (D70)", node)
-                    return -1
+                // rewritten ident carries the module's type identity
+                // (namespace_type_member, #1757), so `shapes.Pt` reaches
+                // shapes' type where another `Pt` shadows the short name.
                 return member
             i = self.decl_visibility_prev[i]
         i = if self.displaced_fn_index.contains(member): self.displaced_fn_index.get(member).unwrap() else: -1
@@ -21412,6 +21844,36 @@ impl Sema:
                 return -1
             return member
         0
+
+    // The type `member` names in the module import `ni` provides (#1757):
+    // its identity, not its short name. 0 for a value, a fn, a c_import's
+    // member, or no such type.
+    fn namespace_type_member(ni: i32, member: i32) -> i32:
+        let target = self.ns_targets[ni]
+        if target < 0:
+            return 0
+        self.named_type_candidate_tid_in(member, self.module_paths[target])
+
+    // D70 (§18.2) / #1757: a type annotation `ns.T` where `ns` is an import
+    // namespace of the current module — the module's `T` by identity. 0 when
+    // `ns` is no namespace here; -1 when it is one but provides no type `T`
+    // (the caller reports it). Pure, so the frozen twin resolves alike.
+    fn namespace_type_annotation(base_sym: i32, assoc_sym: i32) -> i32:
+        let ni = self.clause_namespace(self.pool_resolve(base_sym))
+        if ni < 0 or self.ns_targets[ni] < 0:
+            return 0
+        let tid = self.namespace_type_member(ni, assoc_sym)
+        if tid == 0: -1 else: tid
+
+    // Whether the current module may name the type `sym` module `path`
+    // declares (its `pub`), for a namespaced type annotation.
+    fn named_type_visible_in(sym: i32, path: &str) -> bool:
+        var i = self.named_type_candidate_head(sym)
+        while i >= 0:
+            if self.named_type_candidate_paths[i] == path:
+                return self.decl_visible_from_current(path, self.named_type_candidate_pub[i]) != 0
+            i = self.named_type_candidate_next[i]
+        false
 
     // The type `sym` names in the module at `path`, 0 when it declares none.
     fn named_type_candidate_tid_in(sym: i32, path: &str) -> i32:
@@ -22996,6 +23458,7 @@ impl Sema:
         self.clear_generic_substitution()
         for pi in 0..arg_count:
             self.bind_type_params_from_type_expr(self.ast.fn_param_type(param_start, pi), arg_types[pi], tp_start, tp_count, call_node)
+        self.bind_type_params_from_bounds(tp_start, tp_count, call_node)
         self.ensure_generic_substitutions(tp_start, tp_count, param_start, param_count, call_node)
 
         var matches = if self.diags.items.len() as i32 == saved_diag_count: 1 else: 0
@@ -23097,6 +23560,11 @@ impl Sema:
                 self.facade_check_callback_arg(fn_sym, ai, actual_ty, arg_node)
         if slice_mut_args.len() > 0:
             self.check_mut_slice_call_exclusivity(slice_mut_args, arg_nodes)
+        // The specialization's returned-view contract reaches the caller as
+        // every other resolved call's does (the generic method path records
+        // through its concrete signature too): `first(&v)` and
+        // `over(&v) |> map(f)` view `v`.
+        self.record_call_view_origins_args(call_node, sig_idx, false, arg_nodes)
         // #1819: the specialization is the body the call runs.
         let args: Vec[i32] = Vec.new()
         let by_place: Vec[bool] = Vec.new()
@@ -23156,6 +23624,7 @@ impl Sema:
             if arg_ty != 0 and self.type_is_ephemeral_value(arg_ty as TypeId) != 0:
                 let eg_arg_node = if pi < arg_nodes.len() as i32: arg_nodes[pi] else: 0
                 self.check_ephemeral_task_arg_escape(if eg_arg_node > 0: eg_arg_node else: call_node, 0, 0, fn_sym, pi)
+        self.bind_type_params_from_bounds(tp_start, tp_count, call_node)
 
         // Obligation model: collect and solve trait bounds for each bound type parameter.
         let bounds_errors_before = self.diags.count_by_severity(DiagSeverity.Error)
@@ -23272,6 +23741,34 @@ impl Sema:
         if found_count == 1:
             return found
         0
+
+    // The substitution a monomorphized instance was checked under
+    // (register_concrete_specialization), installed for the frozen
+    // resolvers a backend runs over the instance's body: `sizeof[PullCore[G]]`
+    // in `gen_pull__sema__…` names G, which no local carries, and the
+    // LLVM backend binds the same record (set_mono_type_bindings). Returns
+    // the number of bindings pushed, for pop_generic_subst; 0 for a symbol
+    // with no record (a non-generic function). A frame still active when
+    // a frozen consumer asks is a checker leak: a stale `T` sized
+    // `Box.new[A]`'s allocation as the last instance's (#1766).
+    mut fn push_specialization_subst(mono_sym: i32) -> i32:
+        let found = self.concrete_specialization_by_sym.get(mono_sym)
+        if found.is_none():
+            return 0
+        if self.generic_subst_param_syms.len() as i32 != 0:
+            sema_phase_bug("BUG: a generic substitution frame is still active at a frozen specialization body")
+        let idx: i32 = found.unwrap()
+        let start = self.concrete_specialization_subst_starts[idx]
+        let count = self.concrete_specialization_subst_counts[idx]
+        for ti in 0..count:
+            self.generic_subst_param_syms.push(self.concrete_specialization_subst_syms[start + ti])
+            self.generic_subst_type_ids.push(self.concrete_specialization_subst_types[start + ti])
+        count
+
+    mut fn pop_generic_subst(count: i32):
+        for _ in 0..count:
+            let _ = self.generic_subst_param_syms.pop()
+            let _ = self.generic_subst_type_ids.pop()
 
     mut fn put_generic_subst(param_sym: i32, tid: i32, node: i32) -> Unit:
         if tid == 0:
@@ -23508,35 +24005,61 @@ impl Sema:
             let trait_args_idx = self.ast.find_impl_trait_type_args(type_node as NodeId)
             if trait_args_idx < 0:
                 return
-            let trait_arg_start: i32 = self.ast.state.impl_trait_type_args[(trait_args_idx + 1)]
-            let trait_arg_count: i32 = self.ast.state.impl_trait_type_args[(trait_args_idx + 2)]
-            // D69 (§13.4): a generator value implements Gen[T] with no impl
-            // declaration; T is its element type.
-            let gen_state = self.resolve_alias(arg_tid as TypeId) as i32
-            if self.generator_state_yield_types.contains(gen_state) and self.pool_resolve(trait_sym) == "Gen" and trait_arg_count == 1:
-                self.bind_type_params_from_type_expr(self.ast.get_extra(trait_arg_start), self.generator_state_yield_types.get(gen_state).unwrap(), tp_start, tp_count, err_node)
-                return
-            for di in 0..self.ast.decl_count():
-                let decl = self.ast.get_decl(di)
-                if self.ast.kind(decl) != NodeKind.NK_IMPL_DECL:
-                    continue
-                if self.ast.get_data2(decl) != trait_sym:
-                    continue
-                let target_match = self.impl_target_match(decl, arg_tid)
-                if target_match.ok == 0:
-                    continue
-                let impl_args_idx = self.ast.find_impl_trait_type_args(decl as NodeId)
-                if impl_args_idx < 0:
-                    continue
-                let impl_arg_start: i32 = self.ast.state.impl_trait_type_args[(impl_args_idx + 1)]
-                let impl_arg_count = self.ast.state.impl_trait_type_args[(impl_args_idx + 2)]
-                let bind_count = if trait_arg_count < impl_arg_count: trait_arg_count else: impl_arg_count
-                for tai in 0..bind_count:
-                    let param_trait_arg = self.ast.get_extra(trait_arg_start + tai)
-                    let impl_trait_arg = self.ast.get_extra(impl_arg_start + tai)
-                    let actual_trait_arg = self.resolve_impl_trait_arg_for_source(decl, arg_tid, impl_trait_arg, target_match.subst_names, target_match.subst_types)
-                    self.bind_type_params_from_type_expr(param_trait_arg, actual_trait_arg, tp_start, tp_count, err_node)
-                return
+            var trait_args: Vec[i32] = Vec.new()
+            for tai in 0..self.ast.impl_trait_type_args_count(trait_args_idx):
+                trait_args.push(self.ast.get_extra(self.ast.impl_trait_type_args_start(trait_args_idx) + tai))
+            self.bind_type_params_from_trait_args(trait_sym, trait_args, arg_tid, tp_start, tp_count, err_node)
+
+    // `Trait[A, B]` written against a concrete `arg_tid` binds the type
+    // parameters A and B name from the trait arguments of arg_tid's impl
+    // of Trait — for an `impl Trait[A]` parameter and for a bound
+    // `G: Trait[A]` once G is known (#1732).
+    mut fn bind_type_params_from_trait_args(trait_sym: i32, trait_args: Vec[i32], arg_tid: i32, tp_start: i32, tp_count: i32, err_node: i32):
+        let trait_arg_count = trait_args.len() as i32
+        // D69 (§13.4): a generator value implements Gen[T] with no impl
+        // declaration; T is its element type.
+        let gen_state = self.resolve_alias(arg_tid as TypeId) as i32
+        if self.generator_state_yield_types.contains(gen_state) and self.pool_resolve(trait_sym) == "Gen" and trait_arg_count == 1:
+            self.bind_type_params_from_type_expr(trait_args[0], self.generator_state_yield_types.get(gen_state).unwrap(), tp_start, tp_count, err_node)
+            return
+        for di in 0..self.ast.decl_count():
+            let decl = self.ast.get_decl(di)
+            if self.ast.kind(decl) != NodeKind.NK_IMPL_DECL:
+                continue
+            if self.ast.get_data2(decl) != trait_sym:
+                continue
+            let target_match = self.impl_target_match(decl, arg_tid)
+            if target_match.ok == 0:
+                continue
+            let impl_args_idx = self.ast.find_impl_trait_type_args(decl as NodeId)
+            if impl_args_idx < 0:
+                continue
+            let impl_arg_start: i32 = self.ast.state.impl_trait_type_args[(impl_args_idx + 1)]
+            let impl_arg_count = self.ast.state.impl_trait_type_args[(impl_args_idx + 2)]
+            let bind_count = if trait_arg_count < impl_arg_count: trait_arg_count else: impl_arg_count
+            for tai in 0..bind_count:
+                let impl_trait_arg = self.ast.get_extra(impl_arg_start + tai)
+                let actual_trait_arg = self.resolve_impl_trait_arg_for_source(decl, arg_tid, impl_trait_arg, target_match.subst_names, target_match.subst_types)
+                self.bind_type_params_from_type_expr(trait_args[tai], actual_trait_arg, tp_start, tp_count, err_node)
+            return
+
+    // A type parameter bound to a concrete type by the arguments binds
+    // what its parameterized bounds name: `[T, G: Gen[T]](g: G)` called
+    // with a generator infers T from G's element type, as `g: impl Gen[T]`
+    // does (#1732). Runs after the arguments are bound; a bound whose
+    // parameter is still unknown binds nothing.
+    mut fn bind_type_params_from_bounds(tp_start: i32, tp_count: i32, err_node: i32):
+        var pos = tp_start
+        for ti in 0..tp_count:
+            let tp_name = self.ast.get_extra(pos)
+            let bound_count = self.ast.get_extra(pos + 1)
+            let concrete_tid = self.lookup_generic_subst(tp_name)
+            if concrete_tid != 0:
+                for bi in 0..bound_count:
+                    let meta = self.ast.find_type_bound_args(pos + 2 + bi)
+                    if meta >= 0:
+                        self.bind_type_params_from_trait_args(self.ast.get_extra(pos + 2 + bi), self.ast.type_bound_arg_nodes(meta), concrete_tid, tp_start, tp_count, err_node)
+            pos = pos + 2 + bound_count
 
     fn generic_specialization_key(fn_sym: i32, fn_node: i32, tp_start: i32, tp_count: i32) -> str:
         var key = f"{fn_sym}:{fn_node}"
@@ -24918,6 +25441,7 @@ impl Sema:
             // identical to effect propagation so Option[&T] retains its concrete
             // collection origin at the caller (D22 Rule 10).
             self.record_call_view_origins(node, concrete_sig, recv_param_offset, receiver, extra_start, arg_count, self.has_resolved_call_args(node))
+            self.note_pulled_next_view_origins(node, receiver, method_fn_sym, ret_ty)
             self.note_sig_call_global_effects(node, concrete_sig, recv_param_offset, receiver, extra_start, arg_count, self.has_resolved_call_args(node))
             self.record_generator_call_ref_origins(node, concrete_sig, recv_param_offset, receiver, extra_start, arg_count, self.has_resolved_call_args(node))
         if ret_ty != 0:
@@ -26546,7 +27070,7 @@ impl Sema:
         let root = self.place_root_sym(target)
         if root == 0 or self.scope_has(root) == 0:
             return
-        let value_carries = value_ty <= 0 or self.type_can_carry_view(value_ty) or self.expr_is_ephemeral_task(value) != 0
+        let value_carries = value_ty <= 0 or self.type_can_carry_view(value_ty) or self.expr_is_ephemeral_task(value) != 0 or self.expr_is_ephemeral_value(value) != 0
         if not value_carries and not self.type_can_carry_view(slot_ty):
             return
         var value_deps: Vec[i32] = Vec.new()
@@ -27113,14 +27637,18 @@ impl Sema:
     // Maps each type param name → concrete type arg from the generic instance.
     // Returns 1 on success, 0 on failure (missing type decl, param mismatch, etc).
     mut fn setup_generic_inst_substitution(gi_tid: i32, type_sym: i32) -> i32:
-        var decl_sym = type_sym
-        if not self.type_decl_nodes.contains(decl_sym):
-            let canonical = self.canonical_symbol_by_text(type_sym)
-            if canonical != 0 and self.type_decl_nodes.contains(canonical):
-                decl_sym = canonical
-        if not self.type_decl_nodes.contains(decl_sym):
-            return 0
-        let td_node: i32 = self.type_decl_nodes.get(decl_sym).unwrap()
+        // The instance's own declaration (#1745); the symbol only names a
+        // declaration for an instance that recorded none.
+        var td_node = self.generic_inst_decl_node(gi_tid)
+        if td_node == 0:
+            var decl_sym = type_sym
+            if not self.type_decl_nodes.contains(decl_sym):
+                let canonical = self.canonical_symbol_by_text(type_sym)
+                if canonical != 0 and self.type_decl_nodes.contains(canonical):
+                    decl_sym = canonical
+            if not self.type_decl_nodes.contains(decl_sym):
+                return 0
+            td_node = self.type_decl_nodes.get(decl_sym).unwrap()
         let td_extra_start = self.ast.get_data1(td_node)
         let td_packed = self.ast.get_data2(td_node)
         let td_tp_start = self.type_decl_tp_start(td_node)
@@ -27440,6 +27968,11 @@ impl Sema:
         if static_type_sym != 0 and self.is_pending_generic_collection_base(static_type_sym) != 0 and (field == self.syms.new or (static_type_sym == self.syms.vec and early_method_name == "with_capacity")):
             self.note_allocation_site(node, AllocConstructKind.VEC_NEW, 0, 0)
         obj_type = self.adjust_static_receiver_type(expr, obj_type as i32)
+        // §13.3 (#1746): an adapter on any Iter[T] implementor is std.traits'
+        // free fn of that name over the trait, the receiver first — decided
+        // before the arguments are checked, so a closure meets its parameter.
+        if self.user_iter_adapter_fn(obj_type as i32, field) != 0:
+            return self.check_user_iter_method(node, expr, obj_type as i32, field, extra_start, arg_count)
         // D63: `f.clone()` on a callable value. Free for a bare function or
         // a non-move closure (the pair is copied, nothing is owned); a
         // `move ||` closure's owned environment is cloned capture by capture
@@ -29139,10 +29672,18 @@ impl Sema:
                 return self.ast.get_data0(base)
         0
 
+    // The named type a static receiver denotes: the import's type by
+    // identity for a namespace-bound ident (#1757), else the visible one.
+    fn static_receiver_named_type(expr: i32, base_sym: i32) -> i32:
+        let ns_tid = self.ast.namespace_bound_type(expr as NodeId)
+        if ns_tid != 0: ns_tid else: self.lookup_named_type_visible(base_sym)
+
     fn static_receiver_type_is_known(expr: i32) -> i32:
         let base_sym = self.static_receiver_base_sym(expr)
         if base_sym == 0:
             return 0
+        if self.ast.namespace_bound_type(expr as NodeId) != 0:
+            return 1
         // A bare identifier that names a bound local/param is a VALUE receiver
         // (instance method call), not a static type reference — the local wins in
         // value position even if a type of the same name is visible (#628). Only
@@ -29162,8 +29703,7 @@ impl Sema:
         if tk == TypeKind.TY_STRUCT:
             return self.get_type_d2(resolved)
         if tk == TypeKind.TY_GENERIC_INST:
-            let base_sym = self.get_generic_inst_base(resolved as i32)
-            let base_tid = self.type_reflection_base_template(base_sym)
+            let base_tid = self.generic_inst_template_tid(resolved as i32)
             if base_tid != 0:
                 if self.get_type_kind(self.resolve_alias(base_tid as TypeId)) == TypeKind.TY_STRUCT:
                     return self.get_type_d2(self.resolve_alias(base_tid as TypeId))
@@ -29207,8 +29747,7 @@ impl Sema:
                 return 0
             return self.type_extra[(te_start + field_index * 3)]
         if tk == TypeKind.TY_GENERIC_INST:
-            let base_sym = self.get_generic_inst_base(resolved as i32)
-            let base_tid = self.type_reflection_base_template(base_sym)
+            let base_tid = self.generic_inst_template_tid(resolved as i32)
             if base_tid != 0:
                 let base_resolved = self.resolve_alias(base_tid as TypeId)
                 if self.get_type_kind(base_resolved) == TypeKind.TY_STRUCT:
@@ -32625,3 +33164,8 @@ impl Sema:
         if opt.is_some():
             return opt.unwrap()
         0
+
+// §13.3 (#1746): the operations std.traits defines over any Iter[T], by
+// their method names.
+fn sema_iter_adapter_name(name: &str) -> bool:
+    name == "zip" or name == "map" or name == "filter" or name == "filter_map" or name == "take" or name == "drop" or name == "take_while" or name == "drop_while" or name == "enumerate" or name == "chain" or name == "step_by" or name == "collect" or name == "fold" or name == "count" or name == "for_each" or name == "any" or name == "all" or name == "none" or name == "find" or name == "position"
