@@ -11479,6 +11479,10 @@ impl Sema:
         self.typed_expr_types.insert(node, self.ty_bool as i32)
         self.ty_bool as i32
 
+    fn comparison_operand_is_aggregate_literal(node: i32) -> bool:
+        let kind = self.ast.kind(node)
+        kind == NodeKind.NK_TUPLE or kind == NodeKind.NK_ARRAY_LIT
+
     fn comparison_operand_is_variant_call(node: i32) -> i32:
         if self.ast.kind(node) != NodeKind.NK_CALL:
             return 0
@@ -11727,7 +11731,27 @@ impl Sema:
                 let expected_null = self.null_comparison_expected_type(lhs)
                 rhs = self.check_expr_with_expected(rhs_node, expected_null)
             else:
-                if lhs_is_num_lit and rhs_is_num_lit:
+                // §4.2.1 rule 3 through an aggregate (#1996): a tuple or
+                // array literal beside a typed operand takes that operand's
+                // type, so `u == (1, 2)` with `u: (i8, i64)` types the
+                // literal's elements i8 and i64, as `x == 1` types its `1`.
+                let lhs_is_agg_lit = self.comparison_operand_is_aggregate_literal(lhs_node)
+                let rhs_is_agg_lit = self.comparison_operand_is_aggregate_literal(rhs_node)
+                let lhs_takes_peer = lhs_is_agg_lit and not rhs_is_agg_lit and not rhs_is_num_lit
+                let rhs_takes_peer = rhs_is_agg_lit and not lhs_is_agg_lit and not lhs_is_num_lit
+                if lhs_takes_peer:
+                    rhs = self.check_expr_value_context(rhs_node)
+                    if rhs != 0:
+                        let lhs_expected = self.literal_peer_type(rhs as i32)
+                        lhs = self.check_expr_with_expected(lhs_node, lhs_expected as TypeId)
+                else if rhs_takes_peer:
+                    lhs = self.check_expr_value_context(lhs_node)
+                    if lhs != 0:
+                        let rhs_expected = self.literal_peer_type(lhs as i32)
+                        rhs = self.check_expr_with_expected(rhs_node, rhs_expected as TypeId)
+                if lhs_takes_peer or rhs_takes_peer:
+                    0
+                else if lhs_is_num_lit and rhs_is_num_lit:
                     lhs = self.check_expr_value_context(lhs_node)
                     rhs = self.check_expr_value_context(rhs_node)
                 else if lhs_is_num_lit and self.ast.kind(rhs_node) != NodeKind.NK_VARIANT_SHORTHAND:
@@ -11893,6 +11917,27 @@ impl Sema:
             if bool_int_cmp == 0 and ptr_like_cmp == 0 and ptr_zero_cmp == 0 and ptr_none_cmp == 0 and self.builtin_arg_type_compatible(lhs, rhs) == 0 and self.builtin_arg_type_compatible(rhs, lhs) == 0:
                 self.emit_error("comparison operands must have compatible types", node)
                 return 0
+            // §4.3d: a vector's `==` is lane-wise and yields a Mask, not the
+            // one `bool` that `==` on an aggregate is (§11.7: `eq(...) ->
+            // bool`), so an aggregate holding a vector has no structural
+            // equality to derive — and the mask rule refuses picking "all
+            // lanes" for the user (#1995).
+            if op == BinaryOp.OP_EQ or op == BinaryOp.OP_NEQ:
+                let lhs_value = if lhs_cmp_kind == TypeKind.TY_REF: self.auto_deref_ref_ptr_type(self.resolve_alias(lhs)) as i32 else: lhs as i32
+                let held = self.aggregate_held_vector(lhs_value, 0)
+                if held != 0 and not self.is_vector_or_mask_type(lhs_value):
+                    self.emit_error(f"`{sema_operator_symbol_text(op)}` on `{self.type_name(lhs_value)}` is refused: it holds `{self.type_name(held)}`, whose `==` is lane-wise and yields a mask, not one `bool` (§4.3d); compare that part with `(a == b).all()`", node)
+                    return 0
+            // Two tuples compare element by element, each pair one type
+            // (#1996): `(i8, i64) == (i32, i32)` has no element-wise meaning
+            // short of an implicit conversion, which §4.2.6 never makes
+            // between two typed values. Accepting it left MIR to refuse it.
+            if lhs_cmp_kind == TypeKind.TY_TUPLE and rhs_cmp_kind == TypeKind.TY_TUPLE:
+                let lhs_tuple = self.resolve_alias(self.cmp_normalize_str_ref(lhs) as TypeId) as i32
+                let rhs_tuple = self.resolve_alias(self.cmp_normalize_str_ref(rhs) as TypeId) as i32
+                if not self.types_identical(lhs_tuple, rhs_tuple):
+                    self.emit_error(f"comparison operands must have the same tuple type: `{self.type_name(lhs_tuple)}` and `{self.type_name(rhs_tuple)}`", node)
+                    return 0
             return self.ty_bool as i32
 
         // Logical operators
@@ -25674,8 +25719,13 @@ impl Sema:
         // gates. Route each ephemeral arg through the same escape check.
         for egi in 0..arg_count:
             if egi < arg_types.len() as i32 and arg_types[egi] != 0 and self.type_is_ephemeral_value(arg_types[egi] as TypeId) != 0:
-                let eg_extra = self.ast.get_data1(node)
-                let eg_arg = if self.has_resolved_call_args(node) != 0: self.get_resolved_call_arg(node, egi) else: self.ast.get_extra(eg_extra + egi)
+                // The argument nodes sit at the caller's `extra_start`: a
+                // call's own list (its d1), or the one slot an `in` or `|>`
+                // node records for the operand it passes (#2009). Only a call
+                // node has a resolved (reordered) argument list; reading an
+                // `in` node's d1 as an argument list took its lhs node id
+                // for an extra index and checked an unrelated node.
+                let eg_arg = if self.ast.kind(node) == NodeKind.NK_CALL and self.has_resolved_call_args(node) != 0: self.get_resolved_call_arg(node, egi) else: self.ast.get_extra(extra_start + egi)
                 if eg_arg > 0:
                     self.check_ephemeral_task_arg_escape(eg_arg, 0, 0, method_fn_sym, egi)
 
