@@ -1695,6 +1695,11 @@ pub type Sema {
     // argument node, callee sym. Judged after the effect fixpoint.
     deferred_callable_forwards: Vec[i32],
     binding_view_dep_data: Vec[i32],
+    // D65 phase 3 (#1647): Sema's category of each `let` it bound as a
+    // view, by let node: 1 = a reference value (`&T`), 2 = a view of a
+    // place (a recorded view projection or a field view, D22/D27). MIR
+    // materializes 2 as an alias of the place, never as an owning local.
+    view_bound_let_nodes: HashMap[i32, i32],
     // Expression-level view metadata for call expressions and view-producing nodes.
     expr_view_param_origins: HashMap[i32, i32],
     // The subset of a node's expr_view_param_origins whose parameters' own
@@ -1721,6 +1726,14 @@ pub type Sema {
     alloc_callee_calls: Vec[i32],
     alloc_callee_calls_resolved: i32,
     current_fn_symbol: i32,
+    // #1983: the specialization whose body is being checked (its mono
+    // symbol), 0 outside one; and the type argument of each type-level
+    // builtin call (`sizeof[T]()`) as checked in that specialization, keyed
+    // pair(mono symbol, type-argument node). A frozen consumer reads the
+    // fact instead of re-resolving the node under the instance's
+    // substitution, which needs the mutable substitution stack.
+    current_specialization_sym: i32,
+    specialization_type_args: HashMap[i64, i32],
 
     // Current state
     source_text: str,
@@ -1943,6 +1956,18 @@ pub type Sema {
     named_type_candidate_ci: Vec[i32],         // parallel: 1 when a c_import expansion declared it
     named_type_candidate_heads: HashMap[i32, i32], // symbol -> newest candidate index
     named_type_candidate_next: Vec[i32],       // previous candidate for the same symbol
+    // #1457: type names declared in more than one source file. A method of
+    // such a type carries its declaration: its symbol and its method-table
+    // key use the owner's identity symbol (`Name$m$<path hash>`, the way an
+    // extension method's `$ext$` symbol does), so each module's `Item.total`
+    // is its own (§18.1). Computed once from the decl table
+    // (compute_method_origins) so the declaring side and the lookup side
+    // read one answer.
+    colliding_type_names: HashMap[i32, i32],   // name symbol -> 1
+    type_identity_syms: HashMap[i64, i32],     // pair(name symbol, path symbol) -> identity symbol
+    type_identity_tids: HashMap[i32, i32],     // identity symbol -> the declaration's TypeId
+    type_identity_names: HashMap[i32, i32],    // identity symbol -> the declared name symbol
+    impl_identity_traits: HashMap[i64, i32],   // pair(identity symbol, trait) -> 1: that declaration's direct impls
     decl_visibility_syms: Vec[i32],            // top-level symbol visibility candidates
     decl_visibility_paths: Vec[str],           // parallel declaring module path
     decl_visibility_pub: Vec[i32],             // parallel public flag
@@ -2257,7 +2282,7 @@ fn sema_new_map_i32_str -> HashMap[i32, str]:
 fn sema_new_map_str_i32 -> HashMap[str, i32]:
     HashMap.new()
 
-fn sema_new_map_i64_i32 -> HashMap[i64, i32]:
+pub fn sema_new_map_i64_i32 -> HashMap[i64, i32]:
     HashMap.new()
 
 pub fn sema_new_vec_str -> Vec[str]:
@@ -3247,6 +3272,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         deferred_closure_arg_checks: Vec.new(),
         deferred_callable_forwards: Vec.new(),
         binding_view_dep_data: Vec.new(),
+        view_bound_let_nodes: sema_new_map_i32_i32(),
         expr_view_param_origins: sema_new_map_i32_i32(),
         expr_view_storage_origins: sema_new_map_i32_i32(),
         expr_view_into_temporary: sema_new_map_i32_i32(),
@@ -3262,6 +3288,8 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         alloc_callee_calls: Vec.new(),
         alloc_callee_calls_resolved: 0,
         current_fn_symbol: 0,
+        current_specialization_sym: 0,
+        specialization_type_args: sema_new_map_i64_i32(),
         source_text: "",
         tracked_input_root: "",
         tracked_input_paths: sema_new_vec_str(),
@@ -3380,6 +3408,11 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         named_type_candidate_ci: Vec.new(),
         named_type_candidate_heads: sema_new_map_i32_i32(),
         named_type_candidate_next: Vec.new(),
+        colliding_type_names: sema_new_map_i32_i32(),
+        type_identity_syms: sema_new_map_i64_i32(),
+        type_identity_tids: sema_new_map_i32_i32(),
+        type_identity_names: sema_new_map_i32_i32(),
+        impl_identity_traits: sema_new_map_i64_i32(),
         decl_visibility_syms: Vec.new(),
         decl_visibility_paths: sema_new_vec_str(),
         decl_visibility_pub: Vec.new(),
@@ -3628,6 +3661,13 @@ impl Sema:
     // `decl_node` is the declaring type declaration, 0 for a builtin.
     mut fn record_named_type_with_pub(sym: i32, tid: i32, is_pub: i32, decl_node: i32) -> Unit:
         self.named_types.insert(sym, tid)
+        // #1457: the declaration an identity symbol names, for the stages
+        // that receive a method symbol and need its owner's type.
+        if decl_node != 0 and self.colliding_type_names.contains(sym):
+            let identity = self.type_identity_symbol(sym, self.current_module_path)
+            if identity != sym:
+                self.type_identity_tids.insert(identity, tid)
+                self.type_identity_names.insert(identity, sym)
         self.index_named_type_candidate(sym, self.named_type_candidate_syms.len() as i32)
         self.named_type_candidate_syms.push(sym)
         self.named_type_candidate_tids.push(tid)

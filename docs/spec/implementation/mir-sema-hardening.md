@@ -98,6 +98,20 @@ carry a `MirIntrinsic` and are recognized by it). Red in `audit:all`.
 Fixture: `test/analysis/` planted configurations + `behav_callable_alias_field_call.w`.
 
 ### Phase 2 — codegen mode provenance (would have caught the `&fn` crash)
+Status: implemented for the sites #1647 named (#1647, wave-d65). Each
+site calls `Codegen.mode_decide(site, fact, llvm, …)`: the decision is the
+owner's fact — FnAbi's PassMode (`fn_abi_param_by_address`, receivers by
+place), Sema's category of a place step (`mir_place_step_holds_address`,
+`mir_sema_type_is_raw_pointer`) or of an operand (`mir_operand_is_fn_item`,
+`mir_sema_type_is_raw_pointer_or_ref`, `mir_param_slot_holds_address`) — and
+the LLVM type is verification. `audit:codegen` (`audit_mode_provenance`)
+reports per site; a disagreement is a violation. Before the change the lane
+was red over `src/main.w` on all nine live sites; the two method-owner
+fallbacks of the field walks never fired and were deleted. The downcast
+sites and the null constant read the `Option`-of-pointer niche, which is
+codegen-owned representation, and stay LLVM-typed. Not yet converted:
+`mir_try_place_ptr_for_ref` (value-vs-slot by LLVM type and the name
+`self`) and `mir_operand_local_holds_pointer`.
 Every `analysis_last_marshal_strategy` must be derivable from the argument's
 `PassMode` and the operand's MIR category, never from `wl_get_type_kind` of
 the evaluated value. Concretely: `marshal_ref_addr`'s "already a pointer"
@@ -108,6 +122,16 @@ records the reason; a `type-inspection` reason is a violation). Then the
 `spawn_os`/transmute special path reads Sema's environment-storage fact.
 
 ### Phase 3 — places and origins
+Status: implemented for field places and `let` bindings (#1647, wave-d65).
+MIR records each place lowered from a source field access (node, place,
+base) and each `let`'s materialization (alias or owning local); Sema
+persists its binding category (`view_bound_let_nodes`). `audit:resolution`
+judges them with `mir_field_place_verdict` / `mir_let_binding_verdict`
+(planted in `test/internals/analysis_resolution_test.w`). Over `src/main.w`
+the compiler already agrees: 70083 field places and 9155 bindings, 0
+violations. Not yet covered: view origins (`expr_view_param_origins`)
+and index places; the field projection still names its field by symbol,
+not by Sema's declaration index.
 Every MIR place lowered from a source expression must correspond to Sema's
 resolved place/origin for that node: field index from Sema's declaration
 identity (not from name lookup at lowering time — the module-type identity
@@ -116,6 +140,15 @@ category, alias/view origin from `expr_view_param_origins`. The audit
 compares MIR place projections with Sema's canonical projection per node.
 
 ### Phase 4 — effects
+Status: implemented for call-argument transfer (#1647, wave-d65).
+`audit:resolution` judges every call argument that reads a named owned
+binding with `mir_call_arg_transfer_verdict`: a move into a parameter Sema
+borrows (share-place, extern bit-copy) or a copy into one it consumes is a
+violation (planted in `test/internals/analysis_resolution_test.w`). Over
+`src/main.w`: 180558 arguments, 27343 judged (18417 into borrowing
+parameters), 0 violations. Not yet covered: closure captures (D62/D63's
+`{storage, captures, call_kind}` record) and `lower_callable_expr`'s own
+observe-vs-move choice.
 MIR move/borrow/capture classification per operation must agree with Sema's
 effect summary: a MIR `move` operand where Sema recorded observe (or vice
 versa) is a violation; closure environments carry Sema's

@@ -116,6 +116,12 @@ pub type Codegen {
     analysis_query: str,
     analysis_report: AnalysisReport,
     analysis_last_marshal_strategy: AnalysisMarshalStrategy,
+    // D65 phase 2 (#1647): per mode-provenance site, the decisions taken,
+    // those where the owner's fact and the LLVM type disagree, and the first
+    // such disagreement.
+    mode_site_decisions: Vec[i32],
+    mode_site_disagree: Vec[i32],
+    mode_site_first: Vec[str],
 
     // Current function state
     current_ret_type: i64,
@@ -817,6 +823,37 @@ impl Codegen:
     // Coverage proof for the instrumentation itself. Every reachable ordinary MIR
     // call argument must pass through one recorded marshalling branch; otherwise an
     // uninstrumented Codegen path could hide a contract divergence.
+    // ── D65 phase 2 (#1647): mode provenance ─────────────────────────
+    // Each site below once decided a passing mode or a place category from
+    // the LLVM type of a value. The owner of that fact is FnAbi's PassMode
+    // (D6) or Sema's place category (D65); codegen materializes it. A site
+    // now calls mode_decide with both answers: the decision is the owner's,
+    // and the LLVM type is verification only.
+    mut fn mode_decide(site: i32, fact: bool, llvm: bool, fn_sym: i32, subject: i32) -> bool:
+        if self.analysis_enabled != 0:
+            while self.mode_site_decisions.len() as i32 < MODE_SITE_COUNT:
+                self.mode_site_decisions.push(0)
+                self.mode_site_disagree.push(0)
+                self.mode_site_first.push("")
+            self.mode_site_decisions[site] = self.mode_site_decisions[site] + 1
+            if fact != llvm:
+                if self.mode_site_disagree[site] == 0:
+                    self.mode_site_first[site] = f"{self.sema_symbol_text(fn_sym)} subject {subject}: fact={fact} llvm-pointer={llvm}"
+                self.mode_site_disagree[site] = self.mode_site_disagree[site] + 1
+        fact
+
+    // One verdict per site: an owner fact the LLVM representation
+    // contradicts is a violation — either the fact or the representation is
+    // wrong, and codegen re-deriving the fact would have hidden it.
+    mut fn audit_mode_provenance():
+        if self.analysis_enabled == 0:
+            return
+        for site in 0..self.mode_site_decisions.len() as i32:
+            let name = mode_site_name(site)
+            if self.mode_site_disagree[site] > 0:
+                self.analysis_fail(f"mode-provenance: {name}: {mode_site_owner(site)} and the LLVM type disagree in {self.mode_site_disagree[site]} of {self.mode_site_decisions[site]} decisions; first: {self.mode_site_first[site]}")
+            self.analysis_report.note(f"mode-provenance: {name} decisions={self.mode_site_decisions[site]} disagree={self.mode_site_disagree[site]}")
+
     mut fn audit_codegen_call_coverage():
         if self.analysis_enabled == 0 or self.analysis_query != "audit":
             return
@@ -965,6 +1002,9 @@ fn Codegen.init_with_opt(module_name: &str, opt_level: i32) -> Codegen:
         analysis_query: "",
         analysis_report: AnalysisReport.init(),
         analysis_last_marshal_strategy: AnalysisMarshalStrategy.DirectValue,
+        mode_site_decisions: Vec.new(),
+        mode_site_disagree: Vec.new(),
+        mode_site_first: Vec.new(),
         current_ret_type: 0,
         mir_emit_mutual_tail_call: 0,
         async_trampolines: HashMap.new(),
@@ -4285,6 +4325,36 @@ impl Codegen:
     // `Self` in a method of a split name is the declaration visible from the
     // method's own module (sync_decl_context set it), not the name's first
     // registration.
+    // The codegen symbol of a method's owner, from the owner part of the
+    // method symbol. Sema keys a method of a type whose name more than one
+    // file declares by that declaration's identity (`Name$m$<path>`,
+    // #1457) and records which declaration it is; the owner is that
+    // declaration's codegen symbol (its #1446 alias when it has one), never
+    // the identity text, which names no type.
+    fn method_owner_cg_sym(owner_text: &str) -> i32:
+        let sema_sym = self.sema.pool_lookup_symbol(owner_text)
+        if sema_sym != 0 and self.sema.type_identity_tids.contains(sema_sym):
+            let tid = self.sema.resolve_alias(self.sema.type_identity_tids.get(sema_sym).unwrap() as TypeId) as i32
+            let name_sym = self.intern.intern(self.sema.pool_resolve(self.sema.type_identity_names.get(sema_sym).unwrap()))
+            return self.nominal_cg_sym_for_tid(tid, name_sym)
+        self.intern.intern(owner_text)
+
+    // The codegen type symbol an impl declaration attaches to: the
+    // declaration Sema resolved its target to (impl_decl_target_types), by
+    // its #1446 alias when it has one — the symbol the dyn coercion side
+    // (mir_nominal_sym_from_sema_type) keys a vtable by.
+    fn impl_cg_type_sym(impl_node: i32) -> i32:
+        let bare = self.pool.get_data0(impl_node)
+        let tid = self.sema.impl_decl_target_types.get(impl_node) ?? 0
+        if tid <= 0:
+            return bare
+        self.nominal_cg_sym_for_tid(self.sema.resolve_alias(tid as TypeId) as i32, bare)
+
+    // The method symbol text an impl declaration's methods carry: the owner
+    // key Sema registered them under (#1457) plus the method name.
+    fn impl_method_name_text(impl_node: i32, method_name: &str) -> str:
+        self.sema_symbol_text(self.sema.impl_owner_key_symbol(impl_node)) ++ "." ++ method_name
+
     fn split_owner_sym(owner_sym: i32) -> i32:
         if not self.nominal_split_names.contains(owner_sym):
             return owner_sym
@@ -4570,11 +4640,21 @@ impl Codegen:
         // Parse fields: [field_name, field_type, field_default]*
         let ft_vec: Vec[i64] = Vec.new()
         var invalid_layout = 0
+        let struct_tid = self.type_decl_sema_tid(type_node)
         for fi in 0..field_count:
             let offset = extra_start + 1 + fi * 3
             let f_name = self.pool.get_extra(offset)
             let f_type_node = self.pool.get_extra(offset + 1)
-            let f_ty = self.resolve_type(f_type_node)
+            // #1984 (D65): a generic-instance field is the LLVM type of Sema's
+            // field type, the identity every MIR read of the field lowers.
+            // Resolving the node instead monomorphized the instance under a
+            // name built from its arguments' LLVM layouts
+            // (`HashMap__str__struct{ptr,i64,i64,i64}` beside
+            // `__with.HashMap.str.__with.Vec.str`): one Sema type, two LLVM
+            // structs.
+            let f_sema_ty = if struct_tid > 0: self.sema.type_reflection_field_type_frozen(struct_tid, fi) else: 0
+            let f_is_generic_inst = f_sema_ty > 0 and self.sema.get_type_kind(self.sema.resolve_alias(f_sema_ty as TypeId)) == TypeKind.TY_GENERIC_INST
+            let f_ty = if f_is_generic_inst: self.sema_type_to_llvm(f_sema_ty) else: self.resolve_type(f_type_node)
             self.debug_type_layout_field(name_str, fi, f_name, f_type_node, f_ty)
 
             if f_ty == 0:
@@ -5185,6 +5265,34 @@ impl Codegen:
             return with_str_clone_ref(name)
         fn_abi_anonymous_symbol(sym)
 
+// D65 phase 2 (#1647): the codegen sites that once took a passing mode or
+// a place category from an LLVM type. mode_decide counts them per site.
+pub const MODE_SITE_FIELD_TYPE_THROUGH_ADDRESS: i32 = 0
+pub const MODE_SITE_FIELD_PTR_THROUGH_ADDRESS: i32 = 1
+pub const MODE_SITE_INDEX_THROUGH_ADDRESS: i32 = 2
+pub const MODE_SITE_INDEX_RAW_POINTER: i32 = 3
+pub const MODE_SITE_EVAL_INDIRECT_LOCAL: i32 = 4
+pub const MODE_SITE_MARSHAL_EXISTING_POINTER: i32 = 5
+pub const MODE_SITE_PARAM_BY_ADDRESS: i32 = 6
+pub const MODE_SITE_PARAM_PLACE_ALIAS: i32 = 7
+pub const MODE_SITE_COUNT: i32 = 8
+
+pub fn mode_site_name(site: i32) -> str:
+    if site == MODE_SITE_FIELD_TYPE_THROUGH_ADDRESS: return "projected-type field through an address"
+    if site == MODE_SITE_FIELD_PTR_THROUGH_ADDRESS: return "place-ptr field through an address"
+    if site == MODE_SITE_INDEX_THROUGH_ADDRESS: return "place-ptr index through an address"
+    if site == MODE_SITE_INDEX_RAW_POINTER: return "place-ptr raw-pointer index"
+    if site == MODE_SITE_EVAL_INDIRECT_LOCAL: return "operand read of an indirect local"
+    if site == MODE_SITE_MARSHAL_EXISTING_POINTER: return "marshal_ref_addr existing pointer"
+    if site == MODE_SITE_PARAM_BY_ADDRESS: return "prologue parameter passed by address"
+    if site == MODE_SITE_PARAM_PLACE_ALIAS: return "prologue share-place parameter alias"
+    "unknown"
+
+pub fn mode_site_owner(site: i32) -> str:
+    if site == MODE_SITE_MARSHAL_EXISTING_POINTER: return "the operand's Sema category"
+    if site == MODE_SITE_PARAM_BY_ADDRESS or site == MODE_SITE_PARAM_PLACE_ALIAS or site == MODE_SITE_EVAL_INDIRECT_LOCAL: return "FnAbi's PassMode"
+    "Sema's place category"
+
 // Symbol-naming rules live in src/FnAbi.w (docs/spec/abi/with-abi.md §5); this is
 // the adapter that feeds them the codegen mode.
 impl Codegen:
@@ -5400,7 +5508,7 @@ impl Codegen:
         var method_key_sym: i32 = 0
         for di in 0..name_str.len() as i32:
             if name_str[di] == 46:
-                method_owner_sym = self.intern.intern(name_str.slice(0, di as i64))
+                method_owner_sym = self.method_owner_cg_sym(name_str.slice(0, di as i64))
                 let short_method_name = name_str.slice((di + 1) as i64, name_str.len() as i64)
                 if short_method_name.len() > 0:
                     let short_method_sym = self.intern.intern(short_method_name)
@@ -5777,6 +5885,17 @@ impl Codegen:
         wl_build_insert_value(self.builder, fat, wl_const_null(wl_ptr_type(self.context)), 1)
 
     fn fn_abi_arg(abi: i32, pi: i32) -> ArgAbi: self.fn_abi_args[self.fn_abis[abi].arg_start + pi]
+
+    // FnAbi's answer for whether parameter `pi` of `fn_sym` arrives as an
+    // address — PM_INDIRECT (a copy the caller made), PM_INDIRECT_PLACE (the
+    // caller's place) or a reference receiver — the fact a prologue binds the
+    // parameter from.
+    fn fn_abi_param_by_address(fn_sym: i32, pi: i32) -> bool:
+        let d = self.fn_abi_symbols.get(fn_sym) ?? -1
+        if d < 0 or pi < 0 or pi >= self.fn_abis[d].arg_count:
+            return false
+        let arg = self.fn_abi_arg(d, pi)
+        arg.pass == PM_INDIRECT or arg.pass == PM_INDIRECT_PLACE or arg.reference
 
     // Both MIR operands and synthesized/thunk values arrive here after their
     // semantic adjustments. Only this routine turns an ArgAbi into a value,
