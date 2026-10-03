@@ -19,6 +19,7 @@ use build.sema_order
 use build.tools_lane
 use build.benchmarks
 use build.host_toolchain
+use build.acceptance
 use std.sysinfo
 fn build_owned_text(s: &str): s ++ ""
 
@@ -875,7 +876,7 @@ fn gate_fixed_targets() -> Vec[str]:
     // Built by push: the pinned seed evaluating build.w cannot take .len() of a
     // collection literal (the #1122 class).
     var fixed: Vec[str] = Vec.new()
-    for name in "build selfcheck reseed-check-build-w abi-hash-check unit-return-review spec-inventory-check sema-order-check examples-tests benchmarks-check c-migrator-basic-tests deep-debug-tool-tests user-programs-safe no-host-toolchain".split(" "): fixed.push(name.clone())
+    for name in "build selfcheck reseed-check-build-w abi-hash-check unit-return-review spec-inventory-check sema-order-check examples-tests benchmarks-check c-migrator-basic-tests deep-debug-tool-tests user-programs-safe no-host-toolchain corpus-drift-check".split(" "): fixed.push(name.clone())
     fixed
 
 fn gate_times_ledger_path() -> str: "out/.build-state/battery-times.tsv"
@@ -2797,12 +2798,15 @@ pub fn build(ctx: BuildCtx) -> Build:
     darwin_sysroot.action = run_darwin_sysroot_action
     darwin_sysroot = darwin_sysroot.input("build/sdk.w")
     if os() == "Macos":
-        darwin_sysroot = darwin_sysroot.dep("sysroot-zig-source")
-        darwin_sysroot = darwin_sysroot.input(sdk_zig_source_marker())
+        // #1899: it fetches the pinned Zig source and libc++ ABI list into its
+        // own scratch, so its products are all under out/ and declared — the
+        // tree every darwin link reads included — and the build store can
+        // serve them to another worktree, which then fetches nothing.
+        darwin_sysroot = darwin_sysroot.extra_output(sdk_darwin_sysroot_dir())
         darwin_sysroot = darwin_sysroot.input("build/https_fetch.w")
+        darwin_sysroot = darwin_sysroot.input("build/zlib_gunzip.w")
         darwin_sysroot = darwin_sysroot.allow_network()
     darwin_sysroot = darwin_sysroot.write_scope(sdk_darwin_sysroot_dir())
-    darwin_sysroot = darwin_sysroot.write_scope(sdk_source_root())
     darwin_sysroot = darwin_sysroot.write_scope("out/command/darwin-sysroot")
     darwin_sysroot = darwin_sysroot.timeout(600000)
     out = out.add_target(darwin_sysroot)
@@ -3090,7 +3094,11 @@ pub fn build(ctx: BuildCtx) -> Build:
     stage1 = stage1.extra_output("out/command/stage1")
     stage1 = stage1.extra_output("out/.build-state/seed-input.json")
     stage1 = stage1.timeout(1800000)
-    stage1 = stage1.input(host_bin("out/bin/with-sha256"))
+    // #1899: the helper's source, not its binary: the seed links the binary
+    // with this worktree's paths in its debug map (N_SO/N_OSO), so its bytes
+    // (LC_UUID, code signature) differ per worktree, while what stage1 is made
+    // from is the source and the seed (D50). The dep below orders the build.
+    stage1 = stage1.input("tools/with-sha256.w")
     // The ABI stamp every stage binary carries is sha256 of this record; a
     // re-record re-links (and re-stamps) the stage.
     stage1 = stage1.input("docs/with-abi.sha256")
@@ -3747,6 +3755,23 @@ pub fn build(ctx: BuildCtx) -> Build:
     debug_alloc_tests = debug_alloc_tests.write_scope("out/debug-alloc-tests")
     out = out.add_target(debug_alloc_tests)
 
+    // The D acceptance corpus (D29, #1865; build/acceptance.w): a copy that
+    // gains the imports the std fallback tier will resolve, then the
+    // exact-stdout runner over it.
+    var d_acceptance_corpus = target_new(.Action, "d-acceptance-corpus", "").output("out/d-acceptance/corpus")
+    d_acceptance_corpus.action = run_d_acceptance_corpus_action
+    d_acceptance_corpus = d_acceptance_corpus.input(release_compiler_bin("with"))
+    d_acceptance_corpus = d_acceptance_corpus.input("test/d_acceptance")
+    d_acceptance_corpus = d_acceptance_corpus.input("test/behavior/lib")
+    d_acceptance_corpus = d_acceptance_corpus.input("tools/insert_std_uses.w")
+    d_acceptance_corpus = d_acceptance_corpus.dep("build")
+    d_acceptance_corpus = d_acceptance_corpus.write_scope("out/d-acceptance")
+    out = out.add_target(d_acceptance_corpus)
+    var d_acceptance_tests = target_new(.Test, "d-acceptance-tests", "out/d-acceptance/corpus/*.w")
+    d_acceptance_tests = d_acceptance_tests.arg("compiler=" ++ release_compiler_bin("with"))
+    d_acceptance_tests = d_acceptance_tests.dep("d-acceptance-corpus")
+    out = out.add_target(d_acceptance_tests)
+
     var deep_debug_tool_tests = target_new(.Action, "deep-debug-tool-tests", "").output("out/deep-debug-tool-tests")
     deep_debug_tool_tests = deep_debug_tool_tests.allow_parallel()
     deep_debug_tool_tests.action = run_deep_debug_tool_tests_action
@@ -4116,6 +4141,7 @@ pub fn build(ctx: BuildCtx) -> Build:
     tests = tests.dep("seed-driver")
     tests = tests.dep("reseed-check-build-w")
     tests = tests.dep("behavior-tests")
+    tests = tests.dep("d-acceptance-tests")
     tests = tests.dep("native-compile-error-tests")
     tests = tests.dep("native-codegen-tests")
     tests = tests.dep("native-spec-tests")
@@ -4381,6 +4407,7 @@ pub fn build(ctx: BuildCtx) -> Build:
         let corpus = corpus_at(ci)
         out = corpus_pipeline(move out, ctx, corpus, release_compiler_bin("with"))
     out = out.add_target(corpora_drift_group(ctx))
+    out = out.add_target(corpora_drift_check_group())
 
     var prune = target_new(.Action, "prune", "").output("out/.build-state/prune.always")
     prune.action = run_prune_action

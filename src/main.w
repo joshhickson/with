@@ -1648,6 +1648,14 @@ fn build_runner_entry_source() -> str:
     "    let _c = set_env(\"WITH_BUILD_TOOLFS_SUPPRESS\", \"\")\n" ++
     "    __driver_exit(b.__driver_run_action(__runner_ctx(), __driver_action_name()))\n"
 
+// A runner for this build's key exists, here or in the shared store.
+fn build_runner_built(root: &str, options: &BuildCommandOptions) -> bool:
+    let key = build_cache_graph_key(root, options.target_kind, 0)
+    let bin_path = resolve_join(root, "out/.build-state/build-runner")
+    if with_fs_file_exists(bin_path) != 0 and with_fs_read_file(bin_path ++ ".key") == key: return true
+    let shared = build_cache_runner_store_path(key)
+    shared.len() > 0 and with_fs_file_exists(shared) != 0 and with_fs_read_file(shared ++ ".key") == key
+
 fn build_runner_ensure(root: &str, options: &BuildCommandOptions) -> str:
     let bin_path = resolve_join(root, "out/.build-state/build-runner")
     let key_path = bin_path ++ ".key"
@@ -1661,6 +1669,12 @@ fn build_runner_ensure(root: &str, options: &BuildCommandOptions) -> str:
         if build_runner_copy(shared, bin_path):
             let _k = with_fs_write_file(key_path, key)
             return bin_path
+    // #1906: the runner links against one named root of this driver's
+    // generation, never a probed one. Without it there is nothing of this
+    // generation to link, and the caller says so.
+    let link_root = build_runner_link_root(root)
+    if link_root.len() == 0 and build_runner_runtime_dirs_present(root):
+        return ""
     let entry_path = resolve_join(root, "__with_build_runner.w")
     let t0 = with_clock_nanos()
     var comp = Compilation.init()
@@ -1669,22 +1683,26 @@ fn build_runner_ensure(root: &str, options: &BuildCommandOptions) -> str:
     comp.configure_options(move runner_options)
     comp.set_tool_mode_entry_path(entry_path)
     let no_settings: Vec[str] = Vec.new()
-    // #1797: the runner links exactly as stage1 does — against the bootstrap
-    // link root this run prepared for this seed (prepare-bootstrap-link-root
-    // removes out/lib's stale probes so out/bootstrap-lib is selected), with
-    // WITH_OUT_DIR naming that root as the build's say-so. The caller only
-    // compiles it once that root is this compiler's generation; before, a
-    // seed older than #1720's D30 check took whatever complete directory
-    // was on disk and died on an undefined runtime symbol.
+    // #1797/#1906: the runner links exactly as stage1 does — against a
+    // runtime root the build names (WITH_RUNTIME_ROOT), which Link.w refuses
+    // when its .producer is another generation and never trades for another
+    // directory. Under WITH_OUT_DIR alone the link probed out/lib first, and
+    // a seed-compiled runner took the tree's own runtime whenever the stage
+    // chain had re-created it after prepare-bootstrap-link-root last ran
+    // (its freshness said nothing about out/lib): rt_compat_setenv_str read
+    // an address as a length, SIGSEGV in the runner's first set_env.
     let outer_out_dir = with_getenv_str("WITH_OUT_DIR")
+    let outer_runtime_root = with_getenv_str("WITH_RUNTIME_ROOT")
     let _e_in = with_setenv_str("WITH_OUT_DIR", resolve_join(root, "out"))
+    let _e_root_in = if link_root.len() > 0: with_setenv_str("WITH_RUNTIME_ROOT", link_root) else: 0
     let built = comp.build_binary_from_source_to_path_with_build_settings(entry_path, build_runner_entry_source(), bin_path, no_settings, no_settings, no_settings)
     let _e_out = with_setenv_str("WITH_OUT_DIR", outer_out_dir)
+    let _e_root_out = with_setenv_str("WITH_RUNTIME_ROOT", outer_runtime_root)
     if built == "" or comp.has_errors():
         // Not silent (#1797): the fallback evaluator is the bootstrap path,
         // and when it cannot run an action the build fails there with a
         // message about that action, not about this link.
-        with_eprint("error: build runner compile failed (diagnostics above); actions fall back to comptime evaluation by the driver, which may not evaluate every action of this tree. A runtime symbol undefined at the runner's link means a stale out/lib or out/bootstrap-lib from another compiler generation (#1797): remove out/lib, out/bootstrap-lib and out/tmp/with_runtime, then rebuild")
+        with_eprint("error: build runner compile failed (diagnostics above; linked against " ++ link_root ++ "); actions fall back to comptime evaluation by the driver, which may not evaluate every action of this tree")
         let _rm = with_fs_remove_file(key_path)
         return ""
     let _k = with_fs_write_file(key_path, key)
@@ -1711,22 +1729,49 @@ fn build_runner_copy(from: &str, to: &str) -> bool:
         return false
     true
 
-// #1797: the runner may be linked now when no runtime directory the link
-// could take belongs to another compiler generation: a complete out/lib or
-// out/bootstrap-lib (the cimport_stubs.o probe Link.w uses) must be this
-// compiler's generation (its .producer, or byte for byte its embedded
-// rt_core.o where none is recorded — #1815); an absent one is nothing to mistrust
-// (a user project has neither, and the runner links from the embedded
-// runtime as it always did).
-fn build_runner_runtime_dirs_are_this_generation(root: &str) -> bool:
+// #1906: the runtime root the runner links against — the first complete
+// runtime directory of this driver's generation (its .producer, or byte for
+// byte its embedded rt_core.o where none is recorded — #1815): the seed's
+// out/bootstrap-lib, or out/lib when a tree compiler drives the build. ""
+// when neither is: the runner cannot be linked yet. The link names this
+// root explicitly (WITH_RUNTIME_ROOT), so a directory of another
+// generation is never a candidate, whatever is on disk beside it.
+fn build_runner_link_root(root: &str) -> str:
     let dirs: Vec[str] = Vec.new()
-    dirs.push("out/lib")
     dirs.push("out/bootstrap-lib")
+    dirs.push("out/lib")
+    let platform_object = link_stage_host_platform_runtime_object()
     for i in 0..dirs.len() as i32:
         let dir = resolve_join(root, dirs[i])
-        if with_fs_file_exists(dir ++ "/cimport_stubs.o") != 0 and not link_stage_runtime_dir_is_this_generation(dir):
-            return false
-    true
+        if with_fs_file_exists(dir ++ "/cimport_stubs.o") == 0: continue
+        if platform_object.len() > 0 and with_fs_file_exists(dir ++ "/" ++ platform_object) == 0: continue
+        // The link's own test for a root it is named (#1899).
+        if link_stage_named_runtime_root_is_this_generation(dir): return dir
+    ""
+
+// A project with no runtime directory at all links its runner from the
+// driver's embedded runtime, as it always did; one with a directory of
+// another generation and none of this one waits for prepare.
+fn build_runner_runtime_dirs_present(root: &str) -> bool:
+    with_fs_file_exists(resolve_join(root, "out/bootstrap-lib/cimport_stubs.o")) != 0 or with_fs_file_exists(resolve_join(root, "out/lib/cimport_stubs.o")) != 0
+
+// The target that builds the runner's link root.
+const BUILD_RUNNER_ROOT_PREPARE: str = "prepare-bootstrap-link-root"
+
+// The runner's absence is said once. A `--no-deps` run that skipped the
+// prepare building its root refuses, naming it, rather than silently change
+// worlds (#1835): the action would evaluate in the driver's comptime
+// evaluator, which may not evaluate every action of this tree. A run that
+// skipped nothing (the target does not depend on the prepare: `:seed`)
+// evaluates at comptime with or without --no-deps, and says so.
+fn build_runner_explain_no_root(root: &str, target_name: &str, skipped_root_prepare: bool) -> i32:
+    let generation = if compiler_generation_is_stamped(): compiler_generation() else: "unstamped"
+    let message = "no runtime objects of this driver's generation (" ++ generation ++ ") under out/bootstrap-lib or out/lib to link the action runner against"
+    if skipped_root_prepare:
+        with_eprint("error: --no-deps: " ++ message ++ "; `" ++ BUILD_RUNNER_ROOT_PREPARE ++ "` (a dependency of '" ++ target_name ++ "') builds them and --no-deps skipped it; run `with build :" ++ target_name ++ "` without --no-deps, or `with build :" ++ BUILD_RUNNER_ROOT_PREPARE ++ "` first")
+        return 1
+    with_eprint("[build] " ++ message ++ "; actions evaluate in the driver's comptime evaluator")
+    0
 
 fn build_runner_fallback_list_path(root: &str) -> str:
     resolve_join(root, "out/.build-state/runner-fallback.list")
@@ -1760,6 +1805,9 @@ fn build_runner_effects_path(root: &str, target_name: &str) -> str:
     let _mk = with_fs_mkdir_p(dir)
     resolve_join(dir, "worker.effects")
 
+// The runner's effect records: the log's lines, and (#1899) one `read` record
+// per path the action read through ToolFs, each kept in its own file beside
+// the log (ToolFs.record_read).
 fn build_runner_read_effects(path: &str) -> Vec[str]:
     var out: Vec[str] = Vec.new()
     let text = with_fs_read_file(path)
@@ -1767,7 +1815,17 @@ fn build_runner_read_effects(path: &str) -> Vec[str]:
     for i in 0..lines.len() as i32:
         if lines[i].len() > 0:
             out.push(with_str_clone_ref(lines[i]))
+    let reads = build_graph_rt_list_files(path ++ ".reads").split("\n")
+    for i in 0..reads.len() as i32:
+        if reads[i].len() > 0:
+            out.push("read\t" ++ with_fs_read_file(reads[i]))
     out
+
+// A runner starts with no effect records: neither the log nor the reads of
+// the action's previous run.
+fn build_runner_reset_effects(path: &str):
+    let _rm = with_fs_remove_file(path)
+    let _rm_reads = with_fs_remove_tree(path ++ ".reads")
 
 fn build_runner_validate_outputs(root: &str, target: &BuildGraphTarget) -> i32:
     if target.output.len() > 0:
@@ -1788,7 +1846,7 @@ fn run_build_action_runner_process(runner_path: &str, target: &BuildGraphTarget,
     let old_effects = with_getenv_str("WITH_BUILD_EFFECTS_OUT")
     let _sn = with_setenv_str("WITH_BUILD_ACTION_NAME", target.name)
     let _se = with_setenv_str("WITH_BUILD_EFFECTS_OUT", effects_path)
-    let _rm = with_fs_remove_file(effects_path)
+    build_runner_reset_effects(effects_path)
     let rc = build_graph_rt_exec_argv(build_graph_argv_append("", runner_path))
     let _rn = with_setenv_str("WITH_BUILD_ACTION_NAME", old_name)
     let _re = with_setenv_str("WITH_BUILD_EFFECTS_OUT", old_effects)
@@ -1943,7 +2001,7 @@ fn build_pool_spawn_runner(runner_path: &str, target: &BuildGraphTarget, effects
     let old_effects = with_getenv_str("WITH_BUILD_EFFECTS_OUT")
     let _sn = with_setenv_str("WITH_BUILD_ACTION_NAME", target.name)
     let _se = with_setenv_str("WITH_BUILD_EFFECTS_OUT", effects_path)
-    let _rm = with_fs_remove_file(effects_path)
+    build_runner_reset_effects(effects_path)
     let pid = build_graph_rt_exec_argv_capture_spawn(build_graph_argv_append("", runner_path), stdout_path, stderr_path)
     let _rn = with_setenv_str("WITH_BUILD_ACTION_NAME", old_name)
     let _re = with_setenv_str("WITH_BUILD_EFFECTS_OUT", old_effects)
@@ -2336,12 +2394,15 @@ fn build_options_for_graph_target(root: &str, base: &BuildCommandOptions, target
         options.output_kind = BuildOutputKind.Binary
     options
 
+// WITH_BUILD_NO_EARLY_CUTOFF=1 restores "a dependency ran, so rebuild": no
+// content comparison then spares a target whose dependency ran, neither the
+// cutoff below nor a build store entry (#1899).
+fn build_graph_early_cutoff_enabled() -> bool: with_getenv_str("WITH_BUILD_NO_EARLY_CUTOFF").len() == 0
+
 // Whether dependency `dep_name`, which ran in this invocation, left its
 // declared outputs byte-identical to what they were when it was dispatched.
-// WITH_BUILD_NO_EARLY_CUTOFF=1 answers no, restoring "a dependency ran, so
-// rebuild".
 fn build_graph_dep_outputs_unchanged(root: &str, graph: &BuildGraph, dep_name: &str, names: &Vec[str], digests: &Vec[str]) -> bool:
-    if with_getenv_str("WITH_BUILD_NO_EARLY_CUTOFF").len() > 0: return false
+    if not build_graph_early_cutoff_enabled(): return false
     var before = ""
     for i in 0..names.len() as i32:
         if names[i] == dep_name: before = digests[i].clone()
@@ -2390,7 +2451,7 @@ fn build_graph_enforce_rss(root: &str, graph: &BuildGraph, name: &str, peak: i64
         with_eprint("error: could not invalidate build cache for '" ++ name ++ "'")
     1
 
-unsafe fn run_build_graph(root: &str, cfg: &ProjectConfig, graph: &BuildGraph, action_sema: *mut Sema, options: &BuildCommandOptions, survey: bool) -> i32:
+unsafe fn run_build_graph(root: &str, cfg: &ProjectConfig, graph: &BuildGraph, action_sema: *mut Sema, options: &BuildCommandOptions, survey: bool, skipped_root_prepare: bool) -> i32:
     let no_strings: Vec[str] = Vec.new()
     if graph.targets.len() == 0:
         with_eprint("error: build.w did not declare any targets")
@@ -2437,20 +2498,19 @@ unsafe fn run_build_graph(root: &str, cfg: &ProjectConfig, graph: &BuildGraph, a
     var runner_checked = false
     var runner_path = ""
     var runner_fallback: Vec[str] = Vec.new()
-    // #1075/#1074/#1797: the runner links against the bootstrap link root
-    // (out/bootstrap-lib: the tree's runtime objects and, on Windows, the
-    // LLVM linker metadata), so it is compiled only once that root is this
-    // seed's: when prepare-bootstrap-link-root has completed in this run
-    // (executed, or fresh for this seed), or when no complete out/lib or
-    // out/bootstrap-lib belongs to another generation
-    // (build_runner_runtime_dirs_are_this_generation; a project with neither
-    // links the runner from the embedded runtime, as it always did).
-    // Existence of the files said nothing about which
-    // generation built them: a seed older than #1720's check linked a
-    // 2026-09-22 out/lib, the runner died on an undefined runtime symbol,
-    // and the comptime fallback failed the build before stage1. Until the
-    // root is ready, actions evaluate at comptime, as before.
-    let bootstrap_root_target = "prepare-bootstrap-link-root"
+    // #1075/#1074/#1797/#1906: the runner links against a runtime root of
+    // this driver's generation (build_runner_link_root: the seed's
+    // out/bootstrap-lib, or out/lib under a tree compiler), named to the
+    // link explicitly. It is compiled once prepare-bootstrap-link-root has
+    // completed in this run (or is not in the graph: --no-deps, a project
+    // without one) AND such a root exists; the prepare's freshness alone
+    // said nothing about out/lib, which the stage chain re-creates after it
+    // (#1906), and existence of the files said nothing about which
+    // generation built them (#1797). A project with no runtime directory
+    // links the runner from the embedded runtime, as it always did. Until
+    // the root is ready, actions evaluate at comptime, as before, and the
+    // driver says so (build_runner_explain_no_root).
+    let bootstrap_root_target = BUILD_RUNNER_ROOT_PREPARE
     var bootstrap_root_scheduled = false
     for bi in 0..graph.targets.len() as i32:
         if (&graph.targets[bi]).name == bootstrap_root_target: bootstrap_root_scheduled = true
@@ -2552,6 +2612,12 @@ unsafe fn run_build_graph(root: &str, cfg: &ProjectConfig, graph: &BuildGraph, a
                     skipped_targets.push(with_str_clone_ref(target.name))
                     completed_targets.push(with_str_clone_ref(target.name))
                     continue
+            // #1899: another worktree may have built this very target from
+            // these very inputs; a restored target is a fresh one.
+            else if not force_action_worker_target and (not dep_rebuilt or build_graph_early_cutoff_enabled()) and build_cache_store_restore(root, target):
+                skipped_targets.push(with_str_clone_ref(target.name))
+                completed_targets.push(with_str_clone_ref(target.name))
+                continue
         // About to run: remember what its outputs are now, and what its
         // inputs are (#1654: the record after the run must not describe an
         // input the action never saw).
@@ -2570,12 +2636,19 @@ unsafe fn run_build_graph(root: &str, cfg: &ProjectConfig, graph: &BuildGraph, a
                     survey_failed.push(with_str_clone_ref(target.name))
                     continue
                 return preflight_rc
-        var bootstrap_ready = bootstrap_root_scheduled and completed_targets.contains(bootstrap_root_target)
-        if not bootstrap_ready and not runner_checked:
-            bootstrap_ready = build_runner_runtime_dirs_are_this_generation(root)
-        if target.kind == 23 and not runner_checked and bootstrap_ready and not build_action_worker_env_enabled() and not options.strict_effects:
-            runner_checked = true
-            runner_path = build_runner_ensure(root, options)
+        if target.kind == 23 and not runner_checked and not build_action_worker_env_enabled() and not options.strict_effects:
+            let prepare_done = not bootstrap_root_scheduled or completed_targets.contains(bootstrap_root_target)
+            // #1899: a runner already built for this key (here, or by any
+            // project into the machine-wide store) is a finished binary: it
+            // links nothing, so it needs no root and no prepare. A worktree
+            // whose targets the build store serves runs its few remaining
+            // actions natively instead of evaluating each at comptime.
+            if build_runner_built(root, options) or build_runner_link_root(root).len() > 0 or (prepare_done and not build_runner_runtime_dirs_present(root)):
+                runner_checked = true
+                runner_path = build_runner_ensure(root, options)
+            else if prepare_done:
+                runner_checked = true
+                if build_runner_explain_no_root(root, target.name, skipped_root_prepare) != 0: return 1
             if runner_path.len() > 0:
                 runner_fallback = build_runner_load_fallback(root)
                 let _e1 = with_setenv_str("WITH_BUILD_RUNNER_ROOT", root)
@@ -3219,7 +3292,10 @@ fn run_build_command(options: BuildCommandOptions, graph_options: &BuildGraphCom
                 return 0
             if not repo_lock_acquire(selected_target_name):
                 return 1
-            let build_rc = unsafe { run_build_graph(root, cfg, selected_graph, &raw mut load_result.sema as *mut Sema, actual_options, graph_options.survey) }
+            // #1835: what --no-deps skipped is what the target's full closure
+            // holds beyond itself; only a skipped root prepare is refused.
+            let skipped_root_prepare = graph_options.no_deps and build_graph_find_target_index_by_name(&build_graph_filter_target(&graph, selected_target_name), BUILD_RUNNER_ROOT_PREPARE) >= 0
+            let build_rc = unsafe { run_build_graph(root, cfg, selected_graph, &raw mut load_result.sema as *mut Sema, actual_options, graph_options.survey, skipped_root_prepare) }
             repo_lock_release()
             link_stage_cleanup_current_process_temp_archives()
             build_report_wall(selected_target_name, cmd_t0)
@@ -3326,7 +3402,7 @@ fn run_run_project_command(selected_target_hint: &str, opt_level: i32, no_std: b
     if not repo_lock_acquire(selected_target_name):
         return 1
     build_graph_quiet_times = true
-    let build_rc = unsafe { run_build_graph(root, cfg, selected_graph, &raw mut load_result.sema as *mut Sema, options, false) }
+    let build_rc = unsafe { run_build_graph(root, cfg, selected_graph, &raw mut load_result.sema as *mut Sema, options, false, false) }
     build_graph_quiet_times = false
     repo_lock_release()
     if build_rc != 0:
