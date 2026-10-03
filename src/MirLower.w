@@ -11865,6 +11865,8 @@ impl MirBuilder:
         // bit-copy rule (a call not in comp_resolved lowers conservatively).
         let bc_resolved = self.sema.comp_resolved.get(node)
         let bc_callee_sym: i32 = if bc_resolved.is_some(): bc_resolved.unwrap() else: 0
+        if self.sema.precondition_form_calls.contains(node):
+            return self.lower_precondition_form(fn_op, sig_idx, self.sema.precondition_form_calls.get(node).unwrap(), actual_ret_type_id, 0, arg_exprs_start, arg_exprs_count, node)
 
         let args: Vec[i32] = Vec.new()
         // Use sema-resolved arg order for named-arg and implicit-arg calls
@@ -11931,6 +11933,89 @@ impl MirBuilder:
         if self.sema.is_copy_frozen(actual_ret_type_id) != 0:
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
+
+    // D86 (§18.2): `assert`, `require`, `check` (Sema.precondition_form_calls)
+    // are compiler-known forms. The condition is evaluated; only when it is
+    // false are the message and location evaluated and the declaration
+    // called, which reports the failure and does not return. The passing
+    // path never runs the message: its effects do not happen, and what it
+    // would move stays owned (Sema checked it so: SemaCheck.w check_call).
+    // `lead` is a pipeline's piped condition (`c |> require(msg)`), else 0;
+    // `node` is the call.
+    mut fn lower_precondition_form(fn_op: i32, sig_idx: i32, form_sym: i32, ret_ty: i32, lead: i32, arg_exprs_start: i32, arg_exprs_count: i32, node: i32) -> i32:
+        // The operands in parameter order; whether each is its default.
+        let arg_nodes: Vec[i32] = Vec.new()
+        let arg_defaults: Vec[bool] = Vec.new()
+        if lead != 0:
+            arg_nodes.push(lead)
+            arg_defaults.push(false)
+        if self.sema.has_resolved_call_args(node) != 0:
+            for i in 0..self.sema.get_resolved_call_arg_count(node):
+                arg_nodes.push(self.sema.get_resolved_call_arg(node, i))
+                arg_defaults.push(self.sema.resolved_call_arg_is_default(node, i) != 0)
+        else:
+            for i in 0..arg_exprs_count:
+                arg_nodes.push(self.ast.get_extra(arg_exprs_start + i))
+                arg_defaults.push(false)
+            let fn_node: i32 = if self.sema.fn_decl_nodes.contains(form_sym): self.sema.fn_decl_nodes.get(form_sym).unwrap() else: 0
+            let meta = if fn_node != 0: self.ast.find_fn_meta(fn_node) else: -1
+            if meta >= 0:
+                let param_start = self.ast.fn_meta_param_start(meta)
+                for di in arg_nodes.len() as i32..self.ast.fn_meta_param_count(meta):
+                    let def_node = self.ast.get_fn_param_default(param_start, di)
+                    if def_node != 0:
+                        arg_nodes.push(def_node)
+                        arg_defaults.push(true)
+        if arg_nodes.len() == 0 or arg_nodes[0] <= 0 or sig_idx < 0:
+            sema_phase_bug(f"BUG: precondition form call has no condition or signature: node={node} sig={sig_idx}")
+        let cond_op = self.lower_call_arg(arg_nodes[0], sig_idx, 0, 0, form_sym)
+        let fail_bb = self.new_block()
+        let pass_bb = self.new_block()
+        let vals: Vec[i64] = Vec.new()
+        vals.push(1)
+        let targets: Vec[i32] = Vec.new()
+        targets.push(pass_bb as i32)
+        let table = self.body.new_switch_table(vals, targets)
+        self.terminate(TermKind.TK_SWITCH_INT, cond_op, table, fail_bb, 0)
+
+        // The failing path: a lazy arm, as `??`'s default (D86 states the
+        // message follows its rules), that does not return. Its pending
+        // source-resets flush inside it (lower_if): left pending they would
+        // blank, on the passing path, a value the message did not move.
+        let str_entry = self.save_string_flow_facts()
+        let pending_reset_start = self.pending_reset_locals.len() as i32
+        let pending_reset_field_start = self.pending_reset_field_places.len() as i32
+        let pending_move_temp_start = self.pending_move_temp_locals.len() as i32
+        self.switch_to(fail_bb)
+        let fail_arm = self.begin_lazy_arm()
+        let args: Vec[i32] = Vec.new()
+        // The condition is false on this path.
+        args.push(self.lower_bool_lit(0))
+        for i in 1..arg_nodes.len() as i32:
+            let arg_node = arg_nodes[i]
+            if arg_node <= 0:
+                sema_phase_bug(f"BUG: precondition form operand {i} is missing: node={node}")
+            if arg_defaults[i]:
+                args.push(self.lower_default_call_arg(arg_node, node, sig_idx, 0, i))
+            else:
+                args.push(self.lower_call_arg(arg_node, sig_idx, 0, i, form_sym))
+        let args_id = self.body.new_call_args(args)
+        self.body.set_call_ast_node(args_id, node)
+        self.record_call_contract(args_id, node, sig_idx)
+        let result_local = self.new_temp(ret_ty)
+        let result_place = self.place_for_local(result_local)
+        let after_bb = self.new_block()
+        self.terminate(TermKind.TK_CALL, fn_op, args_id, result_place, after_bb)
+        self.switch_to(after_bb)
+        self.register_stmt_temp(result_local, ret_ty)
+        self.flush_pending_resets_since(pending_reset_start, pending_reset_field_start, pending_move_temp_start)
+        self.end_lazy_arm(&fail_arm)
+        // The declaration does not return on a false condition.
+        self.terminate(TermKind.TK_UNREACHABLE, 0, 0, 0, 0)
+        self.restore_string_flow_facts(&str_entry)
+
+        self.switch_to(pass_bb)
+        self.unit_operand()
 
     // The `Option[CStr]` of a presented call's pointer result (above).
     mut fn lower_presented_text_view(ptr_place: i32, node: i32) -> i32:
@@ -14146,7 +14231,10 @@ impl MirBuilder:
         // On this path nothing moved out, so the subject — an Err payload, or
         // nothing — is dropped here, once; then its cleanup is retired before
         // lowering a default that may itself return from the function.
-        if mir_place_plain_local(&self.body, value_place) >= 0:
+        // A Copy subject has nothing to drop: a drop of it made it owned
+        // storage to the ownership validator, which then found it Init at
+        // return on the success path when this default diverges.
+        if mir_place_plain_local(&self.body, value_place) >= 0 and self.sema.type_needs_drop_frozen(value_ty) != 0:
             self.emit_drop_stmt(value_place, "coalesce-default", self.ast.get_start(expr))
         let dq_scrut_local = self.retire_decomposed_carrier(value_place)
         // #772: a lazy-arm frame + divergence guard, exactly like lower_if's
@@ -16859,6 +16947,15 @@ impl MirBuilder:
         if kind == NodeKind.NK_PIPELINE:
             let rhs = self.ast.get_data1(node)
             if self.ast.kind(rhs) == NodeKind.NK_CALL:
+                // D86 (§18.2): `c |> require(msg)` is the form with `c` as
+                // its condition.
+                if self.sema.precondition_form_calls.contains(rhs):
+                    let form_sym: i32 = self.sema.precondition_form_calls.get(rhs).unwrap()
+                    let recorded = self.sema.resolved_call_sigs.get(rhs).copied()
+                    let form_sig = if recorded.is_some(): recorded.unwrap() else: self.call_sig_for_sym(form_sym)
+                    let form_fn_op = self.lower_callable_expr(self.ast.get_data0(rhs))
+                    let form_ret = if form_sig >= 0: self.sema.sig_return_type(form_sig) else: 0
+                    return self.lower_precondition_form(form_fn_op, form_sig, form_sym, form_ret, self.ast.get_data0(node), self.ast.get_data1(rhs), self.ast.get_data2(rhs), rhs)
                 return self.lower_pipeline(self.ast.get_data0(node), self.ast.get_data0(rhs), self.ast.get_data1(rhs), self.ast.get_data2(rhs), node)
             return self.lower_pipeline(self.ast.get_data0(node), rhs, 0, 0, node)
 
