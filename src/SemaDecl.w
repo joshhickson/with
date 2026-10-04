@@ -151,8 +151,93 @@ impl Sema:
             i = self.named_type_candidate_next[i]
         name_sym
 
+    // #2066: a module declares a type name once, and a trait name once. A
+    // second declaration made a second type of the same name: the name
+    // meant the later one, anything resolved between the two kept the
+    // earlier, and nothing said so (c_import's `typedef struct S S;` did
+    // exactly that, #2043). Reads only the decl table, before any type is
+    // registered; every declaration counts, demanded or not.
+    mut fn report_duplicate_type_declarations():
+        let first_types: HashMap[i64, i32] = HashMap.new()
+        let first_traits: HashMap[i64, i32] = HashMap.new()
+        for di in 0..self.ast.decl_count():
+            let decl = self.ast.get_decl(di)
+            let kind = self.ast.kind(decl)
+            if kind != NodeKind.NK_TYPE_DECL and kind != NodeKind.NK_TRAIT_DECL:
+                continue
+            let name = self.ast.get_data0(decl)
+            if name == 0 or self.pool_resolve(name).len() == 0:
+                continue
+            // A type a `c facade` renders: the facade's own check reports a
+            // clash with a written declaration, naming what generated it
+            // (D51 stage 5, §16.2b.4/§16.2b.8).
+            if self.facade_decl_file_name(di).starts_with("<facade "):
+                continue
+            let key = sema_pair_key(name, self.pool_intern(self.decl_source_path_for_index(di)))
+            let first: i32 = if kind == NodeKind.NK_TYPE_DECL: first_types.get(key) ?? 0 else: first_traits.get(key) ?? 0
+            if first == 0:
+                if kind == NodeKind.NK_TYPE_DECL: first_types.insert(key, decl)
+                else: first_traits.insert(key, decl)
+                continue
+            if first == decl:
+                continue
+            let what = if kind == NodeKind.NK_TYPE_DECL: "type" else: "trait"
+            var diag = Diagnostic.err(f"{what} `{self.pool_resolve(name)}` is declared twice in this module", self.diagnostic_node_span(decl))
+            diag.add_label(self.diagnostic_node_span(first), "first declared here")
+            diag.add_label(self.diagnostic_node_span(decl), "declared again here")
+            self.diags.emit(move diag)
+        self.report_function_named_like_global()
+
+    // #2066: a free function and a module `const`/`var` of one name are two
+    // values under one name. The bare name meant the function and the global
+    // was unreachable (`fn K` + `const K`: `K()` ran, `K` printed nothing).
+    // A method is not a free function: a declaration inside an `impl`,
+    // `extend` or `trait` block, or one spelled `T.m`, is skipped.
+    mut fn report_function_named_like_global():
+        let globals: HashMap[i64, i32] = HashMap.new()
+        let block_files: Vec[i32] = Vec.new()
+        let block_starts: Vec[i32] = Vec.new()
+        let block_ends: Vec[i32] = Vec.new()
+        for di in 0..self.ast.decl_count():
+            let decl = self.ast.get_decl(di)
+            let kind = self.ast.kind(decl)
+            let file = self.pool_intern(self.decl_source_path_for_index(di))
+            if kind == NodeKind.NK_LET_DECL:
+                let name = self.ast.get_data0(decl)
+                if name != 0 and not globals.contains(sema_pair_key(name, file)):
+                    globals.insert(sema_pair_key(name, file), decl)
+            else if kind == NodeKind.NK_IMPL_DECL or kind == NodeKind.NK_TRAIT_DECL or kind == NodeKind.NK_TYPE_DECL:
+                block_files.push(file)
+                block_starts.push(self.ast.get_start(decl))
+                block_ends.push(self.ast.get_end(decl))
+        if globals.len() == 0:
+            return
+        for di in 0..self.ast.decl_count():
+            let decl = self.ast.get_decl(di)
+            if self.ast.kind(decl) != NodeKind.NK_FN_DECL:
+                continue
+            let name = self.ast.get_data0(decl)
+            if name == 0 or self.method_decl_name_symbol(name) != name:
+                continue
+            let file = self.pool_intern(self.decl_source_path_for_index(di))
+            let global_decl: i32 = globals.get(sema_pair_key(name, file)) ?? 0
+            if global_decl == 0:
+                continue
+            let at = self.ast.get_start(decl)
+            var in_block = false
+            for bi in 0..block_files.len() as i32:
+                if block_files[bi] == file and at >= block_starts[bi] and at < block_ends[bi]:
+                    in_block = true
+            if in_block:
+                continue
+            var diag = Diagnostic.err(f"`{self.pool_resolve(name)}` is declared as a function and as a global in this module", self.diagnostic_node_span(decl))
+            diag.add_label(self.diagnostic_node_span(global_decl), "the global")
+            diag.add_label(self.diagnostic_node_span(decl), "the function")
+            self.diags.emit(move diag)
+
     mut fn compute_method_origins():
         self.compute_colliding_type_names()
+        self.report_duplicate_type_declarations()
         let dc = self.ast.decl_count()
         for di in 0..dc:
             let decl = self.ast.get_decl(di)
@@ -933,6 +1018,11 @@ impl Sema:
         if seen.contains(v_name):
             self.emit_error(f"duplicate variant `{self.pool_resolve(v_name)}` in `{self.pool_resolve(enum_name)}`", node)
 
+    // #2066: a field name listed twice gave `v.x` two meanings.
+    mut fn check_duplicate_field(type_name: i32, seen: &Vec[i32], f_name: i32, node: i32):
+        if seen.contains(f_name):
+            self.emit_error(f"duplicate field `{self.pool_resolve(f_name)}` in `{self.pool_resolve(type_name)}`", node)
+
     mut fn collect_type_decl(node: i32, is_local: i32):
         let name = self.ast.get_data0(node)
         if is_local != 0:
@@ -983,6 +1073,7 @@ impl Sema:
                     self.emit_error("opaque types cannot be stored in struct fields; use a pointer or reference", f_type_node)
                 if is_generic_decl != 0 and not is_ephemeral and f_tid != 0 and self.type_is_ephemeral_value(f_tid as i32) != 0:
                     self.emit_ephemeral_storage_error("ephemeral values cannot be stored in non-ephemeral structs", f_type_node, f_tid as i32, node)
+                self.check_duplicate_field(name, &field_names, f_name, f_type_node)
                 field_names.push(f_name)
                 field_tids.push(f_tid as i32)
                 field_defaults.push(f_default)
@@ -1240,6 +1331,7 @@ impl Sema:
                     self.emit_error("opaque types cannot be stored in union fields; use a pointer or reference", f_type_node)
                 if is_generic_decl != 0 and not is_ephemeral and f_tid != 0 and self.type_is_ephemeral_value(f_tid as i32) != 0:
                     self.emit_ephemeral_storage_error("ephemeral values cannot be stored in non-ephemeral unions", f_type_node, f_tid as i32, node)
+                self.check_duplicate_field(name, &field_names, f_name, f_type_node)
                 field_names.push(f_name)
                 field_tids.push(f_tid as i32)
                 field_defaults.push(f_default)
