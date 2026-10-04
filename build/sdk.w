@@ -13,6 +13,8 @@ const SDK_NINJA_VERSION: str = "1.13.1"
 const SDK_NINJA_SHA256: str = "f0055ad0369bf2e372955ba55128d000cfcc21777057806015b45e4accbebf23"
 const SDK_CMAKE_VERSION: str = "4.2.3"
 const SDK_CMAKE_SHA256: str = "7efaccde8c5a6b2968bad6ce0fe60e19b6e10701a12fce948c2bf79bac8a11e9"
+const SDK_ZLIB_VERSION: str = "1.3.1"
+const SDK_ZLIB_SHA256: str = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
 const SDK_LLVM_TAG_TAR_GZ_SHA256: str = "ba534c6835a5b9c2162c806e269799fe41fca952a3c25baff1afcff23841ec2b"
 
 fn sdk_fail(ctx: &ActionCtx, message: &str) -> i32:
@@ -174,6 +176,67 @@ pub fn sdk_llvm_source_dir() -> str:
 
 pub fn sdk_llvm_source_marker() -> str:
     sdk_llvm_source_dir() ++ "/.with-source-ready"
+
+// lld reads a zlib-compressed debug section (ELFCOMPRESS_ZLIB) only when
+// LLVM is built with zlib, and the static libraries Conan Center publishes
+// for Linux carry them (libffi under SDL: "is compressed with
+// ELFCOMPRESS_ZLIB, but lld is not built with zlib support"). The SDK builds
+// zlib's static library from source against the With sysroot, like
+// everything else in it, and LLVM takes that one: lib/libz.a, which the
+// compiler's link names beside the LLVM archives. Nothing of the host's.
+pub fn sdk_zlib_archive() -> str: sdk_source_root() ++ "/zlib-" ++ SDK_ZLIB_VERSION ++ ".tar.gz"
+
+pub fn sdk_zlib_source_dir() -> str: sdk_source_root() ++ "/zlib-" ++ SDK_ZLIB_VERSION
+
+pub fn sdk_zlib_source_marker() -> str: sdk_zlib_source_dir() ++ "/.with-source-ready"
+
+pub fn sdk_zlib_source_url() -> str:
+    "https://github.com/madler/zlib/releases/download/v" ++ SDK_ZLIB_VERSION ++ "/zlib-" ++ SDK_ZLIB_VERSION ++ ".tar.gz"
+
+pub fn sdk_zlib_source_sha256() -> str: SDK_ZLIB_SHA256
+
+pub fn sdk_zlib_library(prefix: &str) -> str: sdk_join(prefix, "lib/libz.a")
+
+fn sdk_build_linux_zlib(ctx: &ActionCtx, root: &str, cmake: &str, bootstrap_prefix: &str, tools_prefix: &str, output_prefix: &str, llvm_build_dir: &str, a: &str, jobs: &str) -> i32:
+    let fs = ctx.fs()
+    if not fs.exists(sdk_zlib_source_marker()):
+        return sdk_fail(ctx, "the zlib source is not unpacked: run :sdk-zlib-source")
+    let build_dir = sdk_join(sdk_dirname(llvm_build_dir), "zlib-" ++ a)
+    if fs.mkdir_all(build_dir) != 0:
+        return sdk_fail(ctx, "could not create zlib build directory: " ++ build_dir)
+    let configure: Vec[str] = Vec.new()
+    configure.push(sdk_owned_text(cmake))
+    configure.push("-G")
+    configure.push("Ninja")
+    configure.push("-S")
+    configure.push(sdk_abs(root, sdk_zlib_source_dir()))
+    configure.push("-B")
+    configure.push(sdk_abs(root, build_dir))
+    configure.push("-DCMAKE_BUILD_TYPE=Release")
+    configure.push("-DCMAKE_MAKE_PROGRAM=" ++ sdk_abs(root, sdk_tool(tools_prefix, "ninja")))
+    configure.push("-DCMAKE_C_COMPILER=" ++ sdk_abs(root, sdk_tool(bootstrap_prefix, "clang")))
+    configure.push("-DZLIB_BUILD_EXAMPLES=OFF")
+    let linux_flags = sdk_linux_toolchain_flags(root, output_prefix, build_dir, a)
+    for i in 0..linux_flags.len() as i32: configure.push(sdk_owned_text(linux_flags[i]))
+    var rc = sdk_run_capture(ctx, "zlib-configure", configure, 600000)
+    if rc != 0: return rc
+    // The static library only: the SDK ships no shared zlib.
+    var build: Vec[str] = Vec.new()
+    build.push(sdk_owned_text(cmake))
+    build.push("--build")
+    build.push(sdk_abs(root, build_dir))
+    build.push("--target")
+    build.push("zlibstatic")
+    build = sdk_append_jobs(move build, jobs)
+    rc = sdk_run_capture(ctx, "zlib-build", build, 600000)
+    if rc != 0: return rc
+    if fs.mkdir_all(sdk_join(output_prefix, "lib")) != 0 or fs.mkdir_all(sdk_join(output_prefix, "include")) != 0:
+        return sdk_fail(ctx, "could not create the SDK's lib and include directories under " ++ output_prefix)
+    if fs.copy_file(sdk_join(build_dir, "libz.a"), sdk_zlib_library(output_prefix)) != 0:
+        return sdk_fail(ctx, "zlib's static library was not built: " ++ sdk_join(build_dir, "libz.a"))
+    if fs.copy_file(sdk_join(sdk_zlib_source_dir(), "zlib.h"), sdk_join(output_prefix, "include/zlib.h")) != 0 or fs.copy_file(sdk_join(build_dir, "zconf.h"), sdk_join(output_prefix, "include/zconf.h")) != 0:
+        return sdk_fail(ctx, "could not install zlib.h and zconf.h into " ++ sdk_join(output_prefix, "include"))
+    0
 
 pub fn sdk_ninja_source_url() -> str:
     "https://github.com/ninja-build/ninja/archive/refs/tags/v" ++ SDK_NINJA_VERSION ++ ".tar.gz"
@@ -577,10 +640,13 @@ fn sdk_package_entries(ctx: &ActionCtx, prefix: &str, sdk_base: &str, platform: 
             if fs.exists(sdk_join(prefix, "bin/" ++ alias)):
                 dirs = sdk_add_parent_dirs(move dirs, sdk_base, "bin/" ++ alias)
     dirs = sdk_merge_sort_strings(dirs)
-    // #1915: the darwin SDK carries the darwin sysroot, as its sysroot/.
-    let sysroot_files = if platform == "darwin-aarch64": sdk_merge_sort_strings(fs.list_files(sdk_darwin_sysroot_dir())) else: Vec.new()
+    // #1915, #2062: a darwin or linux SDK carries its sysroot, as its
+    // sysroot/; a build that pins it reads the sysroot there and fetches no
+    // Zig source.
+    let sysroot_tree = sdk_packaged_sysroot_dir(platform)
+    let sysroot_files = if sysroot_tree.len() > 0: sdk_merge_sort_strings(fs.list_files(sysroot_tree)) else: Vec.new()
     for i in 0..sysroot_files.len() as i32:
-        dirs = sdk_add_parent_dirs(move dirs, sdk_base, "sysroot/" ++ sdk_rel_path(sdk_darwin_sysroot_dir(), sysroot_files[i]))
+        dirs = sdk_add_parent_dirs(move dirs, sdk_base, "sysroot/" ++ sdk_rel_path(sysroot_tree, sysroot_files[i]))
     dirs = sdk_merge_sort_strings(dirs)
     let entries: Vec[ArchiveEntry] = Vec.new()
     for i in 0..dirs.len() as i32:
@@ -590,7 +656,7 @@ fn sdk_package_entries(ctx: &ActionCtx, prefix: &str, sdk_base: &str, platform: 
         let rel = sdk_rel_path(prefix, path)
         entries.push(archive_file_entry(sdk_owned_text(path), sdk_base ++ "/" ++ rel, sdk_file_mode(rel)))
     for i in 0..sysroot_files.len() as i32:
-        let rel = "sysroot/" ++ sdk_rel_path(sdk_darwin_sysroot_dir(), sysroot_files[i])
+        let rel = "sysroot/" ++ sdk_rel_path(sysroot_tree, sysroot_files[i])
         entries.push(archive_file_entry(sdk_owned_text(sysroot_files[i]), sdk_base ++ "/" ++ rel, 0o644))
     if not sdk_platform_is_windows(platform):
         let aliases: Vec[str] = Vec.new()
@@ -661,6 +727,9 @@ pub fn run_package_llvm_sdk_action(ctx: ActionCtx) -> i32:
     if platform == "darwin-aarch64":
         if not selected.contains(sdk_base ++ "/sysroot/usr/lib/libSystem.tbd\n") or not selected.contains(sdk_base ++ "/sysroot/usr/lib/libc++.tbd\n") or not selected.contains(sdk_base ++ "/sysroot/usr/include/stdio.h\n"):
             return sdk_fail(ctx, "the darwin SDK archive omitted its sysroot (#1915): run `with build :darwin-sysroot`")
+    if platform == "linux-x86_64" or platform == "linux-aarch64":
+        if not selected.contains(sdk_base ++ "/sysroot/usr/lib/libc.so\n") or not selected.contains(sdk_base ++ "/sysroot/usr/lib/crt1.o\n"):
+            return sdk_fail(ctx, "the linux SDK archive omitted its sysroot (#2062): run `with build :" ++ (if platform == "linux-aarch64": "linux-sysroot-aarch64" else: "linux-sysroot") ++ "`")
     // The archive is the next build's bootstrap; a package that cannot
     // bootstrap is not an SDK, whatever else it contains.
     let bootstrap = sdk_bootstrap_set(platform)
@@ -1228,7 +1297,7 @@ pub fn run_sdk_llvm_action(ctx: ActionCtx) -> i32:
     configure.push("-DLLVM_INCLUDE_EXAMPLES=OFF")
     configure.push("-DCLANG_INCLUDE_TESTS=OFF")
     configure.push("-DCLANG_BUILD_EXAMPLES=OFF")
-    configure.push("-DLLVM_ENABLE_ZLIB=OFF")
+
     configure.push("-DLLVM_ENABLE_ZSTD=OFF")
     if os() == "Windows":
         // #1915: LLVM, clang and lld are windows-gnu code against the output
@@ -1277,6 +1346,15 @@ pub fn run_sdk_llvm_action(ctx: ActionCtx) -> i32:
             return sdk_fail(ctx, "the SDK's runtimes are not built: run :sdk-runtimes")
         let linux_flags = sdk_linux_llvm_flags(root, output_prefix, build_dir, llvm_arch, native_tools)
         for i in 0..linux_flags.len() as i32: configure.push(sdk_owned_text(linux_flags[i]))
+        // zlib, built here from source, so lld reads the compressed debug
+        // sections of the libraries `with get` installs (sdk_build_linux_zlib).
+        rc = sdk_build_linux_zlib(&ctx, root, cmake, bootstrap_prefix, tools_prefix, output_prefix, build_dir, llvm_arch, jobs)
+        if rc != 0: return rc
+        configure.push("-DLLVM_ENABLE_ZLIB=FORCE_ON")
+        configure.push("-DZLIB_LIBRARY=" ++ sdk_abs(root, sdk_zlib_library(output_prefix)))
+        configure.push("-DZLIB_INCLUDE_DIR=" ++ sdk_abs(root, sdk_join(output_prefix, "include")))
+    else:
+        configure.push("-DLLVM_ENABLE_ZLIB=OFF")
     rc = sdk_run_capture(ctx, "llvm-configure", configure, 1800000)
     if rc != 0: return rc
     var build: Vec[str] = Vec.new()
@@ -1792,10 +1870,12 @@ fn sdk_write_darwin_sysroot(ctx: &ActionCtx, pack_path: &str, rel_paths: &Vec[st
 // never the host's:
 // - usr/lib/lib{c,m,pthread,dl,rt,util,resolv}.so.* and the dynamic linker:
 //   link stubs for glibc SDK_LINUX_GLIBC_MINOR, from Zig's glibc abilists
-//   (every symbol at every version up to the pin, the newest the default);
+//   (every symbol at every version; an unversioned reference binds the
+//   newest at or below the pin, sdk_glibc_stub_sources);
 // - usr/lib/crt1.o, Scrt1.o: glibc's csu start code; usr/lib/libc_nonshared.o;
 // - usr/include: Zig's glibc headers, pinned to the same minor version.
-// A program built against it runs on any glibc at or after the pin. The
+// A program built against it runs on any glibc at or after the pin, unless a
+// library it links was built against a newer one and names its symbols. The
 // generating host need not be the target: the SDK's clang and lld cross.
 const SDK_LINUX_GLIBC_MAJOR: i32 = 2
 const SDK_LINUX_GLIBC_MINOR: i32 = 28
@@ -1809,6 +1889,14 @@ pub fn sdk_linux_sysroot_pack_for(a: &str) -> str: sdk_linux_sysroot_dir_for(a) 
 // The host's.
 pub fn sdk_linux_sysroot_dir() -> str: sdk_linux_sysroot_dir_for(arch())
 pub fn sdk_linux_sysroot_pack() -> str: sdk_linux_sysroot_pack_for(arch())
+
+// The sysroot tree an SDK archive of `platform` carries as its `sysroot/`, or
+// "" for a platform whose SDK carries none.
+pub fn sdk_packaged_sysroot_dir(platform: &str) -> str:
+    if platform == "darwin-aarch64": return sdk_darwin_sysroot_dir()
+    if platform == "linux-x86_64": return sdk_linux_sysroot_dir_for("x86_64")
+    if platform == "linux-aarch64": return sdk_linux_sysroot_dir_for("aarch64")
+    ""
 
 // Zig's glibc library order, which the abilists' library indices name.
 const SDK_GLIBC_LIB_NAMES: [8]str = ["m", "c", "ld", "resolv", "pthread", "dl", "rt", "util"]
@@ -1868,7 +1956,13 @@ fn sdk_glibc_version_suffix(v: &SdkGlibcVersion) -> str:
 
 // The link stubs' sources from Zig's abilists (src/libs/glibc.zig
 // buildSharedObjects): element 0 is the version script naming every version
-// up to the pin, element 1 + i the assembly of SDK_GLIBC_LIB_NAMES[i]. An
+// the abilists know, element 1 + i the assembly of SDK_GLIBC_LIB_NAMES[i].
+// Every symbol is there at every version, and the pin decides only which one
+// an unversioned reference binds: a With program, compiled against the
+// pinned headers, needs the pinned glibc and no more, while a library built
+// elsewhere against a newer glibc (a Conan Center binary asking for
+// fstat@GLIBC_2.33) finds what it names, and the program that links it then
+// needs that glibc. The floor is what the program uses, not a wall. An
 // empty vector is a malformed abilists or a target or version it lacks.
 pub fn sdk_glibc_stub_sources(abilists: &str, target: &str, major: i32, minor: i32) -> Vec[str]:
     var out: Vec[str] = Vec.new()
@@ -1893,7 +1987,7 @@ pub fn sdk_glibc_stub_sources(abilists: &str, target: &str, major: i32, minor: i
     if not r.ok or pin < 0 or target_index < 0: return out
     let inclusions_at: i32 = r.at
     var map = StringBuilder.new()
-    for i in 0..pin + 1:
+    for i in 0..versions.len() as i32:
         map.push_str(sdk_glibc_version_name(&versions[i]) ++ " { };\n")
     out.push(map.to_str())
     let target_bit = (1 as u64) << (target_index as u64)
@@ -1911,32 +2005,45 @@ pub fn sdk_glibc_stub_sources(abilists: &str, target: &str, major: i32, minor: i
             // indexed: the build's comptime evaluator assigns only locals and
             // fields).
             var chosen_sizes: Vec[i32] = Vec.new()
+            // Whether any library gives this symbol a version at or below the
+            // pin: the floor a program keeps unless a library it links needs more.
+            var floor_any = false
             var have_name = false
             for _s in 0..count:
                 if not have_name:
                     sym = r.cstr()
                     chosen = Vec.new()
                     chosen_sizes = Vec.new()
+                    floor_any = false
                     have_name = true
                 let targets = r.leb()
                 let size = if pass == 1: r.leb() as i32 else: 0
                 var lib_index = r.byte()
                 let terminal = (lib_index & 128) != 0
                 lib_index = lib_index & 127
-                let applies = lib_index == lib and (targets & target_bit) != 0
+                let on_target = (targets & target_bit) != 0
+                let applies = lib_index == lib and on_target
                 while true:
                     let b = r.byte()
                     let ver = b & 127
-                    if applies and ver <= pin:
+                    if on_target and ver <= pin: floor_any = true
+                    if applies:
                         chosen.push(ver)
                         chosen_sizes.push(size)
                     if (b & 128) != 0 or not r.ok: break
                 if not terminal: continue
                 have_name = false
                 if chosen.len() == 0: continue
+                // The version an unversioned reference binds: the newest at or
+                // below the pin. A symbol newer than the pin everywhere is bound
+                // at its newest version; one another library holds at the floor
+                // is here only for references that name its version.
                 var newest = -1
+                var default_ver = -1
                 for c in chosen:
                     if c > newest: newest = c
+                    if c <= pin and c > default_ver: default_ver = c
+                if default_ver < 0 and not floor_any: default_ver = newest
                 var written: Vec[i32] = Vec.new()
                 for c in chosen:
                     var seen = false
@@ -1949,7 +2056,7 @@ pub fn sdk_glibc_stub_sources(abilists: &str, target: &str, major: i32, minor: i
                         if chosen[k] == c: object_size = chosen_sizes[k]
                     let v = &versions[c]
                     let label = sym ++ "_" ++ sdk_glibc_version_suffix(v)
-                    let at = if c == newest: "@@" else: "@"
+                    let at = if c == default_ver: "@@" else: "@"
                     stub.push_str(".balign 8\n.globl " ++ label ++ "\n")
                     if pass == 0:
                         stub.push_str(".type " ++ label ++ ", %function\n")
@@ -2036,7 +2143,7 @@ fn sdk_glibc_internal_includes(zig_libc: &str, a: &str) -> Vec[str]:
 fn sdk_linux_sysroot_provenance(a: &str) -> str:
     var out = "The With linux-" ++ a ++ " sysroot (#1915, D81): what linking a With program and\n"
     out = out ++ "c_import of libc read on Linux. Generated by `with build :linux-sysroot`.\n\n"
-    out = out ++ f"Target glibc {SDK_LINUX_GLIBC_MAJOR}.{SDK_LINUX_GLIBC_MINOR}: a program built against it runs on that glibc or any later one.\n\n"
+    out = out ++ f"Target glibc {SDK_LINUX_GLIBC_MAJOR}.{SDK_LINUX_GLIBC_MINOR}: a program built against it runs on that glibc or any later one; a library built against a newer glibc links too, and raises that floor to what it names.\n\n"
     out = out ++ "usr/lib/*.so.*: link stubs generated from Zig's lib/libc/glibc/abilists;\n"
     out = out ++ "usr/lib/{crt1.o,Scrt1.o,libc_nonshared.o}: built from Zig's copy of glibc's csu,\n"
     out = out ++ "stdlib, io, debug and pthread sources; usr/lib/libc.so: glibc's linker script;\n"
@@ -2081,6 +2188,18 @@ pub fn run_linux_sysroot_action(ctx: ActionCtx) -> i32:
         return sdk_write_text(ctx, pack_path, "")
     let root = ctx.project_info().project_root()
     let prefix = compiler_default_llvm_prefix()
+    // The SDK is the bootstrap's product (#2062): a Linux host's SDK that
+    // carries its sysroot is where the build reads it, and nothing is
+    // fetched or compiled. The generation below runs only for an SDK that
+    // has none (while one is being built) and for another architecture's
+    // sysroot, which the host's SDK does not carry.
+    let sdk_sysroot = sdk_join(prefix, "sysroot")
+    if os() == "Linux" and a == arch() and fs.exists(sdk_join(sdk_sysroot, "usr/lib/libc.so")):
+        let from_sdk_tree = sdk_linux_sysroot_dir_for(a)
+        let _stale = fs.remove_tree(from_sdk_tree)
+        if fs.copy_tree(sdk_sysroot, from_sdk_tree) != 0:
+            return sdk_fail(ctx, "could not copy the SDK's sysroot " ++ sdk_sysroot ++ " to " ++ from_sdk_tree)
+        return sdk_write_linux_sysroot_pack(ctx, from_sdk_tree, pack_path)
     let clang = sdk_abs(root, sdk_tool(prefix, "clang"))
     let lld = sdk_abs(root, sdk_tool(prefix, "ld.lld"))
     if not fs.exists(clang) or not fs.exists(lld):
@@ -2249,7 +2368,13 @@ pub fn run_linux_sysroot_action(ctx: ActionCtx) -> i32:
             if rc != 0: return rc
     rc = sdk_write_text(ctx, sdk_join(tree, "PROVENANCE"), sdk_linux_sysroot_provenance(a))
     if rc != 0: return rc
-    // "F <path> <size>\n<bytes>" per file, as the darwin pack.
+    sdk_write_linux_sysroot_pack(ctx, tree, pack_path)
+
+// The pack of a linux sysroot tree: "F <path> <size>\n<bytes>" per file in
+// sorted order, as the darwin pack. One writer for a tree just generated and
+// for one copied out of the SDK, so the two are the same bytes.
+fn sdk_write_linux_sysroot_pack(ctx: &ActionCtx, tree: &str, pack_path: &str) -> i32:
+    let fs = ctx.fs()
     let files = sdk_merge_sort_strings(fs.list_files(tree))
     var pack = StringBuilder.with_capacity(24000000)
     pack.push_str("WITH-SYSROOT 1\n")
