@@ -416,6 +416,8 @@ pub enum CallBuiltin: i32:
     ScopedJoin = 20
     // §4.4a `Enum.from_int(n)` on a discriminant enum.
     EnumFromInt = 21
+    // D96: `with_key_hash[K](key)`, the body of `std.hash.hash_of`.
+    KeyHash = 22
 
 impl Copy for CallBuiltin
 
@@ -1328,6 +1330,9 @@ pub type Sema {
     bind_provenance: Vec[BindingProvenance],
     binding_decl_nodes: HashMap[i32, i32],
     binding_value_nodes: HashMap[i32, i32],
+    // §29.6 (D95): a binding a `let _ = x` dropped, and that `let`, for the
+    // help on a later use.
+    discard_lets: HashMap[i32, i32],
     scope_starts: Vec[i32],
     scope_name_map: HashMap[i32, i32],
     pending_generic_binding_base: HashMap[i32, i32],
@@ -1849,6 +1854,12 @@ pub type Sema {
     // the method itself, or its specialization for a generic instance.
     concrete_eq_sigs: HashMap[i32, i32],
     concrete_eq_mono_syms: HashMap[i32, i32],
+    // The same for `Ord.cmp` (`<` on a value holding the type) and for a
+    // key projection, `Key.key` (§11.7, D96).
+    concrete_cmp_sigs: HashMap[i32, i32],
+    concrete_cmp_mono_syms: HashMap[i32, i32],
+    concrete_key_sigs: HashMap[i32, i32],
+    concrete_key_mono_syms: HashMap[i32, i32],
     generic_inst_cache: HashMap[i64, i32],
     // D7: eager tables filled in preregister_mir_types (before freeze) so the frozen
     // consumers read answers via &Self twins instead of re-deriving them through the
@@ -2372,7 +2383,7 @@ fn sema_prelude_gate_allows_name(name: &str) -> i32:
         return 1
     if name == "Vec" or name == "String" or name == "str" or name == "Unit":
         return 1
-    if name == "Eq" or name == "Ord" or name == "Hash" or name == "Debug":
+    if name == "Eq" or name == "Ord" or name == "Key" or name == "Debug":
         return 1
     if name == "Display" or name == "Default" or name == "Drop":
         return 1
@@ -3274,6 +3285,7 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         bind_provenance: Vec.new(),
         binding_decl_nodes: sema_new_map_i32_i32(),
         binding_value_nodes: sema_new_map_i32_i32(),
+        discard_lets: sema_new_map_i32_i32(),
         scope_starts: Vec.new(),
         scope_name_map: HashMap.new(),
         pending_generic_binding_base: sema_new_map_i32_i32(),
@@ -3533,6 +3545,10 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         concrete_drop_mono_syms: sema_new_map_i32_i32(),
         concrete_eq_sigs: sema_new_map_i32_i32(),
         concrete_eq_mono_syms: sema_new_map_i32_i32(),
+        concrete_cmp_sigs: sema_new_map_i32_i32(),
+        concrete_cmp_mono_syms: sema_new_map_i32_i32(),
+        concrete_key_sigs: sema_new_map_i32_i32(),
+        concrete_key_mono_syms: sema_new_map_i32_i32(),
         generic_inst_cache,
         layout_size_cache,
         layout_align_cache,
