@@ -525,6 +525,8 @@ pub type FacadeResource {
     thread_caps: i32,     // bit0 creator, bit1 send, bit2 share, bit3 drop_any_thread
     abandon: i32,         // `abandon <fn>` (§16.2b.9): the `callbacks none` operation run before the destroyer on a drop path not proven callback-free, or 0
     abandon_node: i32,
+    message: i32,         // `message <fn>` (ruling Amendment 3): the operation describing the most recent failure, or 0
+    message_node: i32,
     handle: i32,          // 1 for a callback-scope `handle Name wraps *mut T` (§16.2b.9): no producer, destroyer or Drop; borrowed for the callback's invocation
 }
 
@@ -561,7 +563,8 @@ pub type ForeignContract {
     buffer_elements: Vec[i32],         // explicit element count; otherwise bytes (D64)
     fixed_params: Vec[i32],            // D64 §16.2b.11: each `param N fixed <literal>` parameter …
     fixed_literals: Vec[i32],          // … and its literal node (parallel)
-    ok_const: i32,                     // `ok CONST` on the fn item: the status contract a copied-back length is presented under (D64)
+    ok_const: i32,                     // `ok CONST` on the fn item: its status contract (D64; ruling Amendment 3), the first constant of a list
+    ok_count: i32,                     // how many constants the `ok` lists (Amendment 3: several on a status-returning operation)
     variadic_node: i32,                // D66 §16.2b.5: the `variadic param N selected by param P:` clause, or 0 …
     variadic_selector: i32,            // … its selector parameter P (-1: none) …
     variadic_case_syms: Vec[i32],      // … each case's imported constant …

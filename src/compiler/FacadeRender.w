@@ -109,6 +109,135 @@ pub fn facade_render_block(pool: AstPool, intern: InternPool, facade: i32, ci: &
     out = out ++ facade_render_free_ops(pool, intern, ci, facade)
     facade_render_public(out)
 
+// Two presentations of one function (ruling Amendment 3, §16.2b.11): "An fn
+// item may be written more than once when each states a distinct `rename`.
+// Each is a presentation with its own fixed parameters." The first item
+// keeps the C declaration. Each later one gets a declaration of its own that
+// links to the same C symbol,
+//
+//     @[link_name("sqlite3_exec")]
+//     extern fn __with_presented_exec_with__of__sqlite3_exec(…) -> c_int
+//
+// and is renamed to it, so every rule that reads an fn item by the function
+// it names — its contract, its hosting, its fixed parameters, its rendering —
+// reads this presentation's own. Returns those declarations as source text
+// ("" when the block repeats nothing); a repetition without distinct
+// renames is left as written, and Sema refuses it.
+pub fn facade_render_presentation_prefix() -> str: "__with_presented_"
+
+// A diagnostic names such a declaration by the C function it declares:
+// `text` with every presentation's declaration name replaced by that
+// function's.
+pub fn facade_render_shown_names(text: &str) -> str:
+    let prefix = facade_render_presentation_prefix()
+    if not text.contains(prefix):
+        return text.clone()
+    let parts = text.split(prefix)
+    var out = parts[0].clone()
+    for i in 1..parts.len() as i32:
+        let at = parts[i].find("__of__")
+        out = out ++ (if at >= 0: parts[i].slice(at + 6, parts[i].len()) else: prefix ++ parts[i])
+    out
+
+pub fn facade_render_presentation_aliases(pool: AstPool, intern: InternPool, facade: i32, ci: &Vec[i32]) -> (str, Vec[i32]):
+    var out = ""
+    // Per declaration emitted, the index of the import's declaration it
+    // is another name for.
+    var origins: Vec[i32] = Vec.new()
+    let start = pool.get_data1(facade as NodeId)
+    let count = pool.get_data2(facade as NodeId)
+    for i in 0..count:
+        let item = pool.get_extra(start + i)
+        if pool.kind(item as NodeId) != NodeKind.NK_FACADE_FN:
+            continue
+        let cname: str = intern.resolve(pool.get_data0(item as NodeId))
+        // Every item of this block naming the same function, in order.
+        let group: Vec[i32] = Vec.new()
+        for k in 0..count:
+            let other = pool.get_extra(start + k)
+            if pool.kind(other as NodeId) == NodeKind.NK_FACADE_FN and intern.resolve(pool.get_data0(other as NodeId)) == cname: group.push(other)
+        if group.len() < 2 or group[0] != item:
+            continue
+        var renames: Vec[str] = Vec.new()
+        var distinct = true
+        for g in 0..group.len() as i32:
+            let rename = facade_render_item_rename_of(pool, intern, group[g])
+            if rename.len() == 0 or renames.contains(rename): distinct = false
+            renames.push(rename)
+        let decl = facade_render_find_fn(pool, intern, ci, pool.get_data0(item as NodeId))
+        let meta = if decl != 0: pool.find_fn_meta(decl as NodeId) else: -1
+        if not distinct or meta < 0:
+            continue
+        var params = ""
+        let pstart = pool.fn_meta_param_start(meta)
+        for pi in 0..pool.fn_meta_param_count(meta):
+            if pi > 0: params = params ++ ", "
+            params = params ++ facade_render_param_name(pool, intern, pstart, pi) ++ ": " ++ render_type_expr(pool, intern, pool.fn_param_type(pstart, pi) as NodeId)
+        for g in 1..group.len() as i32:
+            let alias = facade_render_presentation_prefix() ++ renames[g] ++ "__of__" ++ cname
+            out = out ++ "@[link_name(\"" ++ cname ++ "\")]\nextern fn " ++ alias ++ "(" ++ params ++ ")" ++ facade_render_return(pool, intern, decl) ++ "\n"
+            pool.set_data0(group[g] as NodeId, intern.intern(alias))
+            for di in 0..pool.decl_count():
+                if pool.get_decl(di) as i32 == decl: origins.push(di)
+    (out, origins)
+
+// The `rename` an fn item itself states, or "".
+fn facade_render_item_rename_of(pool: AstPool, intern: InternPool, item: i32) -> str:
+    let cstart = pool.get_data1(item as NodeId)
+    for k in 0..pool.get_data2(item as NodeId):
+        let clause = pool.get_extra(cstart + k)
+        if pool.get_data0(clause as NodeId) == FACADE_CLAUSE_RENAME: return intern.resolve(pool.get_extra(pool.get_data1(clause as NodeId))).clone()
+    ""
+
+// `message <fn>` (ruling Amendment 3, §16.2b.4): how one of `resource`'s
+// methods reads the text of its most recent failure — the text view the
+// clause names, on the resource itself or on the one parent it holds — or
+// "" when the resource states none (Sema refuses a clause that is neither).
+fn facade_render_message_call(pool: AstPool, intern: InternPool, ci: &Vec[i32], resource: i32) -> str:
+    var named = 0
+    let extra_start = pool.get_data1(resource as NodeId)
+    for k in 0..pool.get_data2(resource as NodeId):
+        let clause = pool.get_extra(extra_start + 1 + k)
+        if pool.get_data0(clause as NodeId) == FACADE_CLAUSE_MESSAGE: named = pool.get_extra(pool.get_data1(clause as NodeId))
+    if named == 0:
+        return ""
+    let decl = facade_render_find_fn(pool, intern, ci, named)
+    if decl == 0:
+        return ""
+    let item = facade_render_fn_item(pool, intern, decl)
+    if item == 0:
+        return ""
+    let li = facade_render_lend_item(pool, intern, ci, item)
+    let fname: str = intern.resolve(named)
+    let own_repr = facade_render_unalias(pool, intern, render_type_expr(pool, intern, pool.get_extra(pool.get_data1(resource as NodeId)) as NodeId))
+    if facade_render_lend_hosted(pool, intern, &li, resource, own_repr):
+        return "self." ++ facade_render_present(pool, intern, ci, resource, fname) ++ "()"
+    for parent in facade_render_all_items(pool, NodeKind.NK_FACADE_RESOURCE):
+        if parent == resource:
+            continue
+        let parent_repr = facade_render_unalias(pool, intern, render_type_expr(pool, intern, pool.get_extra(pool.get_data1(parent as NodeId)) as NodeId))
+        if not facade_render_lend_hosted(pool, intern, &li, parent, parent_repr):
+            continue
+        let field = facade_render_parent_field(pool, intern, ci, resource, intern.resolve(pool.get_data0(parent as NodeId)))
+        if field.len() > 0:
+            return "self." ++ field ++ "." ++ facade_render_present(pool, intern, ci, parent, fname) ++ "()"
+    ""
+
+// The same text for a producer received through a parent (ruling Amendment
+// 3: `sqlite3_prepare_v2(db, …)` is an operation on the connection, so a
+// failed prepare carries the connection's message): the parent's message
+// call, read through the producer's first parameter. "" when the producer
+// has no receiver or the receiver states no `message`.
+fn facade_render_producer_message_call(pool: AstPool, intern: InternPool, ci: &Vec[i32], producer: i32) -> str:
+    let parent = facade_render_receiver(pool, intern, producer)
+    let meta = pool.find_fn_meta(producer as NodeId)
+    if parent <= 0 or meta < 0:
+        return ""
+    let call = facade_render_message_call(pool, intern, ci, parent)
+    if not call.starts_with("self."):
+        return ""
+    facade_render_param_name(pool, intern, pool.fn_meta_param_start(meta), 0) ++ call.slice(4, call.len())
+
 // The `<Fn>Error` types of the resource's lend methods that present a
 // copied-back length under `ok` (D64): declared beside the resource, since
 // an error type cannot live inside its impl.
@@ -122,10 +251,17 @@ fn facade_render_hosted_fn_errors(pool: AstPool, intern: InternPool, ci: &Vec[i3
         if not li.bridged or li.text_view or li.borrow_res != 0 or not facade_render_lend_hosted(pool, intern, &li, resource, repr):
             continue
         let bridge = facade_render_bridge(pool, intern, li.decl, 1, -1, "")
-        if not bridge.ok or bridge.cap_var.len() == 0 or facade_render_fn_ok(pool, intern, li.decl) == 0:
+        if not bridge.ok or facade_render_fn_oks(pool, intern, li.decl).len() == 0:
             continue
         let fname: str = intern.resolve(pool.get_data0(li.decl as NodeId))
-        out = out ++ facade_render_fn_error_type(pool, intern, li.decl, facade_render_present(pool, intern, ci, resource, fname))
+        out = out ++ facade_render_fn_error_type(pool, intern, li.decl, facade_render_present(pool, intern, ci, resource, fname), facade_render_message_call(pool, intern, ci, resource).len() > 0)
+    // A callback operation hosted here (`db.exec(sql, callback, userdata)`).
+    for i in 0..items.len() as i32:
+        let cbi = facade_render_callback_item(pool, intern, ci, items[i])
+        if cbi.decl == 0 or not facade_render_callback_hosted(pool, intern, &cbi, resource, repr) or facade_render_fn_oks(pool, intern, cbi.decl).len() == 0:
+            continue
+        let fname: str = intern.resolve(pool.get_data0(cbi.decl as NodeId))
+        out = out ++ facade_render_fn_error_type(pool, intern, cbi.decl, facade_render_present(pool, intern, ci, resource, fname), facade_render_message_call(pool, intern, ci, resource).len() > 0)
     out
 
 // Everything a facade renders is its module's public surface (spec
@@ -376,7 +512,7 @@ fn facade_render_lend_methods(pool: AstPool, intern: InternPool, ci: &Vec[i32], 
             let handle = facade_render_fresh("repr", facade_render_param_names(pool, intern, decl))
             out = out ++ head ++ mname ++ "(" ++ params ++ ") -> Option[" ++ bname ++ "]:\n" ++ pro ++ "        let " ++ handle ++ " = " ++ facade_render_call(pool, intern, decl, call_args) ++ "\n        if " ++ handle ++ " == null: None else: Some(" ++ bname ++ " { origin: " ++ origin ++ ", repr: " ++ handle ++ " })\n"
             continue
-        let (ret, body) = facade_render_bridge_body(pool, intern, decl, &bridge, facade_render_call(pool, intern, decl, call_args), mname, "        ")
+        let (ret, body) = facade_render_bridge_body(pool, intern, decl, &bridge, facade_render_call(pool, intern, decl, call_args), mname, "        ", if failed_only: "" else: facade_render_message_call(pool, intern, ci, resource))
         out = out ++ head ++ mname ++ "(" ++ params ++ ")" ++ ret ++ ":\n" ++ pro ++ body
     out
 
@@ -871,8 +1007,18 @@ pub fn facade_render_all_items(pool: AstPool, kind: NodeKind) -> Vec[i32]:
         let extra_start = pool.get_data1(decl)
         for i in 0..pool.get_data2(decl):
             let item = pool.get_extra(extra_start + i)
-            if pool.kind(item as NodeId) == kind:
-                out.push(item)
+            if pool.kind(item as NodeId) != kind:
+                continue
+            // An fn item repeating an earlier one of its block is refused by
+            // Sema ("described twice"); it renders nothing, so the refusal
+            // is the only error. (A second presentation is not a repeat: it
+            // names its own declaration, facade_render_presentation_aliases.)
+            var repeat = false
+            if kind == NodeKind.NK_FACADE_FN:
+                for k in 0..i:
+                    let earlier = pool.get_extra(extra_start + k)
+                    if pool.kind(earlier as NodeId) == kind and pool.get_data0(earlier as NodeId) == pool.get_data0(item as NodeId): repeat = true
+            if not repeat: out.push(item)
     out
 
 fn facade_render_resource(pool: AstPool, intern: InternPool, ci: &Vec[i32], item: i32, methods: &str, plain_methods: &str, failed_methods: &str) -> str:
@@ -982,19 +1128,26 @@ fn facade_render_resource(pool: AstPool, intern: InternPool, ci: &Vec[i32], item
     // producer or the in-place `init` — onto `Result[R, <R>Error]`
     // (facade_render_error_type); only out-parameter production can still
     // produce on failure, so only it adds the failed-state resource.
+    // `Failed` also carries the library's text when every producer that
+    // can fail is received through a parent stating `message` (ruling
+    // Amendment 3): one error type, one shape.
     var status_type = ""
     var failed_state = false
+    var with_message = true
     if ok_syms.len() > 0:
         for pi in 0..producers.len() as i32:
             let ret = if producers[pi] != 0 and out_refs[pi] != 0: facade_render_return(pool, intern, producers[pi]) else: ""
             if ret.len() > 0:
                 failed_state = true
+                if facade_render_producer_message_call(pool, intern, ci, producers[pi]).len() == 0: with_message = false
                 if status_type.len() == 0:
                     status_type = ret.slice(4, ret.len())
         if init_fn != 0:
             let ret = facade_render_return(pool, intern, init_fn)
             if ret.len() > 0:
                 status_type = ret.slice(4, ret.len())
+                with_message = false
+    if not failed_state: with_message = false
     // The generated error never owns a dependent child (ruling §18: the
     // error "may" own the failure-state resource "where required" — an
     // error escapes scopes, a dependent value cannot). A dependent
@@ -1003,7 +1156,7 @@ fn facade_render_resource(pool: AstPool, intern: InternPool, ci: &Vec[i32], item
     // `FailedWithResource`.
     let dependent = deps.slot_res.len() > 0
     if status_type.len() > 0:
-        out = out ++ facade_render_error_type(pool, intern, name, repr_text, status_type, failed_state, failed_state and not dependent, drop_fn, failed_methods)
+        out = out ++ facade_render_error_type(pool, intern, name, repr_text, status_type, failed_state, failed_state and not dependent, drop_fn, failed_methods, with_message)
     // Borrowed returns of this resource (ruling §26): `Borrowed<R>`.
     out = out ++ facade_render_borrowed_type(pool, intern, ci, item, repr_text, plain_methods)
     for pi in 0..producers.len() as i32:
@@ -1018,7 +1171,7 @@ fn facade_render_resource(pool: AstPool, intern: InternPool, ci: &Vec[i32], item
             let slot = facade_render_param_ref(pool, intern, producer, out_refs[pi])
             if slot < 0:
                 continue
-            let (ctor, result) = facade_render_out_producer(pool, intern, name, repr_text, producer, pname, slot, &ok_syms, made_deps, drop_fn)
+            let (ctor, result) = facade_render_out_producer(pool, intern, name, repr_text, producer, pname, slot, &ok_syms, made_deps, drop_fn, if with_message: facade_render_producer_message_call(pool, intern, ci, producer) else: "")
             out = out ++ ctor ++ facade_render_receiver_method(pool, intern, ci, item, producer, slot, pname, result)
             continue
         let (params, args) = facade_render_params_but(pool, intern, producer, 0, -1, "")
@@ -1454,7 +1607,7 @@ fn facade_render_ok_value(ok_syms: &Vec[i32], status: &str, made: &str) -> str:
 // `R.<pname>`, the producer's presented name (§16.2b.11: `Database.open`
 // for `sqlite3_open`, or its `rename`). Returns the constructor and its
 // result type, which the receiver method repeats.
-fn facade_render_out_producer(pool: AstPool, intern: InternPool, name: &str, repr_text: &str, producer: i32, pname: &str, slot: i32, ok_syms: &Vec[i32], deps: &str, drop_fn: i32) -> (str, str):
+fn facade_render_out_producer(pool: AstPool, intern: InternPool, name: &str, repr_text: &str, producer: i32, pname: &str, slot: i32, ok_syms: &Vec[i32], deps: &str, drop_fn: i32, message_call: &str) -> (str, str):
     let taken = facade_render_param_names(pool, intern, producer)
     let slot_var = facade_render_fresh("slot", taken)
     let (params, args) = facade_render_params_but(pool, intern, producer, 0, slot, "&raw mut " ++ slot_var)
@@ -1475,12 +1628,20 @@ fn facade_render_out_producer(pool: AstPool, intern: InternPool, name: &str, rep
     let result = "Result[" ++ facade_render_ok_type(ok_syms, status_type, name) ++ ", " ++ err ++ "]"
     var out = head ++ " -> " ++ result ++ ":\n" ++ null_slot ++ "    let " ++ status ++ " = " ++ call ++ "\n"
     out = out ++ "    if " ++ facade_render_not_ok(intern, ok_syms, status) ++ ":\n"
-    out = out ++ "        if " ++ slot_var ++ " == null: return Err(" ++ err ++ ".Failed(" ++ status ++ "))\n"
+    // The text is read first: destroying what a failure produced is another
+    // call into the library, which may overwrite it.
+    var failed_args = status.clone()
+    if message_call.len() > 0:
+        let text = facade_render_fresh("facade_text", taken)
+        let message = facade_render_fresh("facade_message", taken)
+        out = out ++ "        let " ++ message ++ ": str = match " ++ message_call ++ ":\n            Some(" ++ text ++ ") => " ++ text ++ ".to_str_lossy()\n            None => \"\"\n"
+        failed_args = status ++ ", " ++ message
+    out = out ++ "        if " ++ slot_var ++ " == null: return Err(" ++ err ++ ".Failed(" ++ failed_args ++ "))\n"
     if deps.len() > 0:
         // A dependent resource: the generated error never owns a child
         // (see facade_render_error_type), so a failure that still produced
         // is destroyed here, exactly once, and reported as `Failed`.
-        out = out ++ "        " ++ facade_render_call(pool, intern, drop_fn, facade_render_repr_arg(pool, intern, drop_fn, repr_text, slot_var, false)) ++ "\n        return Err(" ++ err ++ ".Failed(" ++ status ++ "))\n"
+        out = out ++ "        " ++ facade_render_call(pool, intern, drop_fn, facade_render_repr_arg(pool, intern, drop_fn, repr_text, slot_var, false)) ++ "\n        return Err(" ++ err ++ ".Failed(" ++ failed_args ++ "))\n"
     else:
         out = out ++ "        return Err(" ++ err ++ ".FailedWithResource(" ++ status ++ ", " ++ facade_render_failed_name(name) ++ " { repr: " ++ slot_var ++ " }))\n"
     out = out ++ "    if " ++ slot_var ++ " == null: return Err(" ++ err ++ ".NothingProduced(" ++ status ++ "))\n"
@@ -1524,7 +1685,7 @@ pub fn facade_render_failed_name(name: &str) -> str: "Failed" ++ name
 //             unsafe { sqlite3_close(self.repr) }
 //     impl FailedDatabase:
 //         fn errmsg() -> Option[CStr]: …                 // `valid on failed`
-fn facade_render_error_type(pool: AstPool, intern: InternPool, name: &str, repr_text: &str, status_type: &str, out_param: bool, failed_state: bool, drop_fn: i32, failed_methods: &str) -> str:
+fn facade_render_error_type(pool: AstPool, intern: InternPool, name: &str, repr_text: &str, status_type: &str, out_param: bool, failed_state: bool, drop_fn: i32, failed_methods: &str, with_message: bool) -> str:
     let err = facade_render_error_name(name)
     var out = ""
     if failed_state:
@@ -1532,7 +1693,7 @@ fn facade_render_error_type(pool: AstPool, intern: InternPool, name: &str, repr_
         out = "type " ++ failed ++ " { repr: " ++ repr_text ++ " }\nimpl Drop for " ++ failed ++ ":\n    move fn drop():\n        " ++ facade_render_call(pool, intern, drop_fn, facade_render_repr_arg(pool, intern, drop_fn, repr_text, "self.repr", false)) ++ "\n"
         if failed_methods.len() > 0:
             out = out ++ "impl " ++ failed ++ ":\n" ++ failed_methods
-    out = out ++ "error " ++ err ++ " =\n    | Failed(status: " ++ status_type ++ ")\n"
+    out = out ++ "error " ++ err ++ " =\n    | Failed(status: " ++ status_type ++ (if with_message: ", message: str" else: "") ++ ")\n"
     if failed_state:
         out = out ++ "    | FailedWithResource(status: " ++ status_type ++ ", resource: " ++ facade_render_failed_name(name) ++ ")\n"
     if out_param:
@@ -1853,9 +2014,41 @@ fn facade_render_indent(text: &str, indent: &str) -> str:
 // `Err(<Fn>Error.Failed(status))`; an operation returning nothing always
 // succeeded. A length beyond the capacity is C breaking its contract, and
 // a runtime failure naming the operation and the length, never a trust.
-fn facade_render_bridge_body(pool: AstPool, intern: InternPool, decl: i32, b: &FacadeBridge, call: &str, presented: &str, indent: &str) -> (str, str):
+// The lines that return a failed status as `<Fn>Error.Failed`. With a
+// `message` on the hosting resource (ruling Amendment 3) the error also
+// carries the library's text, an owned copy read before anything else is
+// called on the resource.
+fn facade_render_failed(err: &str, status: &str, failed: &str, message_call: &str, taken: &str, indent: &str) -> str:
+    if message_call.len() == 0:
+        return indent ++ "if " ++ failed ++ ": return Err(" ++ err ++ ".Failed(" ++ status ++ "))\n"
+    let text = facade_render_fresh("facade_text", taken)
+    let message = facade_render_fresh("facade_message", taken)
+    var out = indent ++ "if " ++ failed ++ ":\n"
+    out = out ++ indent ++ "    let " ++ message ++ ": str = match " ++ message_call ++ ":\n"
+    out = out ++ indent ++ "        Some(" ++ text ++ ") => " ++ text ++ ".to_str_lossy()\n"
+    out = out ++ indent ++ "        None => \"\"\n"
+    out ++ indent ++ "    return Err(" ++ err ++ ".Failed(" ++ status ++ ", " ++ message ++ "))\n"
+
+fn facade_render_bridge_body(pool: AstPool, intern: InternPool, decl: i32, b: &FacadeBridge, call: &str, presented: &str, indent: &str, message_call: &str) -> (str, str):
     if b.cap_var.len() == 0:
-        return (facade_render_return(pool, intern, decl), indent ++ call ++ "\n")
+        // A status-returning operation under `ok` (ruling Amendment 3,
+        // §16.2b.4): `Result[T, <Fn>Error]`. One constant: the status is the
+        // whole return, so `T` is `Unit`. Several: `T` is the status that
+        // matched.
+        let oks = facade_render_fn_oks(pool, intern, decl)
+        if oks.len() == 0:
+            return (facade_render_return(pool, intern, decl), indent ++ call ++ "\n")
+        let op_err = facade_render_fn_error_name(presented)
+        let op_status = facade_render_fresh("status", facade_render_param_names(pool, intern, decl))
+        var failed = ""
+        for k in 0..oks.len() as i32:
+            if k > 0: failed = failed ++ " and "
+            failed = failed ++ op_status ++ " != " ++ intern.resolve(oks[k])
+        let checked = indent ++ "let " ++ op_status ++ " = " ++ call ++ "\n" ++ facade_render_failed(op_err, op_status, failed, message_call, facade_render_param_names(pool, intern, decl), indent)
+        if oks.len() == 1:
+            return (" -> Result[Unit, " ++ op_err ++ "]", checked ++ indent ++ "()\n")
+        let status_type = facade_render_return(pool, intern, decl)
+        return (" -> Result[" ++ status_type.slice(4, status_type.len()) ++ ", " ++ op_err ++ "]", checked ++ indent ++ op_status ++ "\n")
     let ok_sym = facade_render_fn_ok(pool, intern, decl)
     let check = indent ++ "if " ++ b.cap_var ++ " < 0 or " ++ b.cap_var ++ " as u64 > " ++ b.cap_of ++ ".len() as u64: panic(f\"" ++ presented ++ ": C reported {" ++ b.cap_var ++ "} " ++ b.cap_unit ++ " written into a buffer of {" ++ b.cap_of ++ ".len()} " ++ b.cap_unit ++ " (§16.2b.8)\")\n"
     let result = indent ++ b.cap_var ++ " as usize\n"
@@ -1864,8 +2057,25 @@ fn facade_render_bridge_body(pool: AstPool, intern: InternPool, decl: i32, b: &F
     let err = facade_render_fn_error_name(presented)
     let status = facade_render_fresh("status", facade_render_param_names(pool, intern, decl))
     var body = indent ++ "let " ++ status ++ " = " ++ call ++ "\n"
-    body = body ++ indent ++ "if " ++ status ++ " != " ++ intern.resolve(ok_sym) ++ ": return Err(" ++ err ++ ".Failed(" ++ status ++ "))\n"
+    body = body ++ facade_render_failed(err, status, status ++ " != " ++ intern.resolve(ok_sym), message_call, facade_render_param_names(pool, intern, decl), indent)
     (" -> Result[usize, " ++ err ++ "]", body ++ check ++ result)
+
+// Every constant of the `ok` an fn item states for the declaration; none
+// for a variadic contract, whose `ok` is its setter's success edge and
+// leaves the presentation as it is (§16.2b.5).
+fn facade_render_fn_oks(pool: AstPool, intern: InternPool, decl: i32) -> Vec[i32]:
+    let oks: Vec[i32] = Vec.new()
+    let item = facade_render_fn_item(pool, intern, decl)
+    if item == 0:
+        return oks
+    let cstart = pool.get_data1(item as NodeId)
+    for k in 0..pool.get_data2(item as NodeId):
+        if pool.get_data0(pool.get_extra(cstart + k) as NodeId) == FACADE_CLAUSE_VARIADIC: return oks
+    for k in 0..pool.get_data2(item as NodeId):
+        let clause = pool.get_extra(cstart + k)
+        if pool.get_data0(clause as NodeId) == FACADE_CLAUSE_OK:
+            for ci in 0..pool.get_data2(clause as NodeId): oks.push(pool.get_extra(pool.get_data1(clause as NodeId) + ci))
+    oks
 
 // The `ok CONST` an fn item states for the declaration, or 0.
 fn facade_render_fn_ok(pool: AstPool, intern: InternPool, decl: i32) -> i32:
@@ -1886,15 +2096,26 @@ pub fn facade_render_bridge_name(cname: &str) -> str: "__with_facade_" ++ cname
 // named after its presented name (`compress` → `CompressError`).
 pub fn facade_render_fn_error_name(presented: &str) -> str:
     if presented.len() == 0: return "Error"
-    presented.slice(0, 1).to_upper() ++ presented.slice(1, presented.len()) ++ "Error"
+    // A snake_case presented name is CamelCased (`exec_with` →
+    // `ExecWithError`); a name with capitals of its own keeps them
+    // (`BZ2_bzBuffToBuffCompress`).
+    var snake = true
+    for i in 0..presented.len():
+        if presented[i] >= 'A' and presented[i] <= 'Z': snake = false
+    if not snake:
+        return presented.slice(0, 1).to_upper() ++ presented.slice(1, presented.len()) ++ "Error"
+    var out = ""
+    for part in presented.split("_"):
+        if part.len() > 0: out = out ++ part.slice(0, 1).to_upper() ++ part.slice(1, part.len())
+    out ++ "Error"
 
 // The error type an inout operation under `ok` returns: `Failed` alone —
 // nothing is produced, so there is no resource to own.
-fn facade_render_fn_error_type(pool: AstPool, intern: InternPool, decl: i32, presented: &str) -> str:
+fn facade_render_fn_error_type(pool: AstPool, intern: InternPool, decl: i32, presented: &str, with_message: bool) -> str:
     let ret = facade_render_return(pool, intern, decl)
     if ret.len() == 0:
         return ""
-    "error " ++ facade_render_fn_error_name(presented) ++ " =\n    | Failed(status: " ++ ret.slice(4, ret.len()) ++ ")\n"
+    "error " ++ facade_render_fn_error_name(presented) ++ " =\n    | Failed(status: " ++ ret.slice(4, ret.len()) ++ (if with_message: ", message: str" else: "") ++ ")\n"
 
 // The free operations a facade block presents (D64): each fn item stating a
 // buffer pairing or a fixed argument whose first parameter takes no
@@ -1955,10 +2176,10 @@ fn facade_render_free_ops(pool: AstPool, intern: InternPool, ci: &Vec[i32], faca
             let handle = facade_render_fresh("repr", facade_render_param_names(pool, intern, decl))
             out = out ++ "fn " ++ base ++ "(" ++ bridge.params ++ ") -> Option[" ++ view ++ "]:\n" ++ facade_render_indent(bridge.prologue, "    ") ++ "    let " ++ handle ++ " = " ++ facade_render_call(pool, intern, decl, bridge.args) ++ "\n    if " ++ handle ++ " == null: None else: Some(unsafe { " ++ handle ++ " as " ++ view ++ " })\n"
             continue
-        if bridge.cap_var.len() > 0 and facade_render_fn_ok(pool, intern, decl) != 0:
-            out = out ++ facade_render_fn_error_type(pool, intern, decl, presented)
+        if facade_render_fn_oks(pool, intern, decl).len() > 0:
+            out = out ++ facade_render_fn_error_type(pool, intern, decl, presented, false)
         let rendered = if li.rename != 0: presented.clone() else: facade_render_bridge_name(cname)
-        let (result, body) = facade_render_bridge_body(pool, intern, decl, &bridge, facade_render_call(pool, intern, decl, bridge.args), presented, "    ")
+        let (result, body) = facade_render_bridge_body(pool, intern, decl, &bridge, facade_render_call(pool, intern, decl, bridge.args), presented, "    ", "")
         out = out ++ "fn " ++ rendered ++ "(" ++ bridge.params ++ ")" ++ result ++ ":\n" ++ facade_render_indent(bridge.prologue, "    ") ++ body
     out
 
@@ -2764,7 +2985,7 @@ fn facade_render_callback_ops(pool: AstPool, intern: InternPool, ci: &Vec[i32], 
         if not bridge.ok:
             continue
         let call = facade_render_call(pool, intern, decl, bridge.args)
-        let (ret, call_body) = facade_render_bridge_body(pool, intern, decl, &bridge, call, mname, indent)
+        let (ret, call_body) = facade_render_bridge_body(pool, intern, decl, &bridge, call, mname, indent, if hosted: facade_render_message_call(pool, intern, ci, resource) else: "")
         let shown_ret = if not hosted and ret.len() == 0: " -> Unit" else: ret.clone()
         let head = (if not hosted: "fn " else: if cbi.retained: "    mut fn " else: "    fn ") ++ mname ++ (if generic: "[U]" else: "") ++ "(" ++ bridge.params ++ ")" ++ shown_ret ++ ":\n"
         var body = facade_render_indent(bridge.prologue, indent)
@@ -2809,8 +3030,10 @@ fn facade_render_callback_ops(pool: AstPool, intern: InternPool, ci: &Vec[i32], 
                 body = body ++ indent ++ "let " ++ facade_render_fresh(f"facade_c{pi}", taken) ++ ": " ++ wrapped_raw[wi] ++ " = if " ++ facade_render_fresh(f"facade_p{pi}", taken) ++ " == null: null else: " ++ w ++ "\n"
         if wrapped_failed:
             continue
-        if bridge.cap_var.len() > 0 and facade_render_fn_ok(pool, intern, decl) != 0:
-            out = out ++ facade_render_fn_error_type(pool, intern, decl, mname)
+        // A hosted operation's error type is declared beside its resource
+        // (facade_render_hosted_fn_errors).
+        if not hosted and facade_render_fn_oks(pool, intern, decl).len() > 0:
+            out = out ++ facade_render_fn_error_type(pool, intern, decl, mname, false)
         out = out ++ head ++ body ++ call_body ++ "\n"
     out
 

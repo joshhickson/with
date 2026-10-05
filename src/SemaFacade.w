@@ -40,6 +40,7 @@ impl Sema:
         self.verify_facade_buffers()
         self.verify_facade_variadic_items()
         self.verify_facade_abandon()
+        self.verify_facade_messages()
         self.verify_facade_borrowed_returns()
         self.verify_facade_text_views()
         self.verify_facade_callback_items()
@@ -788,7 +789,7 @@ impl Sema:
         let repr_tid = self.resolve_type_expr(repr_node) as i32
         if repr_tid == 0:
             return
-        var r = FacadeResource { name, facade, node: item, decl, repr_tid, producers: Vec.new(), out_params: Vec.new(), init: 0, preinit: 0, drop: 0, destroyers: Vec.new(), ok_consts: Vec.new(), ok_node: 0, borrows: Vec.new(), borrows_owner: Vec.new(), borrows_nodes: Vec.new(), last_producer: -2, independent: 0, independent_node: 0, movable: 0, thread_caps: 0, abandon: 0, abandon_node: 0, handle: 0 }
+        var r = FacadeResource { name, facade, node: item, decl, repr_tid, producers: Vec.new(), out_params: Vec.new(), init: 0, preinit: 0, drop: 0, destroyers: Vec.new(), ok_consts: Vec.new(), ok_node: 0, borrows: Vec.new(), borrows_owner: Vec.new(), borrows_nodes: Vec.new(), last_producer: -2, independent: 0, independent_node: 0, movable: 0, thread_caps: 0, abandon: 0, abandon_node: 0, message: 0, message_node: 0, handle: 0 }
         for ci in 0..clause_count:
             let clause = self.ast.get_extra(extra_start + 1 + ci)
             r = self.collect_resource_clause(rname, move r, clause)
@@ -945,6 +946,19 @@ impl Sema:
             r.abandon = f
             r.abandon_node = clause
             return r
+        if kind == FACADE_CLAUSE_MESSAGE:
+            // `message <fn>` (ruling Amendment 3, §16.2b.4): that the
+            // operation is a text view of this resource or of its parent is
+            // verified once every item is collected (verify_facade_message).
+            let f = self.ast.get_extra(ops)
+            if self.facade_fn_sig(f, clause) < 0:
+                return r
+            if r.message != 0:
+                self.emit_error(f"resource '{rname}': 'message' is stated twice; a resource has one description of its most recent failure (§16.2b.4)", clause)
+                return r
+            r.message = f
+            r.message_node = clause
+            return r
         if kind == FACADE_CLAUSE_HANDLE:
             // The parser's marker for `handle Name wraps *mut T` (§16.2b.9):
             // verified in verify_facade_handle.
@@ -976,7 +990,7 @@ impl Sema:
         if self.foreign_contract_index.contains(fn_sym):
             let prev: i32 = self.foreign_contract_index.get(fn_sym).unwrap()
             if self.foreign_contracts[prev].decl == decl:
-                self.emit_error(f"fn '{fname}' is described twice in this facade (§16.2b)", item)
+                self.emit_error_with_help(f"fn '{fname}' is described twice in this facade (§16.2b)", item, "to present one C function as two operations, give each item its own 'rename' (§16.2b.11)")
                 return
             // Another block describes it too. The same clauses restated are
             // the same facts — the runtime's files each carry a block naming
@@ -987,7 +1001,7 @@ impl Sema:
                 return
             self.emit_error(f"fn '{fname}' is described by two facade blocks with different clauses; one function has one contract — restate it word for word or describe it once (§16.2b)", item)
             return
-        var c = ForeignContract { fn_sym, decl, facade, node: item, lend: 0, destroys: 0, consumes: Vec.new(), consumes_destroyed_by: Vec.new(), retains: Vec.new(), retains_by: Vec.new(), returns_borrow_resource: 0, returns_borrow_from: -1, returns_borrow_domain: 0, returns_borrow_parent: 0, returns_static_tid: 0, preserves_params: Vec.new(), preserves_domains: Vec.new(), of_resource: 0, rename: 0, callback_thread_any: 0, callbacks_none: 0, callback_consumes: Vec.new(), callback_userdata_cb: Vec.new(), callback_userdata_of: Vec.new(), valid_on_failed: 0, nullable_params: Vec.new(), buffer_ptr: Vec.new(), buffer_len: Vec.new(), buffer_inout: Vec.new(), buffer_elements: Vec.new(), fixed_params: Vec.new(), fixed_literals: Vec.new(), ok_const: 0, variadic_node: 0, variadic_selector: -1, variadic_case_syms: Vec.new(), variadic_case_values: Vec.new(), variadic_case_tids: Vec.new(), variadic_case_kinds: Vec.new(), variadic_slots: Vec.new(), returns_borrow_record: 0, argv_cb: Vec.new(), argv_index: Vec.new(), argc_index: Vec.new(), argv_handle: Vec.new(), argv_nodes: Vec.new(), user_data_fn: 0, user_data_handle: -1, user_data_node: 0 }
+        var c = ForeignContract { fn_sym, decl, facade, node: item, lend: 0, destroys: 0, consumes: Vec.new(), consumes_destroyed_by: Vec.new(), retains: Vec.new(), retains_by: Vec.new(), returns_borrow_resource: 0, returns_borrow_from: -1, returns_borrow_domain: 0, returns_borrow_parent: 0, returns_static_tid: 0, preserves_params: Vec.new(), preserves_domains: Vec.new(), of_resource: 0, rename: 0, callback_thread_any: 0, callbacks_none: 0, callback_consumes: Vec.new(), callback_userdata_cb: Vec.new(), callback_userdata_of: Vec.new(), valid_on_failed: 0, nullable_params: Vec.new(), buffer_ptr: Vec.new(), buffer_len: Vec.new(), buffer_inout: Vec.new(), buffer_elements: Vec.new(), fixed_params: Vec.new(), fixed_literals: Vec.new(), ok_const: 0, ok_count: 0, variadic_node: 0, variadic_selector: -1, variadic_case_syms: Vec.new(), variadic_case_values: Vec.new(), variadic_case_tids: Vec.new(), variadic_case_kinds: Vec.new(), variadic_slots: Vec.new(), returns_borrow_record: 0, argv_cb: Vec.new(), argv_index: Vec.new(), argc_index: Vec.new(), argv_handle: Vec.new(), argv_nodes: Vec.new(), user_data_fn: 0, user_data_handle: -1, user_data_node: 0 }
         let extra_start = self.ast.get_data1(item)
         let clause_count = self.ast.get_data2(item)
         for ci in 0..clause_count:
@@ -1529,7 +1543,9 @@ impl Sema:
             let lk = self.ast.kind(lit)
             let is_int = lk == NodeKind.NK_INT_LIT or (lk == NodeKind.NK_UNARY and self.ast.get_data0(lit) == UnaryOp.UOP_NEGATE)
             if lk == NodeKind.NK_NULL_LIT:
-                if self.get_type_kind(ptype) != TypeKind.TY_PTR:
+                // A callback parameter is a C function pointer: NULL is the
+                // presentation that passes none (ruling Amendment 3).
+                if self.get_type_kind(ptype) != TypeKind.TY_PTR and not self.facade_param_is_callable(sig, pi):
                     self.emit_error(f"fn '{fname}': 'param {pi} fixed null' binds {shown}, which is not a pointer (§16.2b.11)", clause)
                     return c
             else if lk == NodeKind.NK_BOOL_LIT:
@@ -1673,22 +1689,20 @@ impl Sema:
                     return c
             return c
         if kind == FACADE_CLAUSE_OK:
-            // `ok CONST` on an fn item (D64, §16.2b.8): the status contract
-            // under which a copied-back length is presented — on success
-            // only. A resource's producer states `ok` on the resource
-            // (§16.2b.4); an fn item's `ok` needs a length to present, which
-            // verify_facade_buffers checks once every clause is collected.
+            // `ok` on an fn item (§16.2b.4; ruling Amendment 3): the status
+            // contract of an operation whose C function returns a status.
+            // One constant or several; what the presented operation returns
+            // on success, and the shapes a list does not fit (a copied-back
+            // length, a variadic setter), verify_facade_buffers decides once
+            // every clause is collected.
             let const_sym = self.ast.get_extra(ops)
             let cn: str = self.pool_resolve(const_sym)
-            // Several success statuses are a producer's (§16.2b.4, ruling
-            // Amendment 1: "A producer's `ok` may list several"); the
-            // status contract of an fn item names one.
-            if self.ast.get_data2(clause) > 1:
-                self.emit_error(f"fn '{fname}': 'ok' lists several success statuses, which a producer's 'ok' on its resource may; an fn item's 'ok' — the status contract of a copied-back length or a variadic setter — names one (§16.2b.4)", clause)
-                return c
-            if not self.facade_status_constant_ok(const_sym):
-                self.emit_error(f"fn '{fname}': 'ok {cn}' names no imported integer constant; a status is compared with a compile-time constant the header declares (§16.2b.4)", clause)
-                return c
+            for oi in 0..self.ast.get_data2(clause):
+                let listed = self.ast.get_extra(ops + oi)
+                if not self.facade_status_constant_ok(listed):
+                    let ln: str = self.pool_resolve(listed)
+                    self.emit_error(f"fn '{fname}': 'ok {ln}' names no imported integer constant; a status is compared with a compile-time constant the header declares (§16.2b.4)", clause)
+                    return c
             let ret = self.sig_return_type(sig)
             if ret == 0 or self.get_type_kind(self.numeric_operand_type(ret)) != TypeKind.TY_INT:
                 let rt: str = if ret == 0: "nothing" else: self.type_name(ret)
@@ -1698,6 +1712,7 @@ impl Sema:
                 self.emit_error(f"fn '{fname}': 'ok' is stated twice (§16.2b.4)", clause)
                 return c
             c.ok_const = const_sym
+            c.ok_count = self.ast.get_data2(clause)
             return c
         let cname = facade_clause_name(kind)
         self.emit_error(f"fn '{fname}': clause '{cname}' applies to a resource, not an fn item (§16.2b)", clause)
@@ -2156,6 +2171,33 @@ impl Sema:
     // initializer, drop or destroyer — and itself `callbacks none`, so the
     // abandonment path cannot invoke an incomplete pair. Any other
     // operation is refused; nothing about the path is inferred from a name.
+    // `message <fn>` (ruling Amendment 3, §16.2b.4): the operation is a
+    // text view (`returns borrow CStr from param 0`) of the resource itself
+    // or of the one resource it depends on, so an error from one of the
+    // resource's operations can read it at once.
+    mut fn verify_facade_messages():
+        for ri in 0..self.facade_resources.len() as i32:
+            let f = self.facade_resources[ri].message
+            if f == 0:
+                continue
+            let rname: str = self.pool_resolve(self.facade_resources[ri].name)
+            let fnm: str = self.pool_resolve(f)
+            let node = self.facade_resources[ri].message_node
+            let ci = self.facade_contract_for(f)
+            if ci < 0 or self.foreign_contracts[ci].returns_borrow_resource == 0 or self.pool_resolve(self.foreign_contracts[ci].returns_borrow_resource) != "CStr" or self.foreign_contracts[ci].returns_borrow_from != 0:
+                self.emit_error_with_help(f"resource '{rname}': 'message {fnm}' names an operation that is not a text view of its first parameter (§16.2b.4)", node, f"state it on the fn item: 'fn {fnm}' with 'returns borrow CStr from param 0'")
+                continue
+            let sig = self.get_sig(f)
+            if sig < 0:
+                continue
+            if self.facade_accepts_repr(sig, self.facade_resources[ri].repr_tid):
+                continue
+            var through_parent = 0
+            for pi in 0..self.facade_resources.len() as i32:
+                if pi != ri and self.facade_is_parent_of(ri, pi) and self.facade_accepts_repr(sig, self.facade_resources[pi].repr_tid): through_parent += 1
+            if through_parent != 1:
+                self.emit_error(f"resource '{rname}': 'message {fnm}' takes neither {rname}'s representation nor that of the one resource {rname} depends on, so an error from a {rname} operation has nothing to read it from (§16.2b.4)", node)
+
     mut fn verify_facade_abandon():
         for ri in 0..self.facade_resources.len() as i32:
             let f = self.facade_resources[ri].abandon
@@ -2269,6 +2311,7 @@ pub fn facade_clause_name(kind: i32) -> str:
     if kind == FACADE_CLAUSE_INDEPENDENT: return "independent"
     if kind == FACADE_CLAUSE_MOVABLE: return "movable"
     if kind == FACADE_CLAUSE_ABANDON: return "abandon"
+    if kind == FACADE_CLAUSE_MESSAGE: return "message"
     if kind == FACADE_CLAUSE_LEND: return "lend"
     if kind == FACADE_CLAUSE_CONSUMES: return "consumes"
     if kind == FACADE_CLAUSE_RETAINS: return "retains"
@@ -2288,6 +2331,7 @@ pub fn facade_clause_name(kind: i32) -> str:
     if kind == FACADE_CLAUSE_VARIADIC: return "variadic param … selected by param …"
     if kind == FACADE_CLAUSE_VARIADIC_CASE: return "case"
     if kind == FACADE_CLAUSE_ABANDON: return "abandon"
+    if kind == FACADE_CLAUSE_MESSAGE: return "message"
     if kind == FACADE_CLAUSE_HANDLE: return "handle"
     if kind == FACADE_CLAUSE_CALLBACK_ARGV: return "callback … argv … paired with argc"
     if kind == FACADE_CLAUSE_USER_DATA: return "user_data from"
@@ -2867,9 +2911,12 @@ impl Sema:
         // `ok CONST` on a variadic operation is its status contract for the
         // listed cases (§16.2b.5): the success edge of a setter, read by
         // MIR; the presentation is unchanged.
-        if ok_const != 0 and inout < 0 and self.foreign_contracts[ci].variadic_node == 0:
-            let cn: str = self.pool_resolve(ok_const)
-            self.emit_error(f"fn '{fname}': 'ok {cn}' states the status contract a copied-back length is presented under, and '{fname}' pairs no 'capacity … inout' buffer, so there is no value to present on success; a producer's status is stated on its resource (§16.2b.4, §16.2b.8)", node)
+        // Several success statuses belong to a status-returning operation
+        // (ruling Amendment 3): a copied-back length is presented under one
+        // status, and a variadic setter's success edge is one status.
+        if self.foreign_contracts[ci].ok_count > 1 and (inout >= 0 or self.foreign_contracts[ci].variadic_node != 0):
+            let shape = if inout >= 0: "a copied-back length is presented under one success status" else: "a variadic setter has one success status"
+            self.emit_error(f"fn '{fname}': 'ok' lists several success statuses, and {shape} (§16.2b.4)", node)
             return
         // A resource's own operation renders as its constructor or destroyer,
         // a callback contract as its callback method (stage 9): their
