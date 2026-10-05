@@ -13387,6 +13387,8 @@ impl Sema:
                 if not self.types_identical(lhs_tuple, rhs_tuple):
                     self.emit_error(f"comparison operands must have the same tuple type: `{self.type_name(lhs_tuple)}` and `{self.type_name(rhs_tuple)}`", node)
                     return 0
+            if op == BinaryOp.OP_EQ or op == BinaryOp.OP_NEQ:
+                self.note_structural_equality(lhs as i32, node)
             return self.ty_bool as i32
 
         // Logical operators
@@ -27464,6 +27466,129 @@ impl Sema:
         self.concrete_drop_mono_syms.insert(resolved, mono_sym)
         sig_idx
 
+    // #2137 (§11.7, §11.8): `==` on a value with no `eq` of its own is
+    // structural — field by field, element by element, variant by variant —
+    // and a part that has an `eq` is compared by that method. Codegen renders
+    // the walk from the frozen types (mir_emit_eq_ptrs); which method a part
+    // is compared by is decided here, before the freeze, and never
+    // reconstructed there (D65). `node` is the comparison, for a refusal.
+    mut fn note_structural_equality(tid: i32, node: i32):
+        var seen: HashMap[i32, i32] = sema_new_map_i32_i32()
+        let work: Vec[i32] = Vec.new()
+        work.push(tid)
+        let eq_sym = self.pool_intern("eq")
+        var k = 0
+        while k < work.len() as i32:
+            var t: i32 = self.resolve_alias(work[k] as TypeId) as i32
+            k = k + 1
+            // A view compares as the value it observes.
+            while t > 0 and self.get_type_kind(t as TypeId) == TypeKind.TY_REF:
+                t = self.resolve_alias(self.get_type_d0(t as TypeId) as TypeId) as i32
+            if t <= 0 or seen.contains(t):
+                continue
+            seen.insert(t, 1)
+            let tk = self.get_type_kind(t as TypeId)
+            let declared = tk == TypeKind.TY_STRUCT or tk == TypeKind.TY_ENUM or tk == TypeKind.TY_GENERIC_INST
+            // A generic type's `eq` is its impl's template, which has no
+            // signature until it is specialized (ensure_eq_contract).
+            let generic_eq = tk == TypeKind.TY_GENERIC_INST and self.lookup_generic_method_fn(self.get_generic_inst_base(t), eq_sym) != 0
+            if generic_eq or (declared and self.type_has_operator_method(t, eq_sym) != 0):
+                self.ensure_eq_contract(t, eq_sym, node)
+                // The comparison calls that method (#1819: an operator is a
+                // call of its method), whatever the global-effects analysis
+                // needs to know of it.
+                let part_sig: i32 = self.concrete_eq_sigs.get(t) ?? -1
+                if part_sig >= 0:
+                    let no_args: Vec[i32] = Vec.new()
+                    let no_places: Vec[bool] = Vec.new()
+                    self.note_call_global_effects(node, part_sig, 0, 0, false, no_args, no_places)
+                continue
+            if tk == TypeKind.TY_TUPLE:
+                for ei in 0..self.get_type_d1(t as TypeId): work.push(self.type_extra[(self.get_type_d0(t as TypeId) + ei)])
+            else if tk == TypeKind.TY_ARRAY or tk == TypeKind.TY_SLICE:
+                work.push(self.get_type_d0(t as TypeId))
+            else if tk == TypeKind.TY_STRUCT or tk == TypeKind.TY_ENUM or tk == TypeKind.TY_GENERIC_INST:
+                // A `Vec[T]` compares its elements and a `Box[T]` its pointee:
+                // what they hold is their argument, not a field.
+                if tk == TypeKind.TY_GENERIC_INST:
+                    for ai in 0..self.get_generic_inst_arg_count(t): work.push(self.get_generic_inst_arg(t, ai))
+                for fi in 0..self.type_reflection_field_count(t): work.push(self.type_reflection_field_type(t, fi))
+                for vi in 0..self.type_reflection_variant_count(t):
+                    for pi in 0..self.type_reflection_variant_payload_count(t, vi): work.push(self.type_reflection_variant_payload_type(t, vi, pi))
+
+    // The `eq` a part of type `resolved` is compared by: the type's method,
+    // specialized when the type is a generic instance (the recipe of
+    // ensure_generic_drop_specialization). The walk hands it two views, so
+    // the method takes its receiver and its operand by reference, as
+    // `Eq.eq` declares them.
+    mut fn ensure_eq_contract(resolved: i32, eq_sym: i32, node: i32):
+        if self.concrete_eq_sigs.contains(resolved):
+            return
+        var sig_idx = -1
+        var mono_sym = 0
+        if self.get_type_kind(resolved as TypeId) != TypeKind.TY_GENERIC_INST:
+            let owner = self.get_type_name(resolved as TypeId)
+            sig_idx = self.lookup_method_sig(owner, eq_sym)
+            mono_sym = self.lookup_method_fn(owner, eq_sym)
+        else:
+            var method_node = 0
+            var method_fn = 0
+            var matched_subst_names: Vec[i32] = Vec.new()
+            var matched_subst_types: Vec[i32] = Vec.new()
+            for di in 0..self.ast.decl_count():
+                if self.decl_is_lazy_skipped(di):
+                    continue
+                let impl_node = self.ast.get_decl(di)
+                if self.ast.kind(impl_node) != NodeKind.NK_IMPL_DECL:
+                    continue
+                let candidate_node = self.impl_decl_method_node(impl_node, eq_sym)
+                if candidate_node == 0:
+                    continue
+                var target = self.impl_target_match(impl_node, resolved)
+                if target.ok == 0:
+                    continue
+                let candidate_fn = self.fn_decl_semantic_symbol_at(candidate_node, self.ast.get_data0(candidate_node), self.find_decl_index(candidate_node))
+                if method_fn != 0 and method_fn != candidate_fn:
+                    self.emit_error(f"`==` compares a `{self.type_name(resolved)}` by its `eq`, and more than one impl provides it", node)
+                    return
+                method_fn = candidate_fn
+                method_node = candidate_node
+                matched_subst_names = move target.subst_names
+                matched_subst_types = move target.subst_types
+            if method_fn == 0 or method_node == 0:
+                return
+            var subst = ConcreteSubst.init()
+            for si in 0..matched_subst_names.len() as i32:
+                subst.push(matched_subst_names[si], matched_subst_types[si])
+            let owner_sym = self.get_generic_inst_base(resolved)
+            if self.type_decl_nodes.contains(owner_sym):
+                let owner_decl = self.type_decl_nodes.get(owner_sym).unwrap()
+                var tp_pos = self.type_decl_tp_start(owner_decl)
+                let owner_tp_count = self.type_decl_tp_count(owner_decl)
+                if owner_tp_count == self.get_generic_inst_arg_count(resolved):
+                    for ti in 0..owner_tp_count:
+                        let tp_sym = self.ast.get_extra(tp_pos)
+                        let bound_count = self.ast.get_extra(tp_pos + 1)
+                        subst.push(tp_sym, self.get_generic_inst_arg(resolved, ti))
+                        tp_pos = tp_pos + 2 + bound_count
+            subst.push(self.syms.self_type, resolved)
+            var mono_text = f"{self.pool_resolve(method_fn)}__receiver__{resolved}"
+            for ai in 0..self.get_generic_inst_arg_count(resolved):
+                mono_text = f"{mono_text}_{self.get_generic_inst_arg(resolved, ai)}"
+            mono_sym = self.pool_intern(mono_text)
+            sig_idx = self.get_sig(mono_sym)
+            if sig_idx < 0:
+                let concrete_params: Vec[i32] = Vec.new()
+                sig_idx = self.check_fn_body_concrete(method_node, subst.names, subst.types, mono_sym, concrete_params)
+        if sig_idx < 0 or mono_sym == 0:
+            return
+        let by_view = self.sig_get_param_count(sig_idx) == 2 and self.get_type_kind(self.resolve_alias(self.sig_param_type(sig_idx, 0) as TypeId)) == TypeKind.TY_REF and self.get_type_kind(self.resolve_alias(self.sig_param_type(sig_idx, 1) as TypeId)) == TypeKind.TY_REF
+        if not by_view or self.types_compatible(self.ty_bool as i32, self.sig_return_type(sig_idx)) == 0:
+            self.emit_error_with_help(f"`==` compares a `{self.type_name(resolved)}` inside this value by `{self.type_name(resolved)}.eq`, which does not have the shape of `Eq.eq` (§11.7)", node, "declare it `fn eq(other: &Self) -> bool`")
+            return
+        self.concrete_eq_sigs.insert(resolved, sig_idx)
+        self.concrete_eq_mono_syms.insert(resolved, mono_sym)
+
     // Autoderef's user-Deref dispatch: specialize deref for the concrete
     // receiver and RECORD the resolution on the base expression node —
     // exactly the recipe register_generic_drop_specializations uses for
@@ -30308,6 +30433,11 @@ impl Sema:
         let recv = if raw_recv != 0 and raw_recv != self.ty_void as i32: self.auto_deref_method_type_frozen(raw_recv as TypeId, field) as i32 else: raw_recv
         var intrinsic = self.builtin_method_intrinsic(recv, self.pool_resolve(field))
         let lowering = self.method_lowering_kind(raw_recv, recv, expr, field, arg_count, intrinsic)
+        // `v.contains(x)` and `x in v` compare each element with `x` (#2137).
+        if intrinsic == MirIntrinsic.VEC_CONTAINS and recv > 0:
+            let vec_ty = self.auto_deref_ref_ptr_type(self.resolve_alias(recv as TypeId)) as i32
+            if self.get_type_kind(vec_ty as TypeId) == TypeKind.TY_GENERIC_INST and self.get_generic_inst_arg_count(vec_ty) == 1:
+                self.note_structural_equality(self.get_generic_inst_arg(vec_ty, 0), node)
         if lowering == MethodLowering.IsEmptyViaLen:
             intrinsic = self.builtin_method_intrinsic(recv, "len")
         // A builtin constructor on a written type (`Vec[str].new()`, the
