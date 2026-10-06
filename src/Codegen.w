@@ -113,6 +113,10 @@ pub type Codegen {
     sema_symbol_texts: Vec[str],
     overflow_mode: i32,
     analysis_enabled: i32,
+    // The route mir_build_bin_op took for the operator it last lowered, and
+    // the span of the MIR statement being lowered (operator facts).
+    binop_route: str,
+    cur_stmt_span: i32,
     analysis_query: str,
     analysis_report: AnalysisReport,
     analysis_last_marshal_strategy: AnalysisMarshalStrategy,
@@ -1081,6 +1085,8 @@ fn Codegen.init_with_opt(module_name: &str, opt_level: i32) -> Codegen:
         sema_symbol_texts: Vec.new(),
         overflow_mode: overflow_mode_default(),
         analysis_enabled: 0,
+        binop_route: "",
+        cur_stmt_span: 0,
         analysis_query: "",
         analysis_report: AnalysisReport.init(),
         analysis_last_marshal_strategy: AnalysisMarshalStrategy.DirectValue,
@@ -2119,10 +2125,14 @@ impl Codegen:
         let raw = with_getenv_str("WITH_DEBUG_TYPE_LAYOUT")
         raw.len() > 0 and raw != "0"
 
-    fn debug_fallback_enabled() -> bool:
-        let _ = self
-        let raw = with_getenv_str("WITH_DEBUG_FALLBACK")
-        raw.len() > 0 and raw != "0"
+    // #2199: codegen met MIR it cannot lower — a compiler bug, always
+    // reported (D65). The first detail names the function; the `undef`
+    // returned only lets the walk finish the statement before the stop.
+    mut fn mir_bug_undef(what: &str, ty: i64) -> i64:
+        self.had_error = 1
+        if self.codegen_error_detail.len() == 0:
+            self.codegen_error_detail = f"BUG: {what} in `{self.intern.resolve(self.current_function_name_sym)}`"
+        wl_get_undef(ty)
 
     fn debug_type_layout_field(owner_name: &str, field_index: i32, field_name: i32, type_node: i32, resolved_ty: i64):
         if not self.debug_type_layout_enabled():
@@ -6345,10 +6355,10 @@ impl Codegen:
         let arg = self.fn_abi_arg(index, param_idx)
         arg.pass == PM_INDIRECT_PLACE or arg.reference
 
-    fn apply_noalias_param_attrs(function: i64, param_start: i32, param_count: i32):
+    mut fn apply_noalias_param_attrs(function: i64, param_start: i32, param_count: i32):
         self.apply_noalias_param_attrs_with_offset(function, param_start, param_count, 0)
 
-    fn apply_noalias_param_attrs_with_offset(function: i64, param_start: i32, param_count: i32, param_offset: i32):
+    mut fn apply_noalias_param_attrs_with_offset(function: i64, param_start: i32, param_count: i32, param_offset: i32):
         if function == 0 or param_start < 0 or param_count <= 0:
             return
         let fn_type = wl_global_get_value_type(function)
@@ -6361,15 +6371,13 @@ impl Codegen:
         // into a null deref. Loud skip: a non-function under a mono sym in
         // fn_values is a registration bug upstream, not an attr concern.
         if fn_type == 0 or wl_count_param_types(fn_type) < 0:
-            if with_getenv_str("WITH_MIR_AUDIT").len() > 0:
-                with_eprint(f"[noalias-nonfn] attr walk on non-function value (param_count={param_count} offset={param_offset})")
+            self.mir_bug_undef(f"noalias attributes on a value that is not a function (param_count={param_count} offset={param_offset})", wl_i32_type(self.context))
             return
         let llvm_param_count = wl_count_param_types(fn_type)
         for pi in 0..param_count:
             let actual_idx = pi + param_offset
             if actual_idx < 0 or actual_idx >= llvm_param_count:
-                if with_getenv_str("WITH_MIR_AUDIT").len() > 0:
-                    with_eprint(f"[noalias-oob] fn declares {llvm_param_count} LLVM params, attr walk wants index {actual_idx} (param_count={param_count} offset={param_offset})")
+                self.mir_bug_undef(f"noalias attribute on parameter {actual_idx} of a function with {llvm_param_count} LLVM parameters (param_count={param_count} offset={param_offset})", wl_i32_type(self.context))
                 continue
             var param_ty = wl_get_fn_param_type(fn_type, actual_idx)
             if param_ty == 0:

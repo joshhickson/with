@@ -2533,6 +2533,18 @@ impl MirBuilder:
         let pointee = if kind == TypeKind.TY_PTR or kind == TypeKind.TY_REF: self.sema.get_type_d0(resolved) else: 0
         self.body.new_deref_place(base, pointee)
 
+    // An operand's type as MIR recorded it: a place's recorded type
+    // (place_sema_types), a constant's own. What codegen reads.
+    fn operand_recorded_type(operand_id: i32) -> i32:
+        if operand_id < 0 or operand_id >= self.body.operand_kinds.len(): return 0
+        let kind = self.body.operand_kinds[operand_id]
+        let data: i32 = self.body.operand_d0[operand_id]
+        if kind == OperandKind.OK_CONSTANT:
+            return if data >= 0 and data < self.body.const_types.len(): self.body.const_types[data] else: 0
+        if (kind == OperandKind.OK_COPY or kind == OperandKind.OK_MOVE) and data >= 0 and data < self.body.place_sema_types.len():
+            return self.body.place_sema_types[data]
+        0
+
     mut fn operand_type(operand_id: i32) -> i32:
         if operand_id < 0 or operand_id >= self.body.operand_kinds.len():
             return self.sema.ty_void as i32
@@ -15721,7 +15733,28 @@ impl MirBuilder:
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
+    // Every expression's operand, recorded with Sema's type for its node
+    // (D65: audit:resolution judges they agree). A contextual copy is
+    // Sema's own adjustment: its operand has the adjusted type.
     mut fn lower_expr(node: i32) -> i32:
+        let op = self.lower_expr_node(node)
+        // Grouping, a block and the other pass-through forms yield their
+        // inner value: that node is judged, with any adjustment Sema made.
+        let kind = if node > 0: self.ast.kind(node) else: NodeKind.NK_BLOCK
+        let passes_through = kind == NodeKind.NK_GROUPED or kind == NodeKind.NK_BLOCK or kind == NodeKind.NK_COMPTIME or kind == NodeKind.NK_UNSAFE_BLOCK or kind == NodeKind.NK_NO_SUSPEND
+        if node > 0 and op >= 0 and not passes_through and self.has_contextual_copy_adjustment(node) == 0:
+            // A splat or lane conversion Sema recorded on the node is its
+            // own adjustment: the operand has the adjusted type (§4.3d).
+            var sema_ty = self.expr_type(node)
+            if node != self.vector_raw_node:
+                if self.sema.vector_splats.contains(node):
+                    sema_ty = self.concrete_type(self.sema.vector_splats.get(node).unwrap())
+                else if self.sema.vector_conversions.contains(node):
+                    sema_ty = self.concrete_type(self.sema.vector_conversions.get(node).unwrap())
+            self.body.note_expr_operand(node, sema_ty, self.operand_recorded_type(op))
+        op
+
+    mut fn lower_expr_node(node: i32) -> i32:
         if node == 0:
             return self.unit_operand()
 
@@ -15874,13 +15907,24 @@ impl MirBuilder:
         if kind == NodeKind.NK_FIELD_ACCESS:
             let fa_base = self.ast.get_data0(node)
             let fa_field = self.ast.get_data1(node)
-            // Distinct type .value access: transparent (no-op)
+            // Distinct type .value access (its one field): transparent. Only
+            // a struct's d0 is its name: a pointer's is its pointee's TypeId,
+            // which matched a distinct's name symbol once the compiler had
+            // TotalF64 (`cases.state.has_default` lowered as `cases.state`).
             let fa_base_type = self.expr_type(fa_base)
             if fa_base_type > 0:
                 let fa_base_resolved = self.sema.resolve_alias(fa_base_type)
-                let fa_base_sym = self.sema.get_type_d0(fa_base_resolved)
+                let fa_base_sym = if self.sema.get_type_kind(fa_base_resolved) == TypeKind.TY_STRUCT: self.sema.get_type_d0(fa_base_resolved) else: 0
                 if fa_base_sym > 0 and self.sema.distinct_type_names.contains(fa_base_sym):
-                    return self.lower_expr(fa_base)
+                    // The same bytes, with Sema's type for `.value` (the inner
+                    // type): a consumer that reads the operand's type (an
+                    // f-string's formatter) must see `f64`, not the wrapper.
+                    let fa_inner_ty = self.expr_type(node)
+                    let fa_value = self.lower_expr(fa_base)
+                    if fa_inner_ty == 0 or fa_inner_ty == fa_base_type:
+                        return fa_value
+                    let fa_place = self.materialize_operand(fa_value, fa_inner_ty, self.ast.get_start(node))
+                    return self.operand_for_place(fa_place, fa_inner_ty)
             // Enum variant access: Color.Red → discriminant value constant
             if self.ast.kind(fa_base) == NodeKind.NK_IDENT:
                 let fa_base_ast_sym = self.ast.get_data0(fa_base)
@@ -16292,9 +16336,14 @@ impl MirBuilder:
                 let dt_args_start = self.ast.get_data1(node)
                 if self.ast.get_data2(node) != 1:
                     sema_phase_bug(f"BUG: Sema accepted a distinct type constructor without exactly one argument: node={node}")
-                // Transparent: distinct types have same LLVM type as inner,
-                // so the constructor is just the inner value itself
-                return self.lower_expr(self.ast.get_extra(dt_args_start))
+                // The inner value's bytes, with the wrapper's type (D65: the
+                // operand has Sema's type for the call). Returned bare, a
+                // folded `TotalF64(1.0)` was an `f64` constant, and codegen
+                // compared floats where the wrapper compares by its key.
+                let dt_inner = self.lower_expr(self.ast.get_extra(dt_args_start))
+                let dt_ty = self.expr_type(node)
+                let dt_place = self.materialize_operand(dt_inner, dt_ty, self.ast.get_start(node))
+                return self.operand_for_place(dt_place, dt_ty)
             // Callable type syntax: TypeName(args) → the `TypeName.new` Sema resolved
             if self.ast.kind(callee) == NodeKind.NK_IDENT and callee_kind == CallCalleeKind.TypeConstructor:
                 let ct_sema_sym: i32 = self.sema.type_ctor_call_syms.get(node) ?? 0

@@ -1729,9 +1729,7 @@ impl Codegen:
                 materialize_ty = self.mir_sema_type_to_llvm(const_sema_ty)
         let fallback_ty = if materialize_ty != 0: materialize_ty else: wl_i32_type(self.context)
         if const_id < 0 or const_id >= body.const_kinds.len() as i32:
-            if self.debug_fallback_enabled():
-                with_eprint(f"warning: [fallback] mir_const_value: invalid const_id={const_id}")
-            return wl_get_undef(fallback_ty)
+            return self.mir_bug_undef(f"MIR constant id {const_id} is out of range", fallback_ty)
 
         let ck = body.const_kinds[const_id]
         let cd = body.const_d0[const_id]
@@ -1831,8 +1829,7 @@ impl Codegen:
             // so gen_closure can find captured variables and their types.
             let closure_node = cd
             if closure_node <= 0 or closure_node >= self.pool.node_count():
-                with_eprint(f"warning: [ck-closure] invalid node={closure_node}")
-                return wl_get_undef(fallback_ty)
+                return self.mir_bug_undef(f"closure constant {const_id} names no node ({closure_node})", fallback_ty)
             for li in 0..body.local_count():
                 let name_sym = body.local_names[li]
                 if name_sym != 0:
@@ -1854,7 +1851,7 @@ impl Codegen:
             // Same preamble as CK_CLOSURE: populate local_allocas/local_types from MIR locals
             let ab_node = cd
             if ab_node <= 0 or ab_node >= self.pool.node_count():
-                return wl_get_undef(fallback_ty)
+                return self.mir_bug_undef(f"async-block constant {const_id} names no node ({ab_node})", fallback_ty)
             for ab_li in 0..body.local_count():
                 let ab_name_sym = body.local_names[ab_li]
                 if ab_name_sym != 0:
@@ -1917,20 +1914,18 @@ impl Codegen:
             // here compiled and jumped into garbage at run time; it is a BUG.
             sema_phase_bug(f"BUG: function constant names no function: sym={fn_sym} name={fn_name} (not in fn_values or the LLVM module)")
 
-        wl_get_undef(fallback_ty)
+        self.mir_bug_undef(f"MIR constant {const_id} of kind {ck} has no lowering", fallback_ty)
 
     mut fn mir_eval_operand(body: &MirBody, operand_id: i32, expected_ty: i64) -> i64:
         let fallback_ty = if expected_ty != 0: expected_ty else: wl_i32_type(self.context)
         if operand_id < 0 or operand_id >= body.operand_kinds.len() as i32:
-            if self.debug_fallback_enabled():
-                with_eprint(f"warning: [fallback] mir_eval_operand: invalid operand_id={operand_id}")
-            return wl_get_undef(fallback_ty)
+            return self.mir_bug_undef(f"MIR operand id {operand_id} is out of range", fallback_ty)
 
         let ok = body.operand_kinds[operand_id]
         let od = body.operand_d0[operand_id]
         if ok == OperandKind.OK_COPY or ok == OperandKind.OK_MOVE:
             if od < 0 or od >= body.place_locals.len() as i32:
-                return wl_get_undef(fallback_ty)
+                return self.mir_bug_undef(f"operand {operand_id} names place {od}, out of range", fallback_ty)
             let local_id = body.place_locals[od]
             if body.place_proj_counts[od] == 0:
                 let value_opt = self.mir_local_values.get(local_id)
@@ -1952,7 +1947,7 @@ impl Codegen:
                     if sema_llvm_ty != 0:
                         ptr = self.mir_place_ptr(body, od, true, sema_llvm_ty)
             if ptr == 0:
-                return wl_get_undef(fallback_ty)
+                return self.mir_bug_undef(f"operand {operand_id}: place {od} has no address", fallback_ty)
             var ptr_ty: i64 = 0
             let p_count = body.place_proj_counts[od]
             if p_count > 0:
@@ -1968,7 +1963,7 @@ impl Codegen:
                 if sema_ty > 0:
                     ptr_ty = self.mir_sema_type_to_llvm(sema_ty)
             if ptr_ty == 0:
-                return wl_get_undef(fallback_ty)
+                return self.mir_bug_undef(f"operand {operand_id}: place {od} has no type", fallback_ty)
             // An unprojected local FnAbi passes by address (an indirect local)
             // is read through the address its slot holds. Decided before the
             // bitpacked view below: that one applies to projected places only.
@@ -2038,7 +2033,7 @@ impl Codegen:
         if ok == OperandKind.OK_CONSTANT:
             return self.mir_const_value(body, od, expected_ty)
 
-        wl_get_undef(fallback_ty)
+        self.mir_bug_undef(f"MIR operand {operand_id} of kind {ok} has no lowering", fallback_ty)
 
     mut fn mir_operand_is_unsigned(body: &MirBody, operand_id: i32) -> bool:
         if operand_id < 0 or operand_id >= body.operand_kinds.len() as i32:
@@ -2312,6 +2307,18 @@ impl Codegen:
         self.compare_str_order(lhs_cmp, rhs_cmp, op)
 
     mut fn mir_build_eq_from_sema(op: i32, lhs: i64, rhs: i64, lhs_sema: i32, rhs_sema: i32) -> i64:
+        // §11.7 (D96): a type with a key projection is equal where its keys
+        // are, whatever represents it (a distinct float: TotalF64, D97).
+        let keyed_live = self.mir_eq_live_type(lhs_sema)
+        if self.sema.concrete_key_sigs.contains(keyed_live) and keyed_live == self.mir_eq_live_type(rhs_sema) and wl_type_of(lhs) == wl_type_of(rhs):
+            let keyed_ty = wl_type_of(lhs)
+            let lhs_keyed = self.create_entry_alloca(keyed_ty)
+            let rhs_keyed = self.create_entry_alloca(keyed_ty)
+            wl_build_store(self.builder, lhs, lhs_keyed)
+            wl_build_store(self.builder, rhs, rhs_keyed)
+            self.binop_route = "key-projection"
+            let keyed_equal = self.mir_emit_eq_ptrs(lhs_keyed, rhs_keyed, keyed_ty, lhs_sema)
+            return if op == BinaryOp.OP_EQ: keyed_equal else: wl_build_not(self.builder, keyed_equal)
         let lhs_kind = self.mir_compare_dispatch_kind(lhs_sema)
         let rhs_kind = self.mir_compare_dispatch_kind(rhs_sema)
         if lhs_kind == 0 or rhs_kind == 0 or lhs_kind != rhs_kind:
@@ -2325,12 +2332,14 @@ impl Codegen:
             return 0
 
         if lhs_kind == 1 and self.is_str_type(lhs_ty):
+            self.binop_route = "str-view"
             return self.compare_str_eq(lhs_cmp, rhs_cmp, op)
 
         if lhs_kind == 2:
             // #2137: an aggregate compares as its With type says — field by
             // field, element by element, variant by variant, a part with an
             // `eq` by that method — never as the bytes of its representation.
+            self.binop_route = "structural"
             let lhs_slot = self.create_entry_alloca(lhs_ty)
             let rhs_slot = self.create_entry_alloca(lhs_ty)
             wl_build_store(self.builder, lhs_cmp, lhs_slot)
@@ -2350,6 +2359,7 @@ impl Codegen:
                 if self.mir_compare_dispatch_kind(pointee) == 2:
                     let pointee_ty = self.mir_sema_type_to_llvm(pointee)
                     if pointee_ty != 0:
+                        self.binop_route = "view-pointee"
                         let equal = self.mir_emit_eq_ptrs(lhs_cmp, rhs_cmp, pointee_ty, pointee)
                         if op == BinaryOp.OP_EQ:
                             return equal
@@ -2376,6 +2386,8 @@ impl Codegen:
         if key_sig >= 0 and key_sym != 0:
             let concrete = self.ensure_concrete_mir_function(0, key_sig, key_sym, 0, "Key.key")
             if concrete.sym == 0:
+                with_eprint("error: internal compiler error: a key projection Sema recorded has no function to call")
+                self.had_error = 1
                 return wl_get_undef(wl_i1_type(self.context))
             let key_ret = self.sema.sig_return_type(key_sig)
             let left_args: Vec[i64] = [lp]
@@ -3201,19 +3213,40 @@ impl Codegen:
         wl_position_at_end(self.builder, ok_bb)
         self.mir_build_raw_int_bin_op(op, l, r, false)
 
+    // An `operator` fact (analyze): the route mir_build_bin_op took for one
+    // binary operator, with the operand types it saw (Sema's and LLVM's) and
+    // the statement's source offset. `select:stage=codegen,kind=operator`.
+    mut fn record_operator_fact(body: &MirBody, rval_id: i32, op: i32, lhs_sema: i32, rhs_sema: i32, lhs: i64, rhs: i64):
+        var fact = AnalysisFact.new(AnalysisStage.Codegen, AnalysisFactKind.Operator)
+        fact.id = rval_id
+        fact.body_sym = body.fn_sym
+        fact.index = op
+        fact.type_id = lhs_sema
+        fact.start = self.cur_stmt_span
+        fact.name = mir_binop_name(op)
+        let lhs_name = if lhs_sema > 0: self.sema.type_name(lhs_sema) else: "?"
+        let rhs_name = if rhs_sema > 0: self.sema.type_name(rhs_sema) else: "?"
+        // `key:value` words: a query splits on `=`, so `detail~fn:main` and
+        // `detail~route:float` select.
+        fact.detail = f"route:{self.binop_route} fn:{self.sema.pool_resolve(body.fn_sym)} span:{self.cur_stmt_span} lhs:{lhs_name} rhs:{rhs_name} llvm-lhs-kind:{wl_get_type_kind(wl_type_of(lhs))} llvm-rhs-kind:{wl_get_type_kind(wl_type_of(rhs))}"
+        self.analysis_add(move fact)
+
     mut fn mir_build_bin_op(op: i32, lhs: i64, rhs: i64, is_unsigned: bool, lhs_sema: i32, rhs_sema: i32) -> i64:
         let lk = wl_get_type_kind(wl_type_of(lhs))
         let rk = wl_get_type_kind(wl_type_of(rhs))
+        self.binop_route = "int"
 
         // Pointer arithmetic: ptr +/- int → GEP
         if lk == wl_pointer_type_kind() and rk == wl_integer_type_kind():
             if op == BinaryOp.OP_ADD or op == BinaryOp.OP_SUB:
+                self.binop_route = "pointer-arith"
                 let idx_val = if op == BinaryOp.OP_SUB: wl_build_neg(self.builder, rhs) else: rhs
                 let indices: Vec[i64] = Vec.new()
                 indices.push(idx_val)
                 return wl_build_gep(self.builder, wl_i8_type(self.context), lhs, vec_data_i64(&indices), 1)
 
         if self.is_str_type(wl_type_of(lhs)) and self.is_str_type(wl_type_of(rhs)):
+            self.binop_route = "str"
             if op == BinaryOp.OP_EQ or op == BinaryOp.OP_NEQ:
                 return self.compare_str_eq(lhs, rhs, op)
             if op == BinaryOp.OP_LT or op == BinaryOp.OP_GT or op == BinaryOp.OP_LTE or op == BinaryOp.OP_GTE:
@@ -3222,6 +3255,7 @@ impl Codegen:
         if op == BinaryOp.OP_LT or op == BinaryOp.OP_GT or op == BinaryOp.OP_LTE or op == BinaryOp.OP_GTE:
             let sema_ord = self.mir_build_str_order_from_sema(op, lhs, rhs, lhs_sema, rhs_sema)
             if sema_ord != 0:
+                self.binop_route = "str-order"
                 return sema_ord
 
         if op == BinaryOp.OP_EQ or op == BinaryOp.OP_NEQ:
@@ -3229,16 +3263,19 @@ impl Codegen:
             if sema_cmp != 0:
                 return sema_cmp
             if lk == wl_pointer_type_kind() and rk == wl_integer_type_kind():
+                self.binop_route = "pointer-null"
                 if self.is_const_int_value(rhs) and wl_const_int_sext_val(rhs) == 0:
                     let cmp_rhs = wl_const_null(wl_type_of(lhs))
                     return wl_build_icmp(self.builder, if op == BinaryOp.OP_EQ: wl_int_eq() else: wl_int_ne(), lhs, cmp_rhs)
             if rk == wl_pointer_type_kind() and lk == wl_integer_type_kind():
+                self.binop_route = "pointer-null"
                 if self.is_const_int_value(lhs) and wl_const_int_sext_val(lhs) == 0:
                     let cmp_lhs = wl_const_null(wl_type_of(rhs))
                     return wl_build_icmp(self.builder, if op == BinaryOp.OP_EQ: wl_int_eq() else: wl_int_ne(), cmp_lhs, rhs)
 
         let pointer_compare = op == BinaryOp.OP_EQ or op == BinaryOp.OP_NEQ or op == BinaryOp.OP_LT or op == BinaryOp.OP_GT or op == BinaryOp.OP_LTE or op == BinaryOp.OP_GTE
         if pointer_compare and lk == wl_pointer_type_kind() and rk == wl_pointer_type_kind() and self.mir_sema_type_is_raw_pointer_or_ref(lhs_sema) and self.mir_sema_type_is_raw_pointer_or_ref(rhs_sema):
+            self.binop_route = "pointer-address"
             let i64_ty = wl_i64_type(self.context)
             let l_addr = wl_build_ptr_to_int(self.builder, lhs, i64_ty)
             let r_addr = wl_build_ptr_to_int(self.builder, rhs, i64_ty)
@@ -3251,6 +3288,7 @@ impl Codegen:
 
         let is_float = lk == wl_float_type_kind() or lk == wl_double_type_kind() or rk == wl_float_type_kind() or rk == wl_double_type_kind()
         if is_float:
+            self.binop_route = "float"
             let common_float_ty =
                 if lk == wl_double_type_kind() or rk == wl_double_type_kind():
                     wl_f64_type(self.context)
@@ -3269,6 +3307,8 @@ impl Codegen:
             if op == BinaryOp.OP_GT: return wl_build_fcmp(self.builder, wl_real_ogt(), lhs_float, rhs_float)
             if op == BinaryOp.OP_LTE: return wl_build_fcmp(self.builder, wl_real_ole(), lhs_float, rhs_float)
             if op == BinaryOp.OP_GTE: return wl_build_fcmp(self.builder, wl_real_oge(), lhs_float, rhs_float)
+            with_eprint("error: internal compiler error: float operator '" ++ mir_binop_name(op) ++ "' reached LLVM codegen with no lowering")
+            self.had_error = 1
             return wl_get_undef(wl_i32_type(self.context))
 
         if op == BinaryOp.OP_EQ or op == BinaryOp.OP_NEQ:
@@ -3277,9 +3317,11 @@ impl Codegen:
             if lhs_ty == rhs_ty:
                 let cmp_kind = wl_get_type_kind(lhs_ty)
                 if cmp_kind == wl_struct_type_kind() or cmp_kind == wl_array_type_kind():
+                    self.binop_route = "aggregate-bytes"
                     return self.compare_aggregate_eq(lhs, rhs, op)
 
         if op == BinaryOp.OP_SHL or op == BinaryOp.OP_SHR:
+            self.binop_route = "shift"
             return self.mir_build_total_shift(op, lhs, rhs, is_unsigned)
 
         // Coerce both operands to the wider integer type (never truncate)
@@ -3340,6 +3382,7 @@ impl Codegen:
         // pointer — same view read as comparisons (#293). Under #747 a borrowed
         // param concatenated its POINTER bytes as a header (garbage output).
         if op == BinaryOp.OP_CONCAT:
+            self.binop_route = "concat"
             let cc_lhs = self.mir_coerce_compare_operand(lhs, lhs_sema)
             let cc_rhs = self.mir_coerce_compare_operand(rhs, rhs_sema)
             return self.mir_str_concat(cc_lhs, cc_rhs)
@@ -4379,9 +4422,7 @@ impl Codegen:
     mut fn mir_eval_rvalue(body: &MirBody, rval_id: i32, dest_ty: i64, dest_sema_ty: i32) -> i64:
         let fallback_ty = if dest_ty != 0: dest_ty else: wl_i32_type(self.context)
         if rval_id < 0 or rval_id >= body.rval_kinds.len() as i32:
-            if self.debug_fallback_enabled():
-                with_eprint(f"warning: [fallback] mir_eval_rvalue: invalid rval_id={rval_id}")
-            return wl_get_undef(fallback_ty)
+            return self.mir_bug_undef(f"MIR rvalue id {rval_id} is out of range", fallback_ty)
 
         let rk = body.rval_kinds[rval_id]
         let d0 = body.rval_d0[rval_id]
@@ -4435,6 +4476,7 @@ impl Codegen:
                     return wl_build_gep(self.builder, if elem_ty != 0: elem_ty else: wl_i8_type(self.context), rhs, vec_data_i64(&indices), 1)
             let is_unsigned = self.mir_operand_is_unsigned(body, d1)
             let out = self.mir_build_bin_op(d0, lhs, rhs, is_unsigned, lhs_sema, rhs_sema)
+            if self.analysis_enabled != 0: self.record_operator_fact(body, rval_id, d0, lhs_sema, rhs_sema, lhs, rhs)
             if d0 == BinaryOp.OP_CONCAT:
                 return out
             if dest_ty != 0:
@@ -4481,7 +4523,7 @@ impl Codegen:
         if rk == RvalueKind.RK_REF:
             var ptr = self.mir_place_ptr(body, d1, false, 0)
             if ptr == 0:
-                return wl_get_undef(fallback_ty)
+                return self.mir_bug_undef(f"reference rvalue {rval_id}: place {d1} has no address", fallback_ty)
             ptr = self.mir_ref_through_indirect_base(body, d1, ptr)
             let dyn_ref = self.mir_build_dyn_trait_value_from_ref_place(body, d1, ptr, dest_ty, dest_sema_ty)
             if wl_type_of(dyn_ref) == dest_ty:
@@ -4499,7 +4541,7 @@ impl Codegen:
         if rk == RvalueKind.RK_ADDR_OF:
             var ptr = self.mir_place_ptr(body, d0, false, 0)
             if ptr == 0:
-                return wl_get_undef(fallback_ty)
+                return self.mir_bug_undef(f"address-of rvalue {rval_id}: place {d0} has no address", fallback_ty)
             ptr = self.mir_ref_through_indirect_base(body, d0, ptr)
             if dest_ty != 0 and wl_type_of(ptr) != dest_ty and wl_get_type_kind(dest_ty) == wl_pointer_type_kind():
                 return wl_build_bitcast(self.builder, ptr, dest_ty)
@@ -4742,7 +4784,7 @@ impl Codegen:
                         wl_build_store(self.builder, coerced_val, gep)
                 self.mir_store_liveness_byte(struct_ty, alloca)
                 return wl_build_load(self.builder, struct_ty, alloca)
-            return wl_get_undef(fallback_ty)
+            return self.mir_bug_undef(f"aggregate rvalue {rval_id} names field list {agg_fields_id}, out of range", fallback_ty)
 
         if rk == RvalueKind.RK_CAST:
             // §4.3d: a lane-wise conversion between vectors.
@@ -4905,7 +4947,7 @@ impl Codegen:
         if rk == RvalueKind.RK_SLICE:
             let base_ptr = self.mir_place_ptr(body, d0, false, 0)
             if base_ptr == 0:
-                return wl_get_undef(fallback_ty)
+                return self.mir_bug_undef(f"slice rvalue {rval_id}: place {d0} has no address", fallback_ty)
             var base_ty = self.mir_place_projected_type(body, d0)
             if base_ty == 0:
                 let base_local = body.place_locals[d0]
@@ -5000,7 +5042,7 @@ impl Codegen:
                         wl_build_store(self.builder, af_coerced, af_gep)
                 return wl_build_load(self.builder, af_ty, af_alloca)
 
-        wl_get_undef(fallback_ty)
+        self.mir_bug_undef(f"MIR rvalue {rval_id} of kind {rk} has no lowering", fallback_ty)
 
     mut fn mir_emit_drop_fields_ptr(ptr: i64, ty: i64, owner_sym: i32, owner_sema_ty: i32) -> Unit:
         if ptr == 0 or ty == 0:
@@ -9745,6 +9787,22 @@ impl Codegen:
                 let dest_sema = self.mir_intrinsic_dest_sema_type(body, dest_place)
                 let dest_is_view = dest_sema > 0 and self.mir_type_kind_at(self.mir_resolve_alias_at(dest_sema)) == TypeKind.TY_REF
                 result = if dest_is_view: self.mir_ref_from_slot_ptr(slot_ptr, dest_sema) else: wl_build_load(self.builder, self.mir_dest_llvm_type(body, dest_place), slot_ptr)
+
+        else if intrinsic == MirIntrinsic.MAP_TAKE_AT:
+            // D44: a consuming traversal moves entry `slot` into its (K, V)
+            // result; the runtime marks the entry dead without a drop.
+            let map_ptr = self.mir_intrinsic_map_handle(body, args_id)
+            let slot = self.coerce_int(self.mir_intrinsic_arg(body, args_id, 1), i64_ty)
+            let entry_ty = self.mir_dest_llvm_type(body, dest_place)
+            let entry = self.create_entry_alloca(entry_ty)
+            var take_fn = wl_get_named_function(self.llmod, "with_hashmap_take_at")
+            let take_params: Vec[i64] = [ptr_ty, i64_ty, ptr_ty, ptr_ty]
+            let take_ty = wl_function_type(i32_ty, vec_data_i64(&take_params), 4, 0)
+            if take_fn == 0:
+                take_fn = wl_add_function(self.llmod, "with_hashmap_take_at", take_ty)
+            let take_args: Vec[i64] = [map_ptr, slot, wl_build_struct_gep(self.builder, entry_ty, entry, 0), wl_build_struct_gep(self.builder, entry_ty, entry, 1)]
+            let _ = wl_build_call(self.builder, take_ty, take_fn, vec_data_i64(&take_args), 4)
+            result = wl_build_load(self.builder, entry_ty, entry)
 
         else if intrinsic == MirIntrinsic.MAP_LEN32 or intrinsic == MirIntrinsic.MAP_LEN64 or intrinsic == MirIntrinsic.MAP_ULEN32:
             let map_ptr = self.mir_intrinsic_map_handle(body, args_id)
@@ -17258,6 +17316,7 @@ impl Codegen:
             for si in 0..stmt_count:
                 let stmt_id = stmt_start + si
                 let stmt_span = body.stmt_spans[stmt_id]
+                self.cur_stmt_span = stmt_span
                 if self.debug_mir_codegen_enabled():
                     let stmt_kind = body.stmt_kinds[stmt_id]
                     let stmt_d0 = body.stmt_d0[stmt_id]

@@ -302,6 +302,39 @@ fn cli_value_or_prefix(argc: i32, flag: &str, prefix: &str) -> str:
         i = i + 1
     ""
 
+// Every flag the driver reads, for any command (#2198). A flag is known by
+// its name, the part before any `=`.
+fn cli_known_flags() -> Vec[str]:
+    ["--abi-sha", "--alloc", "--bundle-corpus", "--bundle-fingerprint", "--c-export-functions", "--c-export", "--c-sysroot", "--c-target", "--check", "--contains", "--convert-goto-to-structured", "--debug-alloc-filter", "--debug-alloc", "--deterministic", "--diff", "--dry-run", "--dump-abi", "--dump-ast", "--dump-async-mir", "--dump-drop-plan", "--dump-drop-state", "--dump-mir", "--dump-place-map", "--dump-project-info", "--dump-resolved", "--dump-tokens", "--dump-typed", "--emit-bundle-interface", "--emit-bundle-manifest", "--emit-c", "--emit-obj", "--exclude", "--exit-code", "--explain-mir-origin", "--explain", "--fail-fast", "--filter", "--force-reinstall", "--force", "--freestanding", "--from-source", "--generation", "--graph", "--help", "--ir-roundtrip", "--keep-binary", "--lib", "--link-bundle", "--link-object", "--migrate-one", "--name", "--no-c-export", "--no-deps", "--no-prelude", "--no-runtime", "--no-std", "--open", "--out", "--output", "--overflow", "--prefer-brace", "--prefer-colon", "--prefer-curly", "--prelude", "--quiet", "--release", "--runtime-generation", "--self-id", "--sema-body-order-reverse", "--shared-defs", "--shared-fragment", "--stats", "--strict-effects", "--target", "--test", "--trace-alloc", "--trace-cleanup-edge", "--trace-ownership", "--trace-place", "--validate-all", "--validate-ownership", "--verbose", "--version", "--width-slice", "-D", "-e", "-f", "-g0", "-h", "-I", "-include", "-l", "-n", "-o", "-O0", "-O1", "-O2", "-O3", "-p", "-q", "-v", "-w"]
+
+// The first argument that looks like a flag and names none the driver
+// knows, or "". A flag's value (`-o out`, `--target x`) is skipped.
+fn cli_unknown_flag(argc: i32) -> str:
+    let known = cli_known_flags()
+    var i = 2
+    while i < argc:
+        let arg = with_arg_at(i)
+        if arg == "--": return ""
+        if arg.len() > 1 and arg.starts_with("-") and not arg.starts_with("-I") and not arg.starts_with("-D") and not arg.starts_with("-l"):
+            let eq = arg.find("=")
+            let name = arg.slice(0, if eq > 0: eq else: arg.len())
+            if not known.contains(name): return arg.clone()
+        i = i + (if cli_option_takes_value(arg): 2 else: 1)
+    ""
+
+// The known flag sharing the longest prefix with `arg`, if that prefix is
+// most of it.
+fn cli_nearest_flag(arg: &str) -> str:
+    var best = ""
+    var best_len = 0
+    for flag in cli_known_flags():
+        var n = 0
+        while n < flag.len() and n < arg.len() and flag[n] == arg[n]: n = n + 1
+        if n > best_len:
+            best_len = n
+            best = flag.clone()
+    if best_len * 2 > arg.len(): best else: ""
+
 fn cli_option_takes_value(arg: &str) -> bool:
     arg == "-o" or arg == "--output" or arg == "--target" or
     arg == "--trace-place" or arg == "--explain-mir-origin" or
@@ -868,6 +901,17 @@ fn run_cli(full_argc: i32) -> i32:
             return 1
         print(tools_dir)
         return 0
+    // #2198: a flag `check`, `ir` or `run` does not know is an error. It
+    // used to be ignored, so a misspelled `--validate-al` (or the removed
+    // `--dump-drop-flags`) printed `ok` for a check that never ran.
+    let cli_cmd = cli_command(argc)
+    if cli_cmd == "check" or cli_cmd == "ir" or cli_cmd == "run":
+        let unknown = cli_unknown_flag(argc)
+        if unknown.len() > 0:
+            let near = cli_nearest_flag(unknown)
+            let hint = if near.len() > 0: f"; did you mean `{near}`?" else: ""
+            with_eprint(f"error: unknown option `{unknown}` for `with {cli_cmd}`{hint}")
+            return 2
     if cli_command(argc) == "__framework-stubs":
         let stub_args: Vec[str] = Vec.new()
         for i in 2..argc: stub_args.push(with_arg_at(i))
@@ -3333,6 +3377,32 @@ fn cli_fast_install_blessed(root: &str, target_name: &str) -> i32:
     if build_graph_install_path(f"[{target_name}]", compiler_path, data, dest, 0o755, "version") != 0:
         return 1
     with_write("[" ++ target_name ++ "] " ++ dest ++ " <- out/release/bin/with (" ++ verified_by ++ ")\n")
+    cli_install_compiler_dsym(root, target_name, dest)
+
+// The installed compiler's debug info: lldb on ~/.local/bin/with gets source
+// lines, arguments and dotted breakpoints only from a dSYM beside it. The
+// release link writes `with.unstamped.dSYM`; stamping patches bytes and
+// keeps the Mach-O UUID, so that dSYM is the stamped binary's. It installs
+// as `with.dSYM` with its DWARF file named after the binary, through a temp
+// sibling and a rename. An old one is removed first either way: a dSYM
+// left from an earlier install describes a different binary.
+fn cli_install_compiler_dsym(root: &str, target_name: &str, dest: &str) -> i32:
+    let dsym = dest ++ ".dSYM"
+    build_graph_rt_remove_tree(dsym)
+    let source = resolve_join(root, "out/release/bin/with.unstamped.dSYM/Contents")
+    let dwarf = with_fs_read_file(source ++ "/Resources/DWARF/with.unstamped")
+    if dwarf.len() == 0:
+        with_write(f"[{target_name}] no dSYM in out/release/bin (this SDK links no dsymutil): lldb on {dest} has symbols only, no source lines\n")
+        return 0
+    let tmp = dsym ++ f".install-tmp.{build_graph_rt_pid()}"
+    build_graph_rt_remove_tree(tmp)
+    let plist = with_fs_read_file(source ++ "/Info.plist")
+    let wrote = build_graph_rt_mkdir_p(tmp ++ "/Contents/Resources/DWARF") == 0 and build_graph_rt_write_file(tmp ++ "/Contents/Info.plist", plist) == 0 and build_graph_rt_write_file(tmp ++ "/Contents/Resources/DWARF/with", dwarf) == 0
+    if not wrote or build_graph_rt_rename_file(tmp, dsym) != 0:
+        build_graph_rt_remove_tree(tmp)
+        with_eprint(f"[{target_name}] error: could not install {dsym}")
+        return 1
+    with_write(f"[{target_name}] {dsym} <- out/release/bin/with.unstamped.dSYM\n")
     0
 
 fn run_build_command(options: BuildCommandOptions, graph_options: &BuildGraphCommandOptions) -> i32:

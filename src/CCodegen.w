@@ -3303,6 +3303,11 @@ impl CCodegen:
                     current_tid = 0
                     continue
                 let field_name = cc_intern_resolve(self.intern, pd)
+                // A distinct type is its inner type in C (`typedef double
+                // TotalF64`): `.value` is the same object, no member.
+                if tk == TypeKind.TY_STRUCT and field_name == "value" and self.type_is_distinct(resolved as i32) != 0:
+                    current_tid = self.struct_field_tid(resolved as i32, pd)
+                    continue
                 out = out ++ "." ++ field_name
                 if tk == TypeKind.TY_STRUCT:
                     let ft_raw = self.struct_field_tid(resolved as i32, pd)
@@ -6632,7 +6637,7 @@ fn cc_builtin_from_mir_intrinsic(intrinsic: MirIntrinsic) -> CcBuiltin:
     if intrinsic == MirIntrinsic.MAP_INCREMENT: return CcBuiltin.MAP_INCREMENT
     if intrinsic == MirIntrinsic.MAP_DECREMENT: return CcBuiltin.MAP_DECREMENT
     if intrinsic == MirIntrinsic.MAP_UPDATE: return CcBuiltin.MAP_UPDATE
-    if intrinsic == MirIntrinsic.MAP_CAPACITY or intrinsic == MirIntrinsic.MAP_SLOT_OCCUPIED or intrinsic == MirIntrinsic.MAP_KEY_AT or intrinsic == MirIntrinsic.MAP_VALUE_AT: return CcBuiltin.MAP_SLOT_WALK
+    if intrinsic == MirIntrinsic.MAP_CAPACITY or intrinsic == MirIntrinsic.MAP_SLOT_OCCUPIED or intrinsic == MirIntrinsic.MAP_KEY_AT or intrinsic == MirIntrinsic.MAP_VALUE_AT or intrinsic == MirIntrinsic.MAP_TAKE_AT: return CcBuiltin.MAP_SLOT_WALK
     if intrinsic == MirIntrinsic.VEC_MAP: return CcBuiltin.VEC_MAP
     if intrinsic == MirIntrinsic.VEC_FILTER: return CcBuiltin.VEC_FILTER
     if intrinsic == MirIntrinsic.VEC_FOLD: return CcBuiltin.VEC_FOLD
@@ -7539,6 +7544,14 @@ impl CCodegen:
                 self.fail("emit-c: a map slot access expects the map and a slot index")
                 return "    abort();"
             let slot = "(int64_t)(" ++ self.operand_text(body, self.call_arg_operand(body, args_id, 1)) ++ ")"
+            // D44: a consuming traversal moves the entry into its (K, V)
+            // destination; the runtime marks it dead without a drop.
+            if intrinsic == MirIntrinsic.MAP_TAKE_AT:
+                if has_ret == 0:
+                    self.fail("emit-c: a map entry is taken into a destination")
+                    return "    abort();"
+                let entry = self.place_text(body, dest_place)
+                return "    (void)with_hashmap_take_at(" ++ map_ptr ++ ", " ++ slot ++ ", (void*)&(" ++ entry ++ ").field0, (void*)&(" ++ entry ++ ").field1);\n" ++ f"    goto bb{next_bb};"
             if intrinsic == MirIntrinsic.MAP_SLOT_OCCUPIED:
                 value = "with_hashmap_slot_occupied(" ++ map_ptr ++ ", " ++ slot ++ ")"
             else:
@@ -7675,13 +7688,14 @@ impl CCodegen:
                 return "    abort();"
             let recv_ptr = self.vec_recv_ptr_text(body, args_id)
             let sep_op = self.call_arg_operand(body, args_id, 1)
+            // The separator is a `&str` view: the `{ptr, len}` value itself
+            // (#1810; with_runtime.h `with_str sep`), never its address.
             let sep = self.operand_text(body, sep_op)
-            let sep_ptr = self.call_arg_address_text(body, sep_op, sep)
             var out = ""
             if has_ret != 0:
-                out = out ++ "    " ++ self.place_text(body, dest_place) ++ " = with_vec_str_join(" ++ recv_ptr ++ ", " ++ sep_ptr ++ ");\n"
+                out = out ++ "    " ++ self.place_text(body, dest_place) ++ " = with_vec_str_join(" ++ recv_ptr ++ ", " ++ sep ++ ");\n"
             else:
-                out = out ++ "    (void)with_vec_str_join(" ++ recv_ptr ++ ", " ++ sep_ptr ++ ");\n"
+                out = out ++ "    (void)with_vec_str_join(" ++ recv_ptr ++ ", " ++ sep ++ ");\n"
             out = out ++ f"    goto bb{next_bb};"
             return out
 
@@ -9913,7 +9927,7 @@ impl CCodegen:
         name == "with_alloc" or name == "with_alloc_aligned" or name == "with_free" or name == "with_memcpy" or name == "with_memmove" or
         name == "with_memset" or name == "with_memcmp" or name == "with_hashmap_get_ptr" or
         name == "with_hashmap_capacity" or name == "with_hashmap_slot_occupied" or
-        name == "with_hashmap_key_ptr_at" or name == "with_hashmap_value_ptr_at" or
+        name == "with_hashmap_key_ptr_at" or name == "with_hashmap_value_ptr_at" or name == "with_hashmap_take_at" or
         name == "with_clock_nanos" or name == "with_nanosleep" or name == "with_sysinfo_os" or
         name == "with_sysinfo_arch" or name == "with_sysinfo_hostname" or name == "with_eprint" or
         name == "with_write" or name == "with_ewrite" or name == "with_panic" or name == "with_bool_to_str" or
@@ -10953,6 +10967,7 @@ impl CCodegen:
         out.write("extern int32_t with_hashmap_slot_occupied(uint8_t*, int64_t);\n")
         out.write("extern uint8_t* with_hashmap_key_ptr_at(uint8_t*, int64_t);\n")
         out.write("extern uint8_t* with_hashmap_value_ptr_at(uint8_t*, int64_t);\n")
+        out.write("extern int32_t with_hashmap_take_at(uint8_t*, int64_t, void*, void*);\n")
         out.write("extern int64_t with_clock_nanos(void);\n")
         out.write("extern int32_t with_nanosleep(int64_t);\n")
         out.write("extern with_str with_sysinfo_os(void);\n")

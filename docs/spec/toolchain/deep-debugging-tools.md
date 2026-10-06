@@ -14,17 +14,24 @@ tool; fix it or file it.
 
 ## Which binary
 
-`with` in the recipes is a compiler; pick the one the question needs.
+`with` in the recipes is a compiler; pick the one the question needs. Any
+of them refuses a flag it does not know on `check`, `ir` and `run`
+(`error: unknown option \`--x\` for \`with check\`; did you mean …`,
+exit 2, #2198): a misspelled or removed flag never reads as a clean run.
 
 - **`with` on PATH** (`~/.local/bin/with`, installed from main): every
-  dump, trace, `analyze`, `reduce` and allocator recipe. It carries no
-  debug info: lldb finds its functions only by regex
+  dump, trace, `analyze`, `reduce` and allocator recipe, and lldb on the
+  compiler when the bug is on main: `:install-user` installs
+  `~/.local/bin/with.dSYM` beside it (the release link's dSYM; stamping
+  keeps the Mach-O UUID), so dotted names resolve and frames show source
+  lines and parameters. An install from an SDK without dsymutil says so and
+  leaves no dSYM; then lldb finds functions only by regex
   (`breakpoint set -r 'Codegen\.marshal_mir_call_arg$'`; the symbol is
-  `__wcu$N$Codegen.marshal_mir_call_arg`), with no source lines and no
-  arguments.
+  `__wcu$N$Codegen.marshal_mir_call_arg`). `ls ~/.local/bin/with.dSYM`
+  answers which.
 - **`out/bootstrap/bin/with-stage1`** (after `with build :dev`; has a
   `.dSYM`): the compiler built from your tree. Use it for anything about
-  source you have changed, and for lldb on the compiler: dotted names
+  source you have changed, and for lldb on that compiler: dotted names
   resolve (`breakpoint set --name Codegen.marshal_mir_call_arg`) and frames
   show source lines and parameters.
 - **`out/stage/bin/with-stage2`** (after a full `with build`) and
@@ -123,7 +130,12 @@ bisect by neutralizing code: the #691 escalation cascade was one misattributed
 seed, a one-query answer with provenance.
 
 For a wrong view-origin verdict (a use-after-free accepted, a valid view
-refused), `WITH_DEBUG_BORROWS=1 with check repro.w` prints every view
+refused), start with `with analyze repro.w 'explain:origin:<fn>[:<binding>]'`
+(below): per parameter, whether a returned view comes from its own storage
+or only through what it views, and the node that first made it so; per
+view binding, its origins, storage origins and dependencies each time
+they were set. It runs on a program that fails to compile. Then
+`WITH_DEBUG_BORROWS=1 with check repro.w` prints every view
 binding with its dependency count and the borrow table at each read and
 mutation check: a binding whose dependency is itself, or a local where a
 parameter was expected, names the lost origin in one run (#2187).
@@ -142,6 +154,16 @@ gate (it must pass on the reduced repro before any build), `matrix` for the
 diverging layer, `lldb:<query>` for breakpoints from real facts, then lldb
 on the compiler branch. `--dump-abi` answers "is this parameter lowered
 consistently at caller and callee" — never infer that from MIR.
+
+When codegen picked the wrong formatter, comparison or ABI for a value (a
+`BUG: … no registered :? formatter`, floats compared where a key
+projection should be, a wrapper passed as its inner type), run
+`analyze repro.w audit:resolution` first: its operand-type check names the
+exact expression whose MIR operand has a type Sema did not give it, with
+both types, before any debugger session. Then
+`analyze repro.w 'select:kind=operator,detail~fn:<fn>'` shows how codegen
+lowered each binary operator in that function: the route it took and the
+operand types it saw (below).
 
 ### A hot loop reloads a struct's fields after every store
 
@@ -250,6 +272,40 @@ hand-built Sema answer) and `test/internals/mir_unknown_callee_test.w`
 and c_facade fixtures and on `build.w`. Phases 2–5 (codegen mode
 provenance, places and origins, effects, MirLower cleanup):
 `docs/spec/implementation/mir-sema-hardening.md`.
+
+**Operand types.** `audit:resolution` also judges every expression MIR
+lowers: the operand `MirBuilder.lower_expr` returns for a source node has
+the type Sema gave that node in this body's instance (MIR records the pair,
+`MirBody.expr_operand_*`; the operand's type is the place's recorded type,
+never re-derived). Sema's own adjustments are its type: a contextual copy
+is not judged, a splat or lane conversion (§4.3d) is judged against the
+adjusted type, and a pass-through form (grouping, a block, `comptime`,
+`unsafe`) is judged through its inner node. A violation reads
+`an expression lowered to an operand of another type (MIR M, Sema f64,
+node kind 27)` at the node's `path:line:column`. It would have caught both
+of D97's bugs before codegen: a distinct's `.value` lowered with the
+wrapper's type, and `TotalF64(1.0)` folded to a bare `f64` constant, so
+the f-string formatter and `==` read the wrong type. The note line
+`expression-operands judged=N disagree=0` reports the count.
+
+**Operator facts.** `select:kind=operator` (a `select` that names codegen
+facts runs the backend) lists one fact per binary operator codegen
+lowered, with `detail` in `key:value` words so a query can filter it
+(`detail~fn:main`, `detail~route:float`, `detail~lhs:TotalF64`):
+
+```
+route:key-projection fn:main span:429 lhs:TotalF64 rhs:TotalF64 llvm-lhs-kind:3 llvm-rhs-kind:3
+```
+
+`route` is the branch of `Codegen.mir_build_bin_op` that produced the
+instruction: `int`, `float`, `str`, `str-order`, `str-view`,
+`key-projection`, `structural`, `view-pointee`, `aggregate-bytes`,
+`pointer-arith`, `pointer-null`, `pointer-address`, `shift`, `concat`.
+`span` is the statement's source offset. "Why did these compare as
+floats" is `route:float` on a type with a key projection: one query, no
+trace print (D97's `TotalF64 ==` was exactly that). An operator spelled
+as a method (`<` through `cmp`) is a call and appears under
+`kind=codegen-argument` instead.
 
 `audit:all` is the proof gate before an expensive build. It validates MIR shape,
 types, and ownership; receiver declaration coverage and finalized contracts;
@@ -442,6 +498,33 @@ the 57-method escalation cascade in #691 was exactly one misattributed seed
 plus transitive root edges, a one-query answer with provenance and an
 afternoon of bisection without it. Also a semantic-snapshot request: works
 on erroring inputs.
+
+## View Origins
+
+`analyze <file> 'explain:origin:<fn>[:<binding>]'` prints what Sema recorded
+about the views of `<fn>` (a generic function by its plain name: every
+specialization matches), even when the check fails:
+
+```
+explain:origin at_match
+  at_match param[0]: a returned view may come from it, only through what it views (origins=[0] through=[0])
+    first view at repro.w:12 (node 579952)
+  binding `v` bind at repro.w:12: origins=[0] storage=[0] deps=[s]
+```
+
+Per parameter that a returned view may come from: whether from the
+parameter's own storage (the caller's argument must outlive the result) or
+only through what it views, and the node that first put it in the
+origins and in the storage set. Per view binding (`:<binding>` narrows to
+one name), a row each time its origins were set or merged: `bind` (a
+`let`, a pattern, a parameter alias), `store` (a view pushed into it),
+`loop` (a `for` binding); `origins` and `storage` are parameter indices,
+`deps` the locals it depends on. A binding whose `deps` names itself, a
+local where a parameter was expected, or a `first storage` row on a value
+that should only be viewed through, is where the origin went wrong. Sema
+records these as it checks (`Sema.view_fact_*`, `param_view_fact_*`); the
+binding table itself is gone once a body is checked, which is why this
+existed only as trace prints before (#2187's two-hour hunt).
 
 ## Repro Reduction
 
@@ -809,7 +892,7 @@ CLI dumps (`with check <file> <flag>`):
 | Flag | Prints |
 |---|---|
 | `--dump-tokens`, `--dump-ast`, `--dump-resolved`, `--dump-typed` | the lexer's tokens, the AST, resolution, and Sema's types per node |
-| `--dump-mir`, `--dump-async-mir` | the lowered MIR bodies (synchronous, and after the async transform) |
+| `--dump-mir`, `--dump-async-mir` | the lowered MIR bodies (synchronous, and after the async transform); also when the typed validator refused one (`internal compiler error: invalid MIR before codegen … in \`Type.fn\``): the ICE names the body, and `--dump-mir` / `--explain-mir-origin '<fn>:_N'` read the invalid statement |
 | `--dump-place-map`, `--dump-drop-state`, `--dump-drop-plan`, `--dump-abi` | see the drop-state view and `--dump-abi` above |
 | `--trace-place`, `--explain-mir-origin`, `--trace-ownership`, `--trace-cleanup-edge` | one place's history, where a MIR local came from, its ownership states, one CFG edge |
 | `--validate-ownership`, `--validate-all` | the MIR validators |
@@ -856,9 +939,20 @@ Environment switches (set on the compiler's run unless noted):
 | `WITH_TRACE_GRAPH=1` | build | the build graph as it materializes |
 | `WITH_MIGRATE_TRACE_PORT=1`, `WITH_MIGRATE_RAW_STATS=1`, `WITH_MIGRATE_TRACE_LIBC_CONSTANTS=1` | migrator | each ported declaration; raw-pointer statistics; each libc constant candidate and its value |
 
-`WITH_DEBUG_FALLBACK=1` prints a warning where codegen hits an invalid MIR
-id and emits `undef`. That a switch decides whether this is reported at all
-is a defect (#2199): the failure must always be loud.
+Codegen that meets MIR it cannot lower (an id out of range, a place with no
+address, a kind with no lowering, a noalias walk past a function's
+parameters) stops with ``error: code generation failed: BUG: <what> in
+`<function>` ``; there is no switch to turn it on (#2199 retired
+`WITH_DEBUG_FALLBACK`, which decided whether the `undef` it emitted was
+reported at all). The named function is where to start `--dump-mir`.
+
+The same holds for the typed MIR validator's ICE (`invalid MIR before
+codegen: … in \`CiGotoCfgContext.emit_switch_dispatch\``): the invalid
+module is kept for the dumps, so `--dump-mir` shows the refused statement
+(`_14 = copy _6.state`) and `--explain-mir-origin` its locals. A compiler
+that lowers its own source wrongly shows it as `check src/main.w` failing
+under stage1 while the build succeeded: the release binary is then built
+from invalid MIR, so reproduce with stage1, not the release binary.
 
 ## Verification Targets
 

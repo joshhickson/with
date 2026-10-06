@@ -7746,7 +7746,7 @@ impl Sema:
             if method_name == "remove": return MirIntrinsic.MAP_REMOVE
             if method_name == "clear": return MirIntrinsic.MAP_CLEAR
             let set_slot_intrinsic = mir_map_slot_intrinsic(method_name)
-            if set_slot_intrinsic != MirIntrinsic.NONE and set_slot_intrinsic != MirIntrinsic.MAP_VALUE_AT: return set_slot_intrinsic
+            if set_slot_intrinsic != MirIntrinsic.NONE and set_slot_intrinsic != MirIntrinsic.MAP_VALUE_AT and set_slot_intrinsic != MirIntrinsic.MAP_TAKE_AT: return set_slot_intrinsic
             return MirIntrinsic.NONE
         if type_name == "Option":
             if method_name == "is_some": return MirIntrinsic.OPT_IS_SOME
@@ -15778,6 +15778,7 @@ impl Sema:
         self.set_binding_view_deps(sym, param_mask, deps)
         self.set_binding_view_storage_mask(sym, self.compute_expr_storage_origin_mask(expr_node))
         self.register_view_binding_borrows(sym, expr_node)
+        self.note_view_fact(sym, expr_node, 1)
 
     // #1302 (§2.2, §9.7, D22/D27/D32): a pattern is structural projection, so a
     // match observes its subject unless an arm takes an owned value out of it —
@@ -17561,6 +17562,7 @@ impl Sema:
         if deps.len() == 0 and param_mask == 0:
             deps = self.push_unique_i32(move deps, self.place_root_sym(iterable))
         self.set_binding_view_deps(sym, param_mask, deps)
+        self.note_view_fact(sym, iterable, 3)
 
     // #1317 / §21.1 rule 1, §15.8, D44: the loop binding is a live view into
     // the iterated place for the whole loop (the compiler-inserted iterator
@@ -23212,7 +23214,7 @@ impl Sema:
             if field == self.syms.contains or field == self.syms.remove or self.is_collection_len_method(field):
                 return 1
             let set_slot = mir_map_slot_intrinsic(self.pool_resolve(field))
-            if set_slot != MirIntrinsic.NONE and set_slot != MirIntrinsic.MAP_VALUE_AT:
+            if set_slot != MirIntrinsic.NONE and set_slot != MirIntrinsic.MAP_VALUE_AT and set_slot != MirIntrinsic.MAP_TAKE_AT:
                 return 1
         if owner_sym == self.syms.slotmap:
             if field == self.syms.new or field == self.syms.insert or field == self.syms.get:
@@ -28025,7 +28027,7 @@ impl Sema:
         let part = (problem % 4294967296) as i32
         if problem / 4294967296 == 1:
             let what = if part == self.resolve_alias(tid as TypeId) as i32: "it is a float" else: f"it holds a `{self.type_name(part)}`"
-            self.emit_error_with_help(f"`{self.type_name(tid)}` cannot be a map key: {what}, and a NaN key is never found again (§11.7)", node, "key by a projection that is a key, such as `impl Key for T: fn key(): (self.x * 1000.0) as i64`")
+            self.emit_error_with_help(f"`{self.type_name(tid)}` cannot be a map key: {what}, and a NaN key is never found again (§11.7)", node, "wrap the float as `TotalF64(x)` (`use std.traits.TotalF64`), whose NaN equals NaN and whose -0.0 equals 0.0, or key by a projection that is a key")
             return
         self.emit_error_with_help(f"`{self.type_name(part)}` cannot be a map key: it defines its own `eq`, and a map hashes it by its parts, which that `eq` may not compare (§11.7)", node, f"state the part equality is about: `impl Key for {self.type_name(part)}: fn key(): ...`")
 
@@ -28834,7 +28836,7 @@ impl Sema:
 
     // D44: the slot walk a map's (or set's) traversal is written over in
     // std.collections: `slot_count()`, `slot_live(i)`, `slot_key(i) -> &K`,
-    // `slot_value(i) -> &V`. Positions run in insertion order (D96) and
+    // `slot_value(i) -> &V`, and the consuming `mut slot_take(i) -> (K, V)`. Positions run in insertion order (D96) and
     // include removed entries, so they are no API: only the standard
     // library calls them. A view's origin is the map. 0 when `name` is no
     // slot accessor.
@@ -28844,6 +28846,9 @@ impl Sema:
             self.emit_error(f"`{name}` walks a map's storage and is internal to std.collections; traverse with `iter()`, `keys()` or `values()` (§13.5)", node)
         if name == "slot_count": return self.ty_i64 as i32
         if name == "slot_live": return self.ty_bool as i32
+        if name == "slot_take":
+            let entry: Vec[i32] = [self.get_generic_inst_arg(recv_type, 0), self.get_generic_inst_arg(recv_type, 1)]
+            return self.ensure_tuple_type(entry, 2) as i32
         self.record_builtin_receiver_view_origins(node, expr)
         let elem = self.get_generic_inst_arg(recv_type, if name == "slot_key": 0 else: 1)
         self.ensure_exact_type(TypeKind.TY_REF, elem, 0, 0) as i32
@@ -30678,6 +30683,8 @@ impl Sema:
         if type_name_sym == self.syms.hashmap:
             if field == self.syms.insert or field == self.syms.remove or field == self.syms.clear:
                 return ReceiverMode.Mut
+            if self.pool_resolve(field) == "slot_take":
+                return ReceiverMode.Mut
             let method_name = self.pool_resolve(field)
             if method_name == "increment" or method_name == "decrement" or method_name == "update":
                 return ReceiverMode.Mut
@@ -31018,8 +31025,9 @@ impl Sema:
         let recv = if raw_recv != 0 and raw_recv != self.ty_void as i32: self.auto_deref_method_type_frozen(raw_recv as TypeId, field) as i32 else: raw_recv
         var intrinsic = self.builtin_method_intrinsic(recv, self.pool_resolve(field))
         let lowering = self.method_lowering_kind(raw_recv, recv, expr, field, arg_count, intrinsic)
-        // A map or set hashes and compares its key (#2180).
-        if recv > 0:
+        // A map or set hashes and compares its key (#2180); its slot walk
+        // (std.collections' traversals) does neither.
+        if recv > 0 and mir_map_slot_intrinsic(self.pool_resolve(field)) == MirIntrinsic.NONE:
             let map_ty = self.auto_deref_ref_ptr_type(self.resolve_alias(recv as TypeId)) as i32
             if self.get_type_kind(map_ty as TypeId) == TypeKind.TY_GENERIC_INST and self.get_generic_inst_arg_count(map_ty) >= 1:
                 let base = self.canonical_symbol_by_text(self.get_generic_inst_base(map_ty))
@@ -32531,7 +32539,7 @@ impl Sema:
                     return self.ty_void as i32
                 if field == self.syms.contains or field == self.syms.remove:
                     return self.ty_bool as i32
-                if mc_method_name_raw != "slot_value":
+                if mc_method_name_raw != "slot_value" and mc_method_name_raw != "slot_take":
                     let set_slot_ret = self.map_slot_accessor_type(recv_type, mc_method_name_raw, node, expr)
                     if set_slot_ret != 0:
                         return set_slot_ret

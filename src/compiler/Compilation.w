@@ -1806,7 +1806,7 @@ fn analysis_request_is_semantic_snapshot(request: &str) -> bool:
     if request.starts_with("select:kind=receiver") or request.starts_with("select:kind=effect-edge") or request.starts_with("select:kind=specialization"): return true
     if request.starts_with("select:kind=type") or request.starts_with("select:kind=field") or request.starts_with("select:kind=expression") or request.starts_with("select:kind=diagnostic"): return true
     if request.starts_with("select:kind=method-registration") or request.starts_with("select:kind=method-resolution"): return true
-    if request.starts_with("explain:effect:") or request.starts_with("explain:specialization:") or request.starts_with("explain:diagnostic:"): return true
+    if request.starts_with("explain:effect:") or request.starts_with("explain:origin:") or request.starts_with("explain:specialization:") or request.starts_with("explain:diagnostic:"): return true
     if request.starts_with("explain:type:") or request.starts_with("explain:field:") or request.starts_with("explain:expression:"): return true
     if request.starts_with("explain:method:") or request.starts_with("explain:resolution:"): return true
     request.starts_with("explain:node:")
@@ -2081,12 +2081,18 @@ impl Compilation:
         // compiler's; an invalid body is the compiler's bug, named as such.
         if mir_validation_has_error(mir_err):
             let diag_span = compilation_mir_error_span(self.zcu, active_pool, mir_err.fn_sym, mir_err.span)
-            sema.diags.emit(Diagnostic.err("internal compiler error: invalid MIR before codegen (a bug in the With compiler, not in this program): " ++ mir_err.message, diag_span))
+            // The body's name: the span of a synthesized statement can be the
+            // end of the file, which names no function.
+            let body_name = sema.safe_symbol_text(mir_err.fn_sym)
+            sema.diags.emit(Diagnostic.err("internal compiler error: invalid MIR before codegen (a bug in the With compiler, not in this program): " ++ mir_err.message ++ f" in `{body_name}`", diag_span))
             self.zcu.diagnostics = move sema.diags
             self.zcu.sync_from_sema(move sema)
             compilation_debug_pool_flow("run_mir_lower:after_sync", self.zcu.pool, active_pool, self.zcu.last_sema)
             self.zcu.render_all_diagnostics_frontend()
-            self.zcu.set_codegen_snapshot(MirModule.init(), "", AsyncMirModule.init(), "")
+            // The invalid module stays for the dumps (`--dump-mir`,
+            // `--trace-place`): the invalid body is what the hunt needs to
+            // read. Codegen refuses it (ensure_codegen_mir: errors).
+            self.zcu.set_codegen_snapshot(move mir_mod, "", AsyncMirModule.init(), "")
             return
         let t_async = profile_now()
         var _async_diags = move sema.diags
