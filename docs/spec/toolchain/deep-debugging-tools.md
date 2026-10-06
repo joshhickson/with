@@ -165,6 +165,58 @@ both types, before any debugger session. Then
 lowered each binary operator in that function: the route it took and the
 operand types it saw (below).
 
+### A wrong variant: the wrong arm, `unwrap` of a `Some` panics, `?` takes the error
+
+A variant read through the wrong tag or index. Measure which code assumed
+the representation instead of asking Sema, before reading any of it:
+
+1. **`WITH_DEBUG_PERMUTE_TAGS=1`** on the compile (`WITH_DEBUG_PERMUTE_TAGS=1
+   with-stage1 test test/behavior`). Every plain enum takes its tags in
+   reverse declaration order; meaning is unchanged, so a program that
+   differs from its normal run, or a typed-MIR ICE, is code that assumed a
+   tag ("`Some` is 0", "the tag is the index"). The failing tests name the
+   shapes; `--dump-mir` on one shows the switch value or downcast that
+   assumed. Its first corpus runs (2026-10-05, `test/behavior/*.w`) went
+   from 402 failures to 13 to the expected ones as each assumption was
+   fixed: MIR switches comparing a discriminant with an index (the success
+   switch, optional chains, `ControlFlow`), codegen's own tag table, Option
+   and Result tags built as indices, the niche's "null is 1". Two fixtures
+   differ under it by design, because they print the tag itself:
+   `behav_1770_payload_enum_as_int` (`r as i32`, §4.4a) and
+   `behav_comptime_type_info` (the reflected discriminant). Any other
+   difference is a bug.
+2. **`WITH_TRACE_VARIANT_FALLBACK=1`**: MirLower answering a variant lookup
+   from the variant's name alone because the type does not declare it
+   (`[variant-fallback] index of \`Some\` in type Result[…] fn \`total\``).
+   Any line is a type-blind answer: a `Result`'s `Some` took Option's index
+   and `?` treated `Err` as success (D97 reorder). Ask Sema's per-type
+   answer (`sema.enum_variant_index_for_type`) instead.
+3. The typed MIR validator's ICE names the body and the payload types
+   (`enum payload read declares ty=549 but the variant's payload is ty=554
+   in \`total\``); `--dump-mir` shows the `switchInt` value and the
+   `<as vN>` downcast it chose.
+
+### Run a corpus with the compiler you just built
+
+`out/bootstrap/bin/with-stage1 test test/behavior` (any files or
+directories) runs every fixture with its `//! expect-*` headers under
+stage1: the corpus check a change needs before the battery, without the
+release build `:behavior-tests` waits for. Add a debug switch in front
+(`WITH_DEBUG_PERMUTE_TAGS=1`) to run the whole corpus under it.
+
+Pass `test/behavior/*.w`, not the directory: `test/behavior/lib/` holds
+helper modules, which fail as tests. Set `WITH_TEST_COMPILER` to the same
+stage1 for the fixtures that spawn a compiler. Eight fixtures fail under
+any stage1 (main's too, measured 2026-10-05) and pass under the release
+binary: the comptime snapshot memory limit, the rt-in-unit check lane, the
+build-action and RSS-budget fixtures and the raw-pointer effect order
+(`behav_1944_comptime_snapshot_memory`, `behav_rt_in_unit_check_lane`,
+`behav_action_absolute_paths`, `behav_action_binary_read_errors_strict`,
+`behav_action_binary_read_errors_strict_read_binary`,
+`behav_1899_build_store_undeclared_read`, `behav_build_rss_budget`,
+`behav_sema_raw_pointer_effect_order`). Compare against main's stage1 in a
+worktree before calling one of yours.
+
 ### A hot loop reloads a struct's fields after every store
 
 The compiler's own optimized IR (`WITH_DUMP_LLIR_POST=1`) says why. Two
@@ -892,6 +944,8 @@ CLI dumps (`with check <file> <flag>`):
 | Flag | Prints |
 |---|---|
 | `--dump-tokens`, `--dump-ast`, `--dump-resolved`, `--dump-typed` | the lexer's tokens, the AST, resolution, and Sema's types per node |
+| `WITH_DEBUG_PERMUTE_TAGS=1` | compiler | plain enums get reversed tags, meaning unchanged: any behavior change is code that assumed a tag (route: a wrong variant) |
+| `WITH_TRACE_VARIANT_FALLBACK=1` | compiler | each variant lookup MirLower answered by name in a type that does not declare the variant |
 | `--dump-mir`, `--dump-async-mir` | the lowered MIR bodies (synchronous, and after the async transform); also when the typed validator refused one (`internal compiler error: invalid MIR before codegen … in \`Type.fn\``): the ICE names the body, and `--dump-mir` / `--explain-mir-origin '<fn>:_N'` read the invalid statement |
 | `--dump-place-map`, `--dump-drop-state`, `--dump-drop-plan`, `--dump-abi` | see the drop-state view and `--dump-abi` above |
 | `--trace-place`, `--explain-mir-origin`, `--trace-ownership`, `--trace-cleanup-edge` | one place's history, where a MIR local came from, its ownership states, one CFG edge |

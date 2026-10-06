@@ -2668,6 +2668,296 @@ impl Codegen:
         wl_build_br(self.builder, done_bb)
         wl_position_at_end(self.builder, done_bb)
 
+    // ── Ordering (§11.8, #2203) ─────────────────────────────────────────
+    // `<`, `<=`, `>`, `>=` on a tuple, an array, an enum, an Option or a
+    // Result: part by part, in order, the first part that differs decides;
+    // an enum by its variants' declaration order, then the payloads of the
+    // variant both hold (D97: `None` before any `Some`); a part with a `cmp`
+    // by that method. Each aggregate's walk is `__with_cmp_<type>(l, r) ->
+    // i32` (-1, 0, 1), declared before its body like the equality walk. A
+    // part with no order is a reported BUG, never an `icmp` on an aggregate.
+
+    mut fn mir_build_order_from_sema(op: i32, lhs: i64, rhs: i64, lhs_sema: i32, rhs_sema: i32) -> i64:
+        if self.mir_compare_dispatch_kind(lhs_sema) != 2 or self.mir_compare_dispatch_kind(rhs_sema) != 2:
+            return 0
+        let ty = wl_type_of(lhs)
+        if ty == 0 or ty != wl_type_of(rhs):
+            return 0
+        // A scalar representation (a distinct i32, a payload-free enum's
+        // integer) orders on the int and float paths; only an aggregate or
+        // the Option niche needs a walk.
+        let repr_kind = wl_get_type_kind(ty)
+        let resolved = self.mir_eq_live_type(lhs_sema)
+        let variant_count = self.mir_enum_variant_count(resolved)
+        if repr_kind == wl_integer_type_kind() and variant_count > 0:
+            // A payload-free enum orders by declaration, not by its tags'
+            // values (a repr enum's, or permuted ones).
+            self.binop_route = "enum-order"
+            let l_index = self.mir_enum_tag_index(lhs, resolved, variant_count)
+            let r_index = self.mir_enum_tag_index(rhs, resolved, variant_count)
+            let pred = if op == BinaryOp.OP_LT: wl_int_ult() else if op == BinaryOp.OP_GT: wl_int_ugt() else if op == BinaryOp.OP_LTE: wl_int_ule() else: wl_int_uge()
+            return wl_build_icmp(self.builder, pred, l_index, r_index)
+        if repr_kind != wl_struct_type_kind() and repr_kind != wl_array_type_kind() and repr_kind != wl_pointer_type_kind():
+            return 0
+        self.binop_route = "structural-order"
+        let lhs_slot = self.create_entry_alloca(ty)
+        let rhs_slot = self.create_entry_alloca(ty)
+        wl_build_store(self.builder, lhs, lhs_slot)
+        wl_build_store(self.builder, rhs, rhs_slot)
+        let order = self.mir_emit_cmp_ptrs(lhs_slot, rhs_slot, ty, lhs_sema)
+        let zero = wl_const_int(wl_i32_type(self.context), 0, 0)
+        let pred = if op == BinaryOp.OP_LT: wl_int_slt() else if op == BinaryOp.OP_GT: wl_int_sgt() else if op == BinaryOp.OP_LTE: wl_int_sle() else: wl_int_sge()
+        wl_build_icmp(self.builder, pred, order, zero)
+
+    // -1 where `lt`, 1 where `gt`, else 0.
+    fn mir_three_way(lt: i64, gt: i64) -> i64:
+        let i32_ty = wl_i32_type(self.context)
+        let greater = wl_build_select(self.builder, gt, wl_const_int(i32_ty, 1, 0), wl_const_int(i32_ty, 0, 0))
+        wl_build_select(self.builder, lt, wl_const_int(i32_ty, -1, 1), greater)
+
+    fn mir_cmp_fn_type() -> i64:
+        let params: Vec[i64] = [wl_ptr_type(self.context), wl_ptr_type(self.context)]
+        wl_function_type(wl_i32_type(self.context), vec_data_i64(&params), 2, 0)
+
+    // The order of the values of With type `sema_ty` at `lp` and `rp`, as an
+    // i32 (-1, 0, 1).
+    mut fn mir_emit_cmp_ptrs(lp: i64, rp: i64, ty: i64, sema_ty: i32) -> i64:
+        let resolved = self.mir_eq_live_type(sema_ty)
+        let tk = self.sema.get_type_kind(resolved as TypeId)
+        let i32_ty = wl_i32_type(self.context)
+        let cmp_sig: i32 = self.sema.concrete_cmp_sigs.get(resolved) ?? -1
+        let cmp_sym: i32 = self.sema.concrete_cmp_mono_syms.get(resolved) ?? 0
+        if cmp_sig >= 0 and cmp_sym != 0:
+            let concrete = self.ensure_concrete_mir_function(0, cmp_sig, cmp_sym, 0, "Ord.cmp")
+            if concrete.sym == 0:
+                return self.mir_bug_undef(f"the cmp Sema recorded for type {resolved} has no function", i32_ty)
+            let args: Vec[i64] = [lp, rp]
+            let ret = self.build_call_fn_value(concrete.sym, concrete.value, concrete.fn_type, -1, 0, args, 2, "structural order", 0)
+            return self.coerce_value_to_type(ret, i32_ty)
+        let observes_str = tk == TypeKind.TY_REF and self.sema.get_type_kind(self.sema.resolve_alias(self.sema.get_type_d0(resolved as TypeId) as TypeId)) == TypeKind.TY_STR
+        if tk == TypeKind.TY_STR or observes_str:
+            let lv = self.mir_coerce_compare_operand(wl_build_load(self.builder, ty, lp), resolved)
+            let rv = self.mir_coerce_compare_operand(wl_build_load(self.builder, ty, rp), resolved)
+            let fn_val = self.ensure_with_str_cmp_declared()
+            let fn_sym = self.intern.intern("with_str_cmp_ref")
+            let fn_ty = self.fn_fn_types.get(fn_sym).unwrap() as i64
+            let args: Vec[i64] = [self.str_view_arg(lv), self.str_view_arg(rv)]
+            let order = self.build_call_fn_value(fn_sym, fn_val, fn_ty, -1, 0, args, 2, "with_str_cmp_ref", 0)
+            let zero = wl_const_int(wl_type_of(order), 0, 0)
+            return self.mir_three_way(wl_build_icmp(self.builder, wl_int_slt(), order, zero), wl_build_icmp(self.builder, wl_int_sgt(), order, zero))
+        if tk == TypeKind.TY_REF:
+            let pointee = self.sema.get_type_d0(resolved as TypeId)
+            let pointee_ty = self.mir_sema_type_to_llvm(pointee)
+            if pointee_ty != 0 and wl_get_type_kind(ty) == wl_pointer_type_kind():
+                return self.mir_emit_cmp_ptrs(wl_build_load(self.builder, ty, lp), wl_build_load(self.builder, ty, rp), pointee_ty, pointee)
+        if tk == TypeKind.TY_INT or tk == TypeKind.TY_BOOL:
+            let lv = wl_build_load(self.builder, ty, lp)
+            let rv = wl_build_load(self.builder, ty, rp)
+            let unsigned = tk == TypeKind.TY_BOOL or self.mir_sema_type_is_unsigned(resolved)
+            return self.mir_three_way(wl_build_icmp(self.builder, if unsigned: wl_int_ult() else: wl_int_slt(), lv, rv), wl_build_icmp(self.builder, if unsigned: wl_int_ugt() else: wl_int_sgt(), lv, rv))
+        if tk == TypeKind.TY_FLOAT:
+            let lv = wl_build_load(self.builder, ty, lp)
+            let rv = wl_build_load(self.builder, ty, rp)
+            return self.mir_three_way(wl_build_fcmp(self.builder, wl_real_olt(), lv, rv), wl_build_fcmp(self.builder, wl_real_ogt(), lv, rv))
+        if tk == TypeKind.TY_STRUCT and self.sema.distinct_type_names.contains(self.sema.get_type_d0(resolved as TypeId)):
+            // §4.5: a distinct has its inner type's representation and order.
+            return self.mir_emit_cmp_ptrs(lp, rp, ty, self.sema.type_extra[(self.sema.get_type_d1(resolved as TypeId) + 1)])
+        if (tk == TypeKind.TY_TUPLE or tk == TypeKind.TY_ARRAY or tk == TypeKind.TY_STRUCT or tk == TypeKind.TY_ENUM or tk == TypeKind.TY_GENERIC_INST) and not self.mir_sema_type_is_std_vec(resolved):
+            let walk = self.mir_cmp_fn(resolved, ty)
+            if walk != 0:
+                let args: Vec[i64] = [lp, rp]
+                return wl_build_call(self.builder, self.mir_cmp_fn_type(), walk, vec_data_i64(&args), 2)
+        self.mir_bug_undef(f"`<` reached a part of type {self.sema.type_name(resolved)}, which has no order (§11.8)", i32_ty)
+
+    mut fn mir_cmp_fn(resolved: i32, ty: i64) -> i64:
+        if not self.mir_eq_type_has_walk(resolved, ty):
+            return 0
+        let fn_name = "__with_cmp_" ++ f"{resolved}"
+        let existing = wl_get_named_function(self.llmod, fn_name)
+        if existing != 0:
+            return existing
+        let walk = wl_add_function(self.llmod, fn_name, self.mir_cmp_fn_type())
+        wl_set_linkage(walk, wl_internal_linkage())
+        let saved_fn: i64 = self.current_function
+        let saved_fn_name_sym: i32 = self.current_function_name_sym
+        let saved_fn_node: i32 = self.current_function_node
+        let saved_ret_ty: i64 = self.current_ret_type
+        let saved_bb = wl_get_insert_block(self.builder)
+        self.current_function = walk
+        self.current_function_name_sym = 0
+        self.current_function_node = 0
+        self.current_ret_type = wl_i32_type(self.context)
+        let entry = wl_append_bb(self.context, walk, "entry")
+        let decided = wl_append_bb(self.context, walk, "decided")
+        wl_position_at_end(self.builder, entry)
+        let result_slot = self.create_entry_alloca(wl_i32_type(self.context))
+        wl_build_store(self.builder, wl_const_int(wl_i32_type(self.context), 0, 0), result_slot)
+        self.mir_emit_cmp_walk(wl_get_param(walk, 0), wl_get_param(walk, 1), ty, resolved, decided, result_slot)
+        wl_build_br(self.builder, decided)
+        wl_position_at_end(self.builder, decided)
+        let _ = wl_build_ret(self.builder, wl_build_load(self.builder, wl_i32_type(self.context), result_slot))
+        self.current_function = saved_fn
+        self.current_function_name_sym = saved_fn_name_sym
+        self.current_function_node = saved_fn_node
+        self.current_ret_type = saved_ret_ty
+        if saved_bb != 0:
+            wl_position_at_end(self.builder, saved_bb)
+        walk
+
+    // Continue only where `order` is 0; otherwise it is the walk's answer.
+    mut fn mir_cmp_require(order: i64, decided: i64, result_slot: i64):
+        wl_build_store(self.builder, order, result_slot)
+        let next = wl_append_bb(self.context, self.current_function, "cmp.next")
+        wl_build_cond_br(self.builder, wl_build_icmp(self.builder, wl_int_ne(), order, wl_const_int(wl_type_of(order), 0, 0)), decided, next)
+        wl_position_at_end(self.builder, next)
+
+    // Decide the walk with a constant answer.
+    mut fn mir_cmp_decide(answer: i64, decided: i64, result_slot: i64):
+        wl_build_store(self.builder, wl_const_int(wl_i32_type(self.context), answer, 1), result_slot)
+        wl_build_br(self.builder, decided)
+
+    mut fn mir_emit_cmp_walk(lp: i64, rp: i64, ty: i64, resolved: i32, decided: i64, result_slot: i64):
+        let tk = self.sema.get_type_kind(resolved as TypeId)
+        let i64_ty = wl_i64_type(self.context)
+        if tk == TypeKind.TY_TUPLE:
+            for i in 0..self.sema.get_type_d1(resolved as TypeId):
+                let elem_sema = self.mir_project_field_sema_type(resolved, i)
+                let elem_ty = self.mir_sema_type_to_llvm(elem_sema)
+                if elem_sema > 0 and elem_ty != 0:
+                    let order = self.mir_emit_cmp_ptrs(self.tuple_elem_ptr(ty, lp, i), self.tuple_elem_ptr(ty, rp, i), elem_ty, elem_sema)
+                    self.mir_cmp_require(order, decided, result_slot)
+            return
+        if tk == TypeKind.TY_ARRAY:
+            let elem_sema = self.sema.get_type_d0(resolved as TypeId)
+            let elem_ty = wl_get_element_type(ty)
+            let count = self.sema.get_type_d1(resolved as TypeId)
+            let index_slot = self.create_entry_alloca(i64_ty)
+            wl_build_store(self.builder, wl_const_int(i64_ty, 0, 0), index_slot)
+            let head = wl_append_bb(self.context, self.current_function, "cmp.elems")
+            let body_bb = wl_append_bb(self.context, self.current_function, "cmp.elems.body")
+            let done = wl_append_bb(self.context, self.current_function, "cmp.elems.done")
+            wl_build_br(self.builder, head)
+            wl_position_at_end(self.builder, head)
+            let index = wl_build_load(self.builder, i64_ty, index_slot)
+            wl_build_cond_br(self.builder, wl_build_icmp(self.builder, wl_int_slt(), index, wl_const_int(i64_ty, count as i64, 0)), body_bb, done)
+            wl_position_at_end(self.builder, body_bb)
+            let zero = wl_const_int(i64_ty, 0, 0)
+            let l_idx: Vec[i64] = [zero, index]
+            let r_idx: Vec[i64] = [zero, index]
+            let le = wl_build_gep(self.builder, ty, lp, vec_data_i64(&l_idx), 2)
+            let re = wl_build_gep(self.builder, ty, rp, vec_data_i64(&r_idx), 2)
+            let order = self.mir_emit_cmp_ptrs(le, re, elem_ty, elem_sema)
+            self.mir_cmp_require(order, decided, result_slot)
+            wl_build_store(self.builder, wl_build_add(self.builder, index, wl_const_int(i64_ty, 1, 0)), index_slot)
+            wl_build_br(self.builder, head)
+            wl_position_at_end(self.builder, done)
+            return
+        if self.mir_eq_type_is_box(resolved):
+            let pointee = self.sema.get_generic_inst_arg(resolved, 0)
+            let pointee_ty = self.mir_sema_type_to_llvm(pointee)
+            if pointee_ty != 0 and wl_get_type_kind(ty) == wl_pointer_type_kind():
+                let order = self.mir_emit_cmp_ptrs(wl_build_load(self.builder, ty, lp), wl_build_load(self.builder, ty, rp), pointee_ty, pointee)
+                self.mir_cmp_require(order, decided, result_slot)
+                return
+        let variant_count = self.mir_enum_variant_count(resolved)
+        if variant_count > 0:
+            self.mir_emit_cmp_enum_walk(lp, rp, ty, resolved, variant_count, decided, result_slot)
+            return
+        if tk == TypeKind.TY_STRUCT and self.sema.distinct_type_names.contains(self.sema.get_type_d0(resolved as TypeId)):
+            let order = self.mir_emit_cmp_ptrs(lp, rp, ty, self.sema.type_extra[(self.sema.get_type_d1(resolved as TypeId) + 1)])
+            self.mir_cmp_require(order, decided, result_slot)
+            return
+        let struct_idx = self.find_struct_index_by_type(ty)
+        let field_start: i32 = self.struct_field_starts[struct_idx]
+        let field_count: i32 = self.struct_field_counts[struct_idx]
+        for fi in 0..field_count:
+            let field_sym: i32 = self.struct_field_names[field_start + fi]
+            let field_ty: i64 = self.struct_field_types[field_start + fi]
+            let llvm_fi = self.get_llvm_field_index(ty, fi)
+            let field_sema = self.mir_project_field_sema_type(resolved, field_sym)
+            if field_sema > 0:
+                let order = self.mir_emit_cmp_ptrs(wl_build_struct_gep(self.builder, ty, lp, llvm_fi), wl_build_struct_gep(self.builder, ty, rp, llvm_fi), field_ty, field_sema)
+                self.mir_cmp_require(order, decided, result_slot)
+
+    // The declaration index of the variant whose tag is `tag`.
+    mut fn mir_enum_tag_index(tag: i64, resolved: i32, variant_count: i32) -> i64:
+        let tag_ty = wl_type_of(tag)
+        var index = wl_const_int(tag_ty, variant_count as i64, 0)
+        var vi = variant_count - 1
+        while vi >= 0:
+            let hit = wl_build_icmp(self.builder, wl_int_eq(), tag, wl_const_int(tag_ty, self.mir_enum_variant_discriminant(resolved, vi), 0))
+            index = wl_build_select(self.builder, hit, wl_const_int(tag_ty, vi as i64, 0), index)
+            vi = vi - 1
+        index
+
+    // An enum: the variant declared first is less; the same variant compares
+    // its payloads in order. Representations as mir_emit_eq_enum_walk's.
+    mut fn mir_emit_cmp_enum_walk(lp: i64, rp: i64, ty: i64, resolved: i32, variant_count: i32, decided: i64, result_slot: i64):
+        if wl_get_type_kind(ty) == wl_pointer_type_kind():
+            // The Option niche: null is None, declared before Some.
+            var some_idx = -1
+            for vi in 0..variant_count:
+                if self.mir_enum_variant_payload_count(resolved, vi) == 1: some_idx = vi
+            let lv = wl_build_load(self.builder, ty, lp)
+            let rv = wl_build_load(self.builder, ty, rp)
+            let l_none = wl_build_icmp(self.builder, wl_int_eq(), lv, wl_const_null(ty))
+            let r_none = wl_build_icmp(self.builder, wl_int_eq(), rv, wl_const_null(ty))
+            let none_first = some_idx > 0
+            let l_rank = wl_build_zext(self.builder, if none_first: wl_build_not(self.builder, l_none) else: l_none, wl_i32_type(self.context))
+            let r_rank = wl_build_zext(self.builder, if none_first: wl_build_not(self.builder, r_none) else: r_none, wl_i32_type(self.context))
+            let rank_order = self.mir_three_way(wl_build_icmp(self.builder, wl_int_ult(), l_rank, r_rank), wl_build_icmp(self.builder, wl_int_ugt(), l_rank, r_rank))
+            self.mir_cmp_require(rank_order, decided, result_slot)
+            let payload_bb = wl_append_bb(self.context, self.current_function, "cmp.some")
+            let done_bb = wl_append_bb(self.context, self.current_function, "cmp.option.done")
+            wl_build_cond_br(self.builder, l_none, done_bb, payload_bb)
+            wl_position_at_end(self.builder, payload_bb)
+            if some_idx >= 0:
+                let payload_sema = self.mir_enum_payload_sema_type(resolved, some_idx, 0)
+                if payload_sema > 0:
+                    let order = self.mir_emit_cmp_ptrs(lp, rp, ty, payload_sema)
+                    self.mir_cmp_require(order, decided, result_slot)
+            wl_build_br(self.builder, done_bb)
+            wl_position_at_end(self.builder, done_bb)
+            return
+        let bare = wl_get_type_kind(ty) != wl_struct_type_kind() or wl_count_struct_elem_types(ty) < 2
+        let tag_ty = if bare: ty else: wl_struct_get_type_at(ty, 0)
+        let l_tag = if bare: wl_build_load(self.builder, ty, lp) else: wl_build_load(self.builder, tag_ty, wl_build_struct_gep(self.builder, ty, lp, 0))
+        let r_tag = if bare: wl_build_load(self.builder, ty, rp) else: wl_build_load(self.builder, tag_ty, wl_build_struct_gep(self.builder, ty, rp, 0))
+        let l_index = self.mir_enum_tag_index(l_tag, resolved, variant_count)
+        let r_index = self.mir_enum_tag_index(r_tag, resolved, variant_count)
+        let rank_order = self.mir_three_way(wl_build_icmp(self.builder, wl_int_ult(), l_index, r_index), wl_build_icmp(self.builder, wl_int_ugt(), l_index, r_index))
+        self.mir_cmp_require(rank_order, decided, result_slot)
+        if bare:
+            return
+        let l_data = wl_build_struct_gep(self.builder, ty, lp, 1)
+        let r_data = wl_build_struct_gep(self.builder, ty, rp, 1)
+        let done_bb = wl_append_bb(self.context, self.current_function, "cmp.enum.done")
+        for vi in 0..variant_count:
+            let payload_count = self.mir_enum_variant_payload_count(resolved, vi)
+            if payload_count == 0:
+                continue
+            let case_bb = wl_append_bb(self.context, self.current_function, "cmp.enum.case")
+            let next_bb = wl_append_bb(self.context, self.current_function, "cmp.enum.next")
+            let disc = self.mir_enum_variant_discriminant(resolved, vi)
+            wl_build_cond_br(self.builder, wl_build_icmp(self.builder, wl_int_eq(), l_tag, wl_const_int(tag_ty, disc, 0)), case_bb, next_bb)
+            wl_position_at_end(self.builder, case_bb)
+            let payload_ty = self.mir_enum_variant_payload_llvm_type(resolved, vi)
+            if payload_count == 1:
+                let payload_sema = self.mir_enum_payload_sema_type(resolved, vi, 0)
+                if payload_sema > 0 and payload_ty != 0:
+                    let order = self.mir_emit_cmp_ptrs(l_data, r_data, payload_ty, payload_sema)
+                    self.mir_cmp_require(order, decided, result_slot)
+            else if payload_ty != 0 and wl_get_type_kind(payload_ty) == wl_struct_type_kind():
+                for pf in 0..payload_count:
+                    let payload_sema = self.mir_enum_payload_sema_type(resolved, vi, pf)
+                    if payload_sema > 0:
+                        let order = self.mir_emit_cmp_ptrs(self.tuple_elem_ptr(payload_ty, l_data, pf), self.tuple_elem_ptr(payload_ty, r_data, pf), self.tuple_elem_type(payload_ty, pf), payload_sema)
+                        self.mir_cmp_require(order, decided, result_slot)
+            wl_build_br(self.builder, done_bb)
+            wl_position_at_end(self.builder, next_bb)
+        wl_build_br(self.builder, done_bb)
+        wl_position_at_end(self.builder, done_bb)
+
     // ── Map keys (§11.7, D96) ───────────────────────────────────────────
     // A map hashes and compares a key by its type: 0, by its bytes (an
     // integer, a bool, a raw pointer); 1, as a `str`; 2, by the functions
@@ -3257,6 +3547,9 @@ impl Codegen:
             if sema_ord != 0:
                 self.binop_route = "str-order"
                 return sema_ord
+            let structural_ord = self.mir_build_order_from_sema(op, lhs, rhs, lhs_sema, rhs_sema)
+            if structural_ord != 0:
+                return structural_ord
 
         if op == BinaryOp.OP_EQ or op == BinaryOp.OP_NEQ:
             let sema_cmp = self.mir_build_eq_from_sema(op, lhs, rhs, lhs_sema, rhs_sema)
@@ -3590,26 +3883,15 @@ impl Codegen:
                         pos = pos + 2 + payload_count
         0
 
+    // The tag variant `variant_idx` is stored and tested with: Sema's
+    // discriminant (D65). Codegen kept its own table for repr enums and used
+    // the index for every other enum, which WITH_DEBUG_PERMUTE_TAGS showed
+    // disagreeing with the tags Sema hands out.
     fn mir_enum_variant_discriminant(enum_sema_ty: i32, variant_idx: i32) -> i64:
         if enum_sema_ty <= 0 or variant_idx < 0:
-            return 0
-        let resolved = self.mir_display_resolved_type(enum_sema_ty)
-        let tk = self.mir_display_type_kind(resolved)
-        var enum_sym = 0
-        if tk == TypeKind.TY_ENUM:
-            enum_sym = self.mir_type_d0_at(resolved)
-        else if tk == TypeKind.TY_GENERIC_INST:
-            enum_sym = self.mir_type_d0_at(resolved)
-        let cg_sym = self.sema_sym_to_codegen_sym(enum_sym)
-        if cg_sym > 0:
-            let de_opt = self.disc_enum_type_map.get(cg_sym)
-            if de_opt.is_some():
-                let de_idx = de_opt.unwrap()
-                let v_start = self.disc_enum_variant_starts[de_idx]
-                let v_count = self.disc_enum_variant_counts[de_idx]
-                if variant_idx < v_count:
-                    return self.disc_enum_variant_values[(v_start + variant_idx)]
-        variant_idx as i64
+            sema_phase_bug(f"BUG: a tag asked of type {enum_sema_ty} variant {variant_idx}")
+        let live = self.mir_type_to_live_sema_type(enum_sema_ty)
+        self.sema.enum_variant_discriminant_by_index(if live > 0: live else: enum_sema_ty, variant_idx)
 
     fn mir_enum_tag_value(val: i64) -> i64:
         let val_ty = wl_type_of(val)
@@ -4550,27 +4832,29 @@ impl Codegen:
         if rk == RvalueKind.RK_DISCRIMINANT:
             let ptr = self.mir_place_ptr(body, d0, false, 0)
             if ptr == 0:
-                return wl_get_undef(wl_i32_type(self.context))
+                return self.mir_bug_undef(f"discriminant rvalue {rval_id}: place {d0} has no address", wl_i32_type(self.context))
             if d0 < 0 or d0 >= body.place_locals.len() as i32:
-                return wl_get_undef(wl_i32_type(self.context))
+                return self.mir_bug_undef(f"discriminant rvalue {rval_id}: place {d0} out of range", wl_i32_type(self.context))
             var place_ty = self.mir_place_projected_type(body, d0)
             if place_ty == 0:
-                let local_id = body.place_locals[d0]
-                let place_ty_opt = self.mir_local_types.get(local_id)
-                if not place_ty_opt.is_some():
-                    return wl_get_undef(wl_i32_type(self.context))
-                place_ty = place_ty_opt.unwrap() as i64
+                let local_ty: i64 = (self.mir_local_types.get(body.place_locals[d0]) ?? 0) as i64
+                if local_ty == 0:
+                    return self.mir_bug_undef(f"discriminant rvalue {rval_id}: place {d0} has no type", wl_i32_type(self.context))
+                place_ty = local_ty
             if wl_get_type_kind(place_ty) == wl_struct_type_kind() and wl_count_struct_elem_types(place_ty) > 0:
                 let loaded = wl_build_load(self.builder, place_ty, ptr)
                 return wl_build_extract_value(self.builder, loaded, 0)
             if wl_get_type_kind(place_ty) == wl_pointer_type_kind():
                 let loaded_ptr = wl_build_load(self.builder, place_ty, ptr)
+                // The Option niche: null is None. Its tags are Sema's (D97
+                // declares None first), never "null is 1".
+                let i32_ty = wl_i32_type(self.context)
                 let is_none = wl_build_icmp(self.builder, wl_int_eq(), loaded_ptr, wl_const_null(place_ty))
-                return self.coerce_int(is_none, wl_i32_type(self.context))
+                return wl_build_select(self.builder, is_none, wl_const_int(i32_ty, self.option_tag(false), 0), wl_const_int(i32_ty, self.option_tag(true), 0))
             // Disc enum without payload: the value IS the discriminant
             if wl_get_type_kind(place_ty) == wl_integer_type_kind():
                 return wl_build_load(self.builder, place_ty, ptr)
-            return wl_const_int(wl_i32_type(self.context), 0, 0)
+            return self.mir_bug_undef(f"discriminant rvalue {rval_id}: place {d0} is no enum representation", wl_i32_type(self.context))
 
         if rk == RvalueKind.RK_AGGREGATE:
             // §4.3d: a vector's lanes, in order.
@@ -7605,7 +7889,7 @@ impl Codegen:
     // out of the slot — a null address is never dereferenced.
     mut fn mir_option_ref_from_slot_ptr(slot_ptr: i64, opt_sema_ty: i32) -> i64:
         let opt_ty = self.mir_sema_type_to_llvm(opt_sema_ty)
-        let view_ty = self.mir_builtin_variant_payload_llvm_type(opt_sema_ty, 0)
+        let view_ty = self.mir_builtin_variant_payload_llvm_type(opt_sema_ty, self.mir_success_variant_index(opt_sema_ty))
         self.option_ref_from_slot_ptr(slot_ptr, opt_ty, view_ty)
 
     // `view_ty` is the Some payload's LLVM type (from Sema: the Option's
@@ -7892,7 +8176,7 @@ impl Codegen:
             let live_base_sym = self.sema_sym_to_codegen_sym(self.sema.get_generic_inst_base(live_resolved as i32))
             let live_arg_count = self.sema.get_generic_inst_arg_count(live_resolved as i32)
             if live_base_sym == self.sym_option:
-                if variant_idx == 0 and live_arg_count > 0:
+                if variant_idx == self.option_some_index and live_arg_count > 0:
                     return self.sema.get_generic_inst_arg(live_resolved as i32, 0)
                 return 0
             if live_base_sym == self.sym_result:
@@ -7909,7 +8193,7 @@ impl Codegen:
         let arg_count = self.mir_type_d2_at(resolved)
         let args_start = self.mir_type_d1_at(resolved)
         if base_sym == self.sym_option:
-            if variant_idx == 0 and arg_count > 0:
+            if variant_idx == self.option_some_index and arg_count > 0:
                 return self.mir_type_extra_at(args_start)
             return 0
         if base_sym == self.sym_result:
@@ -7917,6 +8201,23 @@ impl Codegen:
                 return self.mir_type_extra_at(args_start)
             if variant_idx == 1 and arg_count > 1:
                 return self.mir_type_extra_at(args_start + 1)
+        0
+
+    // The variant that carries a carrier's success value: `Some` where Sema
+    // declares it in Option (D97: after `None`), `Ok` (first) otherwise.
+    fn mir_success_variant_index(sema_ty: i32) -> i32:
+        let resolved = self.sema.resolve_alias(sema_ty as TypeId)
+        if self.sema.get_type_kind(resolved) != TypeKind.TY_GENERIC_INST:
+            return 0
+        if self.sema_sym_to_codegen_sym(self.sema.get_generic_inst_base(resolved as i32)) == self.sym_option: self.option_some_index else: 0
+
+    // The tag of that variant: Option's Some tag, or Ok's discriminant.
+    fn mir_success_variant_tag(sema_ty: i32) -> i64:
+        let resolved = self.sema.resolve_alias(sema_ty as TypeId)
+        if self.sema.get_type_kind(resolved) == TypeKind.TY_GENERIC_INST and self.sema_sym_to_codegen_sym(self.sema.get_generic_inst_base(resolved as i32)) == self.sym_option:
+            return self.option_tag(true)
+        if self.sema.enum_variant_index_for_type(resolved as i32, self.sema.syms.ok) >= 0:
+            return self.sema.enum_variant_discriminant_for_type(resolved as i32, self.sema.syms.ok)
         0
 
     mut fn mir_builtin_variant_payload_llvm_type(sema_ty: i32, variant_idx: i32) -> i64:
@@ -10444,9 +10745,7 @@ impl Codegen:
             let recv = self.mir_intrinsic_arg(body, args_id, 0)
             let recv_tk = wl_get_type_kind(wl_type_of(recv))
             if recv_tk == wl_struct_type_kind():
-                let disc = self.option_tag_value(recv)
-                // Some = tag 0, None = tag 1. is_some → tag == 0.
-                result = wl_build_icmp(self.builder, wl_int_eq(), disc, wl_const_int(wl_type_of(disc), 0, 0))
+                result = self.option_tag_is_some(self.option_tag_value(recv))
             else if recv_tk == wl_pointer_type_kind():
                 result = wl_build_icmp(self.builder, wl_int_ne(), recv, wl_const_null(wl_type_of(recv)))
             else:
@@ -10482,7 +10781,7 @@ impl Codegen:
             if borrowed_carrier:
                 let carrier_ty = self.mir_sema_type_to_llvm(carrier_sema)
                 let carrier_tk = if carrier_ty != 0: wl_get_type_kind(carrier_ty) else: 0
-                let payload_sema = self.mir_builtin_variant_payload_sema_type(carrier_sema, 0)
+                let payload_sema = self.mir_builtin_variant_payload_sema_type(carrier_sema, self.mir_success_variant_index(carrier_sema))
                 let payload_resolved = if payload_sema > 0: self.mir_resolve_alias_at(payload_sema) else: 0
                 if carrier_tk == wl_pointer_type_kind():
                     // Option[&T] and other pointer-shaped options use null as
@@ -10507,7 +10806,7 @@ impl Codegen:
                     let tag_ty = wl_struct_get_type_at(carrier_ty, 0)
                     let tag_ptr = wl_build_struct_gep(self.builder, carrier_ty, recv, 0)
                     let disc = wl_build_load(self.builder, tag_ty, tag_ptr)
-                    let is_ok = wl_build_icmp(self.builder, wl_int_eq(), disc, wl_const_int(tag_ty, 0, 0))
+                    let is_ok = wl_build_icmp(self.builder, wl_int_eq(), disc, wl_const_int(tag_ty, self.mir_success_variant_tag(carrier_sema), 0))
                     let borrowed_panic_bb = wl_append_bb(self.context, self.current_function, "unwrap.borrowed.panic")
                     let borrowed_ok_bb = wl_append_bb(self.context, self.current_function, "unwrap.borrowed.ok")
                     wl_build_cond_br(self.builder, is_ok, borrowed_ok_bb, borrowed_panic_bb)
@@ -10542,7 +10841,7 @@ impl Codegen:
                     result = recv
             else if recv_tk == wl_struct_type_kind():
                 let disc = wl_build_extract_value(self.builder, recv, 0)
-                let is_ok = wl_build_icmp(self.builder, wl_int_eq(), disc, wl_const_int(wl_type_of(disc), 0, 0))
+                let is_ok = wl_build_icmp(self.builder, wl_int_eq(), disc, wl_const_int(wl_type_of(disc), self.mir_success_variant_tag(recv_sema), 0))
                 let panic_bb = wl_append_bb(self.context, self.current_function, "unwrap.panic")
                 let ok_bb = wl_append_bb(self.context, self.current_function, "unwrap.ok")
                 wl_build_cond_br(self.builder, is_ok, ok_bb, panic_bb)
@@ -10570,9 +10869,9 @@ impl Codegen:
                     let dest_sema = self.mir_intrinsic_dest_sema_type(body, dest_place)
                     var payload_ty = self.mir_sema_type_to_llvm(dest_sema)
                     if payload_ty == 0:
-                        payload_ty = self.mir_builtin_variant_payload_llvm_type(recv_sema, 0)
+                        payload_ty = self.mir_builtin_variant_payload_llvm_type(recv_sema, self.mir_success_variant_index(recv_sema))
                     if payload_ty == 0:
-                        let res_ok_sema = self.mir_builtin_variant_payload_sema_type(recv_sema, 0)
+                        let res_ok_sema = self.mir_builtin_variant_payload_sema_type(recv_sema, self.mir_success_variant_index(recv_sema))
                         if res_ok_sema > 0:
                             payload_ty = self.mir_sema_type_to_llvm(res_ok_sema)
                     result = self.extract_result_payload(recv, payload_ty)
@@ -10581,7 +10880,7 @@ impl Codegen:
                     // (the Option's body does not name it, #1958).
                     var payload_ty = self.mir_sema_type_to_llvm(self.mir_intrinsic_dest_sema_type(body, dest_place))
                     if payload_ty == 0:
-                        payload_ty = self.mir_builtin_variant_payload_llvm_type(carrier_sema, 0)
+                        payload_ty = self.mir_builtin_variant_payload_llvm_type(carrier_sema, self.mir_success_variant_index(carrier_sema))
                     if payload_ty == 0:
                         sema_phase_bug(f"BUG: unwrap of Option type {recv_sema} has no payload type")
                     result = self.option_payload_value(recv, payload_ty)
@@ -11805,8 +12104,7 @@ impl Codegen:
             let tk = wl_get_type_kind(wl_type_of(recv))
             if tk == wl_struct_type_kind():
                 let disc = self.option_tag_value(recv)
-                // None = tag 1. is_none → tag != 0.
-                result = wl_build_icmp(self.builder, wl_int_ne(), disc, wl_const_int(wl_type_of(disc), 0, 0))
+                result = wl_build_icmp(self.builder, wl_int_eq(), disc, wl_const_int(wl_type_of(disc), self.option_tag(false), 0))
             else if tk == wl_pointer_type_kind():
                 result = wl_build_icmp(self.builder, wl_int_eq(), recv, wl_const_null(wl_type_of(recv)))
             else:
@@ -12629,8 +12927,8 @@ impl Codegen:
             cra.push(recv_payload_ptr)
             let recv_status = wl_build_call(self.builder, crft2, cr_fn, vec_data_i64(&cra), 2)
             if wl_get_type_kind(recv_opt_ty) == wl_struct_type_kind():
-                var recv_some_disc: i64 = 0
-                var recv_none_disc: i64 = 1
+                var recv_some_disc = self.option_tag(true)
+                var recv_none_disc = self.option_tag(false)
                 if recv_opt_sema > 0:
                     if self.sema.enum_variant_index_for_type(recv_opt_sema, self.sema.syms.some) >= 0:
                         recv_some_disc = self.sema.enum_variant_discriminant_for_type(recv_opt_sema, self.sema.syms.some)
@@ -12955,15 +13253,14 @@ impl Codegen:
             let arg_start_of = body.call_arg_starts[args_id]
             let recv_op_id = body.call_arg_operands[arg_start_of]
             let recv_sema = self.mir_operand_sema_type(body, recv_op_id)
-            payload_ty = self.mir_builtin_variant_payload_llvm_type(recv_sema, 0)
+            payload_ty = self.mir_builtin_variant_payload_llvm_type(recv_sema, self.mir_success_variant_index(recv_sema))
             if payload_ty == 0:
                 sema_phase_bug(f"BUG: Option.filter receiver type {recv_sema} has no payload type")
         let elem_ty = payload_ty
         let is_some = if recv_tk == wl_pointer_type_kind():
             wl_build_icmp(self.builder, wl_int_ne(), recv, wl_const_null(obj_ty))
         else:
-            let disc = self.option_tag_value(recv)
-            wl_build_icmp(self.builder, wl_int_eq(), disc, wl_const_int(wl_type_of(disc), 0, 0))
+            self.option_tag_is_some(self.option_tag_value(recv))
         let fn_val = self.mir_intrinsic_arg(body, args_id, 1)
         let cty = wl_type_of(fn_val)
         var fn_ptr = fn_val
@@ -13114,8 +13411,7 @@ impl Codegen:
         let opt_ty = wl_type_of(opt_val)
         if wl_get_type_kind(opt_ty) == wl_pointer_type_kind():
             return wl_build_icmp(self.builder, wl_int_ne(), opt_val, wl_const_null(opt_ty))
-        let tag = self.option_tag_value(opt_val)
-        wl_build_icmp(self.builder, wl_int_eq(), tag, wl_const_int(wl_type_of(tag), 0, 0))
+        self.option_tag_is_some(self.option_tag_value(opt_val))
 
     mut fn mir_call_fn_value(fn_val: i64, ret_ty: i64, args: &Vec[i64], arg_count: i32) -> i64:
         let ptr_ty = wl_ptr_type(self.context)

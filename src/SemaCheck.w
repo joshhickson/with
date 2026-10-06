@@ -21359,6 +21359,38 @@ impl Sema:
             pos = pos + 2 + payload_count
         -1
 
+    // The index of `variant_sym` (`Some`, `None`) in the generic `Option`
+    // declaration, or -1 when the program has none (`--no-std`). D97
+    // declares it `None | Some(T)`; codegen, which builds and tests Options
+    // knowing only their LLVM type, asks here instead of assuming an order.
+    // Option is not a repr enum: a variant's discriminant is its index.
+    pub fn std_option_variant_index(variant_sym: i32) -> i32:
+        var i = self.named_type_candidate_head(self.syms.option)
+        while i >= 0:
+            let tid = self.resolve_alias(self.named_type_candidate_tids[i] as TypeId) as i32
+            let decl = self.type_decl_nodes_by_tid.get(tid) ?? 0
+            if decl != 0 and self.type_decl_tp_count(decl) > 0 and self.get_type_kind(tid as TypeId) == TypeKind.TY_ENUM:
+                return self.enum_variant_index_for_type(tid, variant_sym)
+            i = self.named_type_candidate_next[i]
+        -1
+
+    // The tag of that variant: its discriminant, which is not its index
+    // under WITH_DEBUG_PERMUTE_TAGS. -1 without an Option.
+    pub fn std_option_variant_tag(variant_sym: i32) -> i64: self.std_generic_enum_variant_tag(self.syms.option, variant_sym)
+
+    // The tag of a variant of std's generic enum `enum_sym` (Option,
+    // Result): its discriminant. -1 when the program has no such enum.
+    pub fn std_generic_enum_variant_tag(enum_sym: i32, variant_sym: i32) -> i64:
+        var i = self.named_type_candidate_head(enum_sym)
+        while i >= 0:
+            let tid = self.resolve_alias(self.named_type_candidate_tids[i] as TypeId) as i32
+            let decl = self.type_decl_nodes_by_tid.get(tid) ?? 0
+            if decl != 0 and self.type_decl_tp_count(decl) > 0 and self.get_type_kind(tid as TypeId) == TypeKind.TY_ENUM:
+                let index = self.enum_variant_index_for_type(tid, variant_sym)
+                return if index < 0: -1 else: self.enum_variant_discriminant_at(tid, index)
+            i = self.named_type_candidate_next[i]
+        -1
+
     // §4.4a: the discriminant of a variant of `enum_tid`. Every i64 is a
     // discriminant (`B = -3`), so there is no "absent" value: a caller asks
     // enum_variant_index_for_type whether the variant exists (a -1 sentinel
@@ -21391,10 +21423,20 @@ impl Sema:
             pos = pos + 2 + self.type_extra[(pos + 1)]
         0
 
+    // The tag of variant `index` of `enum_tid` (an enum or an instance of a
+    // generic one): what codegen stores and tests, asked here (D65).
+    pub fn enum_variant_discriminant_by_index(enum_tid: i32, index: i32) -> i64:
+        let decl = self.enum_variant_decl_type(enum_tid)
+        if decl == 0:
+            sema_phase_bug(f"BUG: codegen asked a tag of type {enum_tid}, which declares no variants")
+        self.enum_variant_discriminant_at(decl, index)
+
     fn enum_variant_discriminant_at(enum_decl: i32, index: i32) -> i64:
         let start = self.disc_value_starts.get(enum_decl)
         if start.is_some() and index >= 0 and index < self.get_type_d2(enum_decl):
             return self.disc_value_list[start.unwrap() + index]
+        if sema_permute_tags_enabled() and index >= 0 and index < self.get_type_d2(enum_decl):
+            return (self.get_type_d2(enum_decl) - 1 - index) as i64
         index
 
     mut fn enum_accessor_return_type(enum_tid: i32, variant_sym: i32, accessor_kind: i32) -> i32:
