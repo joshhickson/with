@@ -955,7 +955,9 @@ fn facade_render_lend_item(pool: AstPool, intern: InternPool, ci: &Vec[i32], ite
         // A buffer pairing, a fixed argument and the status contract of a
         // copied-back length (D64) describe the lend's presented call
         // (facade_render_bridge); they make nothing stronger than a lend.
-        else if kind == FACADE_CLAUSE_BUFFER or kind == FACADE_CLAUSE_FIXED or kind == FACADE_CLAUSE_OK: li.bridged = true
+        // D102: `nullable param N` on a function-pointer parameter presents
+        // `Option` of it through the bridge (facade_render_bridge_param).
+        else if kind == FACADE_CLAUSE_BUFFER or kind == FACADE_CLAUSE_FIXED or kind == FACADE_CLAUSE_OK or kind == FACADE_CLAUSE_NULLABLE: li.bridged = true
         else if kind != FACADE_CLAUSE_LEND and kind != FACADE_CLAUSE_PRESERVES and kind != FACADE_CLAUSE_CALLBACKS_NONE: li.lends = false
     if not li.lends:
         return li
@@ -1983,6 +1985,21 @@ fn facade_render_fixed_literal(pool: AstPool, intern: InternPool, decl: i32, pi:
         return facade_render_literal(pool, pool.get_extra(ops + 1))
     ""
 
+// D102 (§16.2b.8): whether `nullable param N` names parameter `pi` of the
+// declaration, in its fn item.
+fn facade_render_param_is_nullable(pool: AstPool, intern: InternPool, decl: i32, pi: i32) -> bool:
+    let item = facade_render_fn_item(pool, intern, decl)
+    if item == 0:
+        return false
+    let cstart = pool.get_data1(item as NodeId)
+    for k in 0..pool.get_data2(item as NodeId):
+        let clause = pool.get_extra(cstart + k)
+        if pool.get_data0(clause as NodeId) != FACADE_CLAUSE_NULLABLE:
+            continue
+        if facade_render_param_ref(pool, intern, decl, pool.get_extra(pool.get_data1(clause as NodeId))) == pi:
+            return true
+    false
+
 fn facade_render_literal(pool: AstPool, node: i32) -> str:
     let kind = pool.kind(node as NodeId)
     if kind == NodeKind.NK_NULL_LIT: return "null"
@@ -2021,11 +2038,20 @@ fn facade_render_bridge_param(pool: AstPool, intern: InternPool, decl: i32, pi: 
     let start = pool.fn_meta_param_start(meta)
     let taken = facade_render_param_names(pool, intern, decl)
     let fixed = facade_render_fixed_literal(pool, intern, decl, pi)
-    if fixed.len() > 0:
-        b.args = fixed.clone()
-        return b
     let pname = facade_render_param_name(pool, intern, start, pi)
     let ptype = render_type_expr(pool, intern, pool.fn_param_type(start, pi) as NodeId)
+    if fixed.len() > 0:
+        // D102: a function-pointer parameter is non-null; `fixed null` is
+        // the facade's claim that C takes NULL there, so the absent pointer
+        // crosses as `None` under the with-abi.md §3 guarantee.
+        if fixed == "null" and facade_render_unalias(pool, intern, ptype).contains("fn("):
+            let raw = facade_render_unalias(pool, intern, ptype)
+            let local = facade_render_fresh(pname ++ "_none", taken)
+            b.prologue = "let " ++ local ++ ": Option[" ++ raw ++ "] = None\n"
+            b.args = "unsafe { transmute[" ++ raw ++ "](" ++ local ++ ") }"
+            return b
+        b.args = fixed.clone()
+        return b
     let (bp, bl, inout, elements) = facade_render_buffer_of(pool, intern, decl, pi)
     if bp < 0 and bl >= 0 or bl < 0 and bp >= 0:
         b.ok = false
@@ -2078,6 +2104,15 @@ fn facade_render_bridge_param(pool: AstPool, intern: InternPool, decl: i32, pi: 
         if handled != ptype:
             shown = handled
             arg = "transmute[" ++ facade_render_callback_raw_type(facade_render_unalias(pool, intern, ptype)) ++ "](" ++ pname ++ ")"
+        // D102 (§16.2b.8): `nullable param N` on a function-pointer
+        // parameter presents `Option` of it; the value crosses as the C
+        // pointer it is (with-abi.md §3), NULL for None.
+        else if facade_render_param_is_nullable(pool, intern, decl, pi) and facade_render_unalias(pool, intern, ptype).contains("fn("):
+            let raw = facade_render_unalias(pool, intern, ptype)
+            let local = facade_render_fresh(pname ++ "_raw", taken)
+            b.prologue = "let " ++ local ++ ": " ++ raw ++ " = unsafe { transmute[" ++ raw ++ "](" ++ pname ++ ") }\n"
+            shown = "Option[" ++ ptype ++ "]"
+            arg = local.clone()
     b.params = pname ++ ": " ++ shown
     b.args = arg.clone()
     b
@@ -2656,6 +2691,7 @@ fn facade_render_callback_item(pool: AstPool, intern: InternPool, ci: &Vec[i32],
         return cbi
     var is_callback = false
     var nullable_pi = -1
+    var nullable_pis: Vec[i32] = Vec.new()
     let cstart = pool.get_data1(item as NodeId)
     for k in 0..pool.get_data2(item as NodeId):
         let clause = pool.get_extra(cstart + k)
@@ -2667,12 +2703,14 @@ fn facade_render_callback_item(pool: AstPool, intern: InternPool, ci: &Vec[i32],
         // parameter loop below passes its literal (facade_render_fixed_literal).
         else if kind == FACADE_CLAUSE_LEND or kind == FACADE_CLAUSE_PRESERVES or kind == FACADE_CLAUSE_FIXED or kind == FACADE_CLAUSE_BUFFER or kind == FACADE_CLAUSE_OK or kind == FACADE_CLAUSE_CALLBACKS_NONE: continue
         else if kind == FACADE_CLAUSE_NULLABLE:
-            // Rendered for the paired callback alone (Sema refuses the
-            // rest, verify_facade_callback_items).
+            // The paired callback's nullability is the pair's (an absent
+            // callback takes its userdata with it); any other function-pointer
+            // parameter the clause names is presented as `Option` by the
+            // parameter bridge (D102, facade_render_bridge_param).
             let npi = facade_render_param_ref(pool, intern, decl, pool.get_extra(ops))
-            if npi < 0 or nullable_pi >= 0:
+            if npi < 0:
                 return cbi
-            nullable_pi = npi
+            nullable_pis.push(npi)
         else if kind == FACADE_CLAUSE_CALLBACK_THREAD: is_callback = true
         else if kind == FACADE_CLAUSE_CALLBACK_USERDATA:
             let cb = facade_render_param_ref(pool, intern, decl, pool.get_extra(ops))
@@ -2728,8 +2766,10 @@ fn facade_render_callback_item(pool: AstPool, intern: InternPool, ci: &Vec[i32],
             return cbi
     if not is_callback or (cbi.retained and cbi.consumed):
         return cbi
+    for k in 0..nullable_pis.len() as i32:
+        if nullable_pis[k] == cbi.callback: nullable_pi = nullable_pis[k]
     if nullable_pi >= 0:
-        if nullable_pi != cbi.callback or cbi.retained or cbi.consumed:
+        if cbi.retained or cbi.consumed:
             return cbi
         cbi.nullable = true
     // The generated wrapper reaches the program's callbacks through the box
@@ -3061,7 +3101,10 @@ fn facade_render_callback_ops(pool: AstPool, intern: InternPool, ci: &Vec[i32], 
                 let wshown = facade_render_wrapped_type(pool, intern, &cbi, pi, raw)
                 var wrapped_part = facade_render_empty_bridge()
                 wrapped_part.ok = wshown.len() > 0
-                wrapped_part.params = wname ++ ": " ++ wshown
+                // D102 (§16.2b.8): `nullable param N` presents a wrapped
+                // callback as `Option` of its shape; `None` reaches C as NULL
+                // through the code-pointer transmute below.
+                wrapped_part.params = wname ++ ": " ++ (if facade_render_param_is_nullable(pool, intern, decl, pi): "Option[" ++ wshown ++ "]" else: wshown.clone())
                 wrapped_part.args = facade_render_fresh(f"facade_c{pi}", taken)
                 bridge = facade_render_append_bridge(move bridge, &wrapped_part)
                 wrapped_names.push(wname)
@@ -3118,7 +3161,10 @@ fn facade_render_callback_ops(pool: AstPool, intern: InternPool, ci: &Vec[i32], 
             // value, NULL for None.
             let raw_cb = facade_render_callback_raw_type(facade_render_unalias(pool, intern, facade_render_param_type(pool, intern, decl, cbi.callback)))
             let ud_type = facade_render_unalias(pool, intern, facade_render_param_type(pool, intern, decl, cbi.userdata))
-            body = body ++ indent ++ "let " ++ ncb ++ ": " ++ raw_cb ++ " = match " ++ cb_name ++ ":\n" ++ indent ++ "    Some(" ++ nf ++ ") => unsafe { transmute[" ++ raw_cb ++ "](" ++ nf ++ ") }\n" ++ indent ++ "    None => null\n"
+            // D102 (with-abi.md §3): `Option[extern "C" fn]` is the nullable
+            // pointer, so the value itself crosses; a `None => null` would
+            // put a null in the non-null type.
+            body = body ++ indent ++ "let " ++ ncb ++ ": " ++ raw_cb ++ " = unsafe { transmute[" ++ raw_cb ++ "](" ++ cb_name ++ ") }\n"
             // The userdata by transmute, not `as *const U as …`: with no
             // callback `U` is Unit, and a cast to `*const Unit` traps
             // codegen (#1626), which a pointer-to-pointer transmute of the
@@ -3149,7 +3195,10 @@ fn facade_render_callback_ops(pool: AstPool, intern: InternPool, ci: &Vec[i32], 
                 if wrapper.len() == 0:
                     wrapped_failed = true
                 body = body ++ wrapper
-                body = body ++ indent ++ "let " ++ facade_render_fresh(f"facade_c{pi}", taken) ++ ": " ++ wrapped_raw[wi] ++ " = if " ++ facade_render_fresh(f"facade_p{pi}", taken) ++ " == null: null else: " ++ w ++ "\n"
+                // D102: the absent callback is `None`, crossing as the C
+                // pointer under the with-abi.md §3 guarantee; the non-null
+                // type holds no null.
+                body = body ++ indent ++ "let " ++ facade_render_fresh(f"facade_c{pi}", taken) ++ ": " ++ wrapped_raw[wi] ++ " = unsafe { transmute[" ++ wrapped_raw[wi] ++ "](if " ++ facade_render_fresh(f"facade_p{pi}", taken) ++ " == null: None else: Some(" ++ w ++ ")) }\n"
         if wrapped_failed:
             continue
         // A hosted operation's error type is declared beside its resource
