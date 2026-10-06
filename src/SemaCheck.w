@@ -18489,6 +18489,7 @@ impl Sema:
                 self.emit_error("unknown field '" ++ self.pool_resolve(field) ++ "' for type '" ++ self.type_name(field_base as i32) ++ "'", node)
             self.note_view_field_projection(node, obj_type as i32, field_ty)
             self.note_field_access_decl(node, field_base as i32, field)
+            self.check_field_visible(field_base as i32, field, node)
             return field_ty
 
         if ftk == TypeKind.TY_GENERIC_INST:
@@ -18501,6 +18502,7 @@ impl Sema:
                 self.emit_error("unknown field '" ++ self.pool_resolve(field) ++ "' for type '" ++ self.type_name(field_base as i32) ++ "'", node)
             self.note_view_field_projection(node, obj_type as i32, field_ty2)
             self.note_field_access_decl(node, field_base as i32, field)
+            self.check_field_visible(field_base as i32, field, node)
             return field_ty2
 
         if ftk == TypeKind.TY_TUPLE:
@@ -19450,6 +19452,11 @@ impl Sema:
             return 0
         if self.reject_facade_type_construction_if_needed(tid as i32, node):
             return 0
+        if tid != 0:
+            // D100 (§18.3): naming a field in a literal reaches it.
+            for lfi in 0..field_count:
+                let lit_field = self.ast.get_extra(extra_start + lfi * 2)
+                if lit_field != 0: self.check_field_visible(tid as i32, lit_field, node)
         if tid != 0:
             let resolved = self.resolve_alias(tid as TypeId)
             if self.get_type_kind(resolved) == TypeKind.TY_STRUCT:
@@ -26263,6 +26270,7 @@ impl Sema:
             self.generic_subst_param_syms = saved_generic_call_subst_syms
             self.generic_subst_type_ids = saved_generic_call_subst_tys
             return 0
+        self.bind_unbound_type_params_from_result(ret_node, tp_start, tp_count, call_node)
         let ege_before = self.diags.count_by_severity(DiagSeverity.Error)
         self.ensure_generic_substitutions(tp_start, tp_count, param_start, param_count, call_node)
         // #598: an uninferable type param already got its one teaching
@@ -26469,6 +26477,38 @@ impl Sema:
         for _ in 0..count:
             let _ = self.generic_subst_param_syms.pop()
             let _ = self.generic_subst_type_ids.pop()
+
+    // A type parameter no argument mentions takes its type from the result
+    // the call is checked against (`var xs: ArenaVec[i32] =
+    // arena_vec_new_in(arena)`, the restructure the uninferable-parameter
+    // diagnostic teaches): the declared return type is matched against the
+    // demanded type. A parameter the arguments bound keeps its binding; a
+    // return type that does not match the demand binds nothing, and the
+    // ordinary result mismatch reports it.
+    mut fn bind_unbound_type_params_from_result(ret_node: i32, tp_start: i32, tp_count: i32, call_node: i32):
+        let expected = self.expected_expr_type as i32
+        if ret_node == 0 or self.has_expected_type == 0 or expected == 0 or expected == self.ty_void as i32 or self.current_value_expr_root != call_node: return
+        var unbound: Vec[i32] = Vec.new()
+        var pos = tp_start
+        for _ in 0..tp_count:
+            let tp_name = self.ast.get_extra(pos)
+            if self.lookup_generic_subst(tp_name) == 0: unbound.push(tp_name)
+            pos = pos + 2 + self.ast.get_extra(pos + 1)
+        if unbound.len() == 0: return
+        let saved_syms = sema_clone_i32_vec(&self.generic_subst_param_syms)
+        let saved_types = sema_clone_i32_vec(&self.generic_subst_type_ids)
+        let saved_diag_count = self.diags.items.len() as i32
+        self.clear_generic_substitution()
+        self.bind_type_params_from_type_expr(ret_node, expected, tp_start, tp_count, call_node)
+        let clean = self.diags.items.len() as i32 == saved_diag_count
+        while self.diags.items.len() as i32 > saved_diag_count:
+            self.diags.items.pop()
+        var found: Vec[i32] = Vec.new()
+        for tp_name in unbound: found.push(if clean: self.lookup_generic_subst(tp_name) else: 0)
+        self.generic_subst_param_syms = saved_syms
+        self.generic_subst_type_ids = saved_types
+        for ui in 0..unbound.len() as i32:
+            if found[ui] != 0: self.put_generic_subst(unbound[ui], found[ui], call_node)
 
     mut fn put_generic_subst(param_sym: i32, tid: i32, node: i32) -> Unit:
         if tid == 0:
@@ -33263,6 +33303,88 @@ impl Sema:
 
     fn field_access_owner_in_body(instance_sym: i32, node: i32): self.field_access_owners.get(sema_pair_key(instance_sym, node)) ?? 0
 
+    // The declaration node of a struct type or a generic instance's
+    // template, or 0.
+    fn type_decl_node_of(tid: i32) -> i32:
+        let resolved = self.resolve_alias(tid as TypeId) as i32
+        if self.get_type_kind(resolved as TypeId) == TypeKind.TY_GENERIC_INST: return self.generic_inst_decl_node(resolved)
+        self.type_decl_nodes_by_tid.get(resolved) ?? 0
+
+    // A record with C's layout: declared by a c_import, or `@[repr(C)]`
+    // (a migrated or hand-written mirror).
+    fn type_is_c_record(tid: i32) -> bool:
+        let resolved = self.resolve_alias(tid as TypeId) as i32
+        if self.get_type_kind(resolved as TypeId) != TypeKind.TY_STRUCT: return false
+        let decl = self.type_decl_node_of(resolved)
+        if decl == 0: return false
+        if type_decl_is_repr_c(self.ast.get_data2(decl)) != 0: return true
+        let di = self.find_decl_index(decl)
+        di >= 0 and di < self.decl_is_c_import.len() as i32 and self.decl_is_c_import[di] != 0
+
+    // §16.2b.3: `Representation.zeroed()` is the C record whose bytes are all
+    // zero. It is safe exactly when all-zero bits are a value of every
+    // field's With type; on any other record it is refused, naming the field.
+    mut fn check_zeroed_call(obj_type: i32, arg_count: i32, node: i32) -> i32:
+        if arg_count != 0:
+            self.emit_error("type.zeroed() takes no arguments", node)
+            return -1
+        let culprit = self.zero_invalid_part(obj_type, "")
+        if culprit.len() > 0:
+            self.emit_error(f"'{self.type_name(obj_type)}.zeroed()' is not available: {culprit} has no all-zero value (§16.2b.3)", node)
+            return -1
+        self.zeroed_call_nodes.insert(node)
+        self.typed_expr_types.insert(node, obj_type)
+        obj_type
+
+    // "" when all-zero bits are a value of `tid`; otherwise the part that
+    // has none, spelled from `path` (a field path inside the record).
+    // Integers, floats, bool and raw pointers are zero-valid; an enum is when
+    // it has no payload and 0 is a declared discriminant; an Option is when
+    // its None is tag 0; arrays, unions and records are when everything in
+    // them is. References, slices, str, non-null fn pointers and everything
+    // else are not.
+    mut fn zero_invalid_part(tid: i32, path: &str) -> str:
+        let resolved = self.resolve_alias(tid as TypeId) as i32
+        let tk = self.get_type_kind(resolved as TypeId)
+        let here = if path.len() == 0: f"type '{self.type_name(tid)}'" else: f"field '{path}' ({self.type_name(tid)})"
+        if tk == TypeKind.TY_INT or tk == TypeKind.TY_FLOAT or tk == TypeKind.TY_BOOL or tk == TypeKind.TY_PTR or tk == TypeKind.TY_VECTOR or tk == TypeKind.TY_VA_LIST: return ""
+        if tk == TypeKind.TY_ENUM: return if self.enum_variant_sym_for_discriminant(resolved, 0) != 0: "" else: here
+        if tk == TypeKind.TY_ARRAY: return self.zero_invalid_part(self.get_type_d0(resolved as TypeId), path ++ "[]")
+        if tk == TypeKind.TY_GENERIC_INST:
+            if self.get_generic_inst_base(resolved) == self.syms.option and self.std_option_variant_tag(self.syms.none) == 0: return ""
+            return here
+        if tk != TypeKind.TY_STRUCT: return here
+        let te_start = self.get_type_d1(resolved as TypeId)
+        for fi in 0..self.get_type_d2(resolved as TypeId):
+            let fname: str = self.pool_resolve(self.type_extra[(te_start + fi * 3)])
+            let inner = self.zero_invalid_part(self.type_extra[(te_start + fi * 3 + 1)], if path.len() == 0: fname else: path ++ "." ++ fname)
+            if inner.len() > 0: return inner
+        ""
+
+    // §18.3 (D100): a field without `pub` is visible throughout its package.
+    // A distinct type's `.value` is the language's unwrap, not a declared
+    // field; a C type's fields are C's, which has no privacy.
+    mut fn check_field_visible(owner: i32, field: i32, node: i32):
+        // A field read through a Box is its payload's field (field access
+        // looks through Box): judge the type that declares it.
+        let owner_res = self.resolve_alias(owner as TypeId) as i32
+        if self.struct_field_decl_index(owner_res, field) < 0 and self.get_type_kind(owner_res as TypeId) == TypeKind.TY_GENERIC_INST and self.get_generic_inst_arg_count(owner_res) == 1 and self.type_symbol_is_std_box(self.get_generic_inst_base(owner_res)) != 0:
+            self.check_field_visible(self.get_generic_inst_arg(owner_res, 0), field, node)
+            return
+        let decl = self.type_decl_node_of(owner)
+        if decl == 0 or self.pub_field_keys.contains(sema_field_key(decl, field)): return
+        let resolved = self.resolve_alias(owner as TypeId) as i32
+        if self.get_type_kind(resolved as TypeId) == TypeKind.TY_STRUCT and self.distinct_type_names.contains(self.get_type_d0(resolved as TypeId)): return
+        let di = self.find_decl_index(decl)
+        if di < 0 or di >= self.decl_source_paths.len() as i32: return
+        if di < self.decl_is_c_import.len() as i32 and self.decl_is_c_import[di] != 0: return
+        let path = self.decl_source_paths[di].clone()
+        if self.package_of(path) == self.package_of(self.current_module_path): return
+        if self.suppress_errors != 0: return
+        let type_name: str = self.type_name(owner)
+        let field_name: str = self.pool_resolve(field)
+        self.emit_error_with_help(f"field '{type_name}.{field_name}' is private to its package (declared in '{path}', §18.3)", node, "mark the field `pub` to export it from its package")
+
     mut fn note_field_access_decl(node: i32, owner: i32, field: i32):
         let index = self.struct_field_decl_index(owner, field)
         if index >= 0:
@@ -33435,6 +33557,8 @@ impl Sema:
         self.type_extra[(pos + 2 + payload_index)]
 
     mut fn check_static_type_method_call(obj_type: i32, field: i32, extra_start: i32, arg_count: i32, node: i32) -> i32:
+        if field == self.syms.zeroed and self.type_is_c_record(obj_type):
+            return self.check_zeroed_call(obj_type, arg_count, node)
         let is_type_method =
             field == self.syms.fields or
             field == self.syms.variants or

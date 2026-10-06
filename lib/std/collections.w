@@ -339,8 +339,8 @@ impl[T: Ord] Iterable[T] for BTreeSet[T]:
 /// Handles are Copy and carry their owner element type at compile time, so a
 /// Handle[Texture] cannot be used with a SlotMap[Mesh].
 pub type Handle[T] {
-    index: u32,
-    generation: u32,
+    pub index: u32,
+    pub generation: u32,
 }
 
 impl[T] Copy for Handle[T]
@@ -422,6 +422,13 @@ impl[T] Iterable[T] for Vec[T]:
 
 /// Each element with its index (§13.5): `for (i, x) in xs.enumerate():`.
 impl[T] Vec[T]:
+    // D100 (§18.3): Vec's fields are private to std. The buffer's address,
+    // for a C call or a runtime helper; reading through it is `unsafe`.
+    pub fn as_ptr() -> *const T: self.ptr
+    pub fn as_mut_ptr() -> *mut T: self.ptr as *mut T
+    // How many elements the buffer holds before it grows.
+    pub fn capacity() -> i64: self.cap
+
     // The result type is the body's: over elements that own something
     // `iter()` yields views (#2145), so the pairs hold `&T`.
     fn enumerate(): self.iter() |> enumerate()
@@ -698,13 +705,13 @@ impl[I, T] Iter[T] for StepByIter[I, T]:
 /// Index specification for multi-dimensional indexing.
 /// Used by the MultiIndex trait. kind: 0=scalar, 1=slice, 2=ellipsis, 3=newaxis.
 pub type IndexSpec {
-    kind: i32,
-    start: i64,
-    stop: i64,
-    step: i64,
-    has_start: bool,
-    has_stop: bool,
-    has_step: bool,
+    pub kind: i32,
+    pub start: i64,
+    pub stop: i64,
+    pub step: i64,
+    pub has_start: bool,
+    pub has_stop: bool,
+    pub has_step: bool,
 }
 
 // §13.3 (#1746): `it.collect[Vec]()` on any Iter[T] implementor, the one

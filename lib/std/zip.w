@@ -16,8 +16,8 @@ const ZIP_CHUNK: i32 = 65536
 const ZIP_HOST_UNIX: i64 = 3
 
 pub type ZipError {
-    code: i32,
-    message: str,
+    pub code: i32,
+    pub message: str,
 }
 
 fn zip_error(code: i32, message: str): ZipError { code: code, message: message }
@@ -25,10 +25,10 @@ fn zip_error(code: i32, message: str): ZipError { code: code, message: message }
 /// One member of an archive. `mode` is the Unix permission bits, or 0 when
 /// the archive does not carry them.
 pub type ZipEntry {
-    name: str,
-    size: i64,
-    mode: i32,
-    is_dir: bool,
+    pub name: str,
+    pub size: i64,
+    pub mode: i32,
+    pub is_dir: bool,
 }
 
 /// An open archive; closed when it goes out of scope.
