@@ -196,6 +196,25 @@ fn count_non_use_decls_frontend(pool: AstPool) -> i32:
     count
 
 impl Zcu:
+    // §18.3 (D100): every `use` of the merged program, once the module graph
+    // is loaded: a target under an `internal` path segment is importable only
+    // from inside its parent's tree (resolve_internal_import_refusal). One
+    // pass here covers every path that loaded a module.
+    mut fn check_internal_imports_frontend(pool: AstPool):
+        for di in 0..pool.decl_count():
+            let decl = pool.get_decl(di)
+            if pool.kind(decl) != NodeKind.NK_USE_DECL: continue
+            let ps = pool.get_data0(decl)
+            let pc = pool.get_data1(decl)
+            if pc <= 0 or self.use_decl_is_local_type_selector_frontend(pool, decl): continue
+            let dotted = self.use_path_name_frontend(pool, ps, pc)
+            let target = self.resolve_module_path_frontend(dotted, self.decl_source_dir_frontend(di))
+            if target.len() == 0: continue
+            let refusal = resolve_internal_import_refusal(self.decl_source_path_frontend(di), target, dotted.replace("/", "."))
+            if refusal.len() == 0: continue
+            let span = Span { file: self.decl_source_file_id_frontend(di), start: pool.get_start(decl), end: pool.get_end(decl) }
+            self.diagnostics.emit(Diagnostic.err(refusal, span))
+
     mut fn emit_missing_import_frontend(pool: AstPool, decl: i32):
         // #932: name the module — an unnamed miss cost a debugger session
         // to bisect (a fresh clone lacks the build-generated modules).
@@ -1835,6 +1854,7 @@ impl Zcu:
         var sema = self.configure_tracked_input_sema(Sema.init(self.pool, move self.diagnostics, pool))
         sema.source_text = with_str_clone_ref(text)
         sema.decl_source_paths = sema_clone_str_vec(&self.decl_source_paths)
+        sema.package_keys = self.package_key_map()
         sema.decl_source_file_ids = sema_clone_i32_vec(&self.decl_source_file_ids)
         sema.decl_is_c_import = sema_clone_i32_vec(&self.decl_is_c_import)
         sema.source_text_file_ids = sema_clone_i32_vec(&self.source_text_file_ids)
@@ -1939,6 +1959,7 @@ impl Zcu:
         // decls — the root file's own decl count excludes it.
         let root_local_decl_count = count_non_use_decls_frontend(pool) - self.prelude_prefix_non_use
 
+        self.check_internal_imports_frontend(pool)
         if self.diagnostics.has_errors():
             self.render_all_diagnostics_frontend()
             self.set_resolve_snapshot(ResolveResult.init(), name)
@@ -2027,6 +2048,7 @@ impl Zcu:
             var pre_sema = self.configure_tracked_input_sema(Sema.init(self.pool, move self.diagnostics, pool))
             pre_sema.source_text = with_str_clone_ref(text)
             pre_sema.decl_source_paths = sema_clone_str_vec(&self.decl_source_paths)
+            pre_sema.package_keys = self.package_key_map()
             pre_sema.decl_source_file_ids = sema_clone_i32_vec(&self.decl_source_file_ids)
             pre_sema.decl_is_c_import = sema_clone_i32_vec(&self.decl_is_c_import)
             pre_sema.source_text_file_ids = sema_clone_i32_vec(&self.source_text_file_ids)
