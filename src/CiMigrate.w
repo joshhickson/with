@@ -757,16 +757,8 @@ fn ci_migrate_preamble_text() -> str:
         // semantics).
         p = p ++ "extern fn abort() -> Never\n"
         p = p ++ "fn __ci_unreachable() -> Never: abort()\n"
-    p = p ++ "\ntype c_char = i8\n"
-    p = p ++ "type c_short = i16\n"
-    p = p ++ "type c_ushort = u16\n"
-    p = p ++ "type c_int = i32\n"
-    p = p ++ "type c_uint = u32\n"
-    p = p ++ "type c_long = i64\n"
-    p = p ++ "type c_ulong = u64\n"
-    p = p ++ "type c_longlong = i64\n"
-    p = p ++ "type c_ulonglong = u64\n"
-    p = p ++ "type c_longdouble = f64\n"
+    // #2176: the C model's aliases (`--c-target`), the host's when none is named.
+    p = p ++ "\n" ++ ci_c_type_aliases(with_cimport_target_triple())
     // Clang's overflow builtins both store the wrapped result and report the
     // overflow bit. Keep both effects: the structural call lowerer selects
     // the helper from the result-pointer type and rejects mixed types loudly.
@@ -1135,9 +1127,17 @@ impl CiProject:
                     continue
                 if with_cimport_fn_storage_class(session, i) == CX_SC_STATIC:
                     // D107: a static definition's NULL arguments are corpus
-                    // caller evidence even though it is no project symbol.
+                    // caller evidence even though it is no project symbol,
+                    // and its own body is the evidence for ITS fn-pointer
+                    // parameters (a static callee passed NULL by its unit
+                    // was rendered non-null and its NULL test folded, #2230
+                    // smoke). The table is name-keyed: a second static of the
+                    // same name in another unit keeps the first's evidence.
                     if cursor >= 0 and with_ci_cursor_is_definition(session, cursor) != 0:
                         self.record_call_evidence(session, cursor, name)
+                        let static_symbol = self.ensure_symbol(CiProjectSymbolKind.CIPS_FN, name)
+                        if self.symbols[static_symbol].has_definition == 0:
+                            self.record_fn_evidence(session, i, cursor, static_symbol)
                     // A `static inline` function DEFINED in a header is the
                     // header's API: every includer compiles a private copy,
                     // and the unit of the same name (tommyhashdyn.c for
@@ -1737,6 +1737,7 @@ impl CiProject:
             let count = self.symbols[si].param_fn_ptr.len() as i32
             for pi in 0..count:
                 if self.symbols[si].param_fn_ptr[pi] == 0 or self.symbols[si].param_nullable[pi] != 0: continue
+                self.sink_seen = HashMap.new()
                 if self.sink_chain_reaches(si, pi, si, pi, 0):
                     self.symbols[si].param_nullable[pi] = 1
                     self.symbols[si].param_reason[pi] = "Option: part of a cycle of forwarded parameters"
@@ -1747,8 +1748,16 @@ impl CiProject:
                 if self.symbols[si].param_fn_ptr[pi] != 0 and self.symbols[si].param_nullable[pi] == 0:
                     self.symbols[si].param_reason[pi] = if self.symbols[si].param_aborting[pi] != 0: "non-null: the NULL branch aborts (a contract), no NULL callers" else: "non-null: called unconditionally, no NULL callers"
 
-    fn sink_chain_reaches(from_si: i32, from_pi: i32, target_si: i32, target_pi: i32, depth: i32) -> bool:
+    // Whether `from`'s parameter forwards, through any chain of sinks, into
+    // `target`'s. Each (symbol, parameter) is entered once per walk
+    // (`sink_seen`, cleared by the caller): without that the walk was
+    // exponential over helpers that forward one callback to several, and a
+    // tommyds migration ran past 20 minutes (#2230 smoke).
+    mut fn sink_chain_reaches(from_si: i32, from_pi: i32, target_si: i32, target_pi: i32, depth: i32) -> bool:
         if depth > 64: return false
+        let mark = f"{from_si}:{from_pi}"
+        if self.sink_seen.contains(mark): return false
+        self.sink_seen.insert(mark, 1)
         for sink in self.symbols[from_si].param_sinks[from_pi].split(";"):
             if not sink.contains(":"): continue
             let kv = sink.split(":")
@@ -1897,6 +1906,11 @@ pub fn migrate_c_directory(input_dir_arg: &str, output_dir_arg: &str, exclude_ba
         eprint(f"migrate: {files_migrated}/{files_scanned} files, {g_migrate_fn_translated_total}/{fn_total} functions translated{file_note}")
         return 1
     eprint(f"migrate: {files_migrated}/{files_scanned} files, {fn_total} functions translated from {input_dir} -> {output_dir}")
+    // #2230: the rewrite rules applied, by function, for migrate_diff.
+    let rules = ci_take_rule_sites()
+    if files_migrated > 0 and with_fs_write_file(output_dir ++ "/rules.tsv", rules) != 0:
+        eprint("migrate: could not write " ++ output_dir ++ "/rules.tsv")
+        return 1
     if files_migrated == 0: 1 else: ci_migrate_apply_writes_clauses()
 
 // ── `writes` clauses (§21.1 rule 1, Eric 2026-09-29) ────────────

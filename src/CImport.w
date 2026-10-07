@@ -489,6 +489,59 @@ pub fn ci_record_omitted_symbol(name: &str, reason: &str):
     // for ABI-expressible constructs that can be reached via the raw surface.
     ci_record_omitted_symbol_cat(name, "", "inexpressible", reason)
 
+// §16.1 (#2176): the C type aliases of a target. `triple` is the parsed
+// target when the parse names one (a Windows selection, a named C model);
+// "" means the active target (TargetSpec). The sizes follow the target's C
+// ABI: `long` is 32 bits on Windows (LLP64) and wasm32, 64 elsewhere;
+// `char` is unsigned on AArch64 Linux and on wasm, signed elsewhere; `long
+// double` is 64 bits only on AArch64 Darwin and Windows — on x86_64 Linux it
+// is the 80-bit extended type and on AArch64 Linux and wasm a 128-bit quad,
+// which With has no float for, so no alias is emitted there and a
+// declaration that needs it is omitted with that reason (ci_type_is_known).
+pub fn ci_c_type_aliases(triple: &str) -> str:
+    let os = if triple.len() > 0: (if ci_str_contains(triple, "windows"): "Windows" else if ci_str_contains(triple, "linux"): "Linux" else if ci_str_contains(triple, "apple"): "Macos" else if ci_str_contains(triple, "wasi") or ci_str_contains(triple, "wasm"): "Wasi" else: "Macos") else: target_spec_os()
+    let arch = if triple.len() > 0: (if ci_str_contains(triple, "aarch64") or ci_str_contains(triple, "arm64"): "aarch64" else if ci_str_contains(triple, "wasm32"): "wasm32" else if ci_str_contains(triple, "wasm64"): "wasm64" else: "x86_64") else: target_spec_arch()
+    let wasm = arch == "wasm32" or arch == "wasm64"
+    let long_bits = if os == "Windows" or arch == "wasm32": 32 else: 64
+    let char_unsigned = (os == "Linux" and arch == "aarch64") or wasm
+    let long_double_64 = (os == "Macos" and arch == "aarch64") or os == "Windows"
+    var out = "type c_char = " ++ (if char_unsigned: "u8" else: "i8") ++ "\n"
+    out = out ++ "type c_short = i16\ntype c_ushort = u16\ntype c_int = i32\ntype c_uint = u32\n"
+    out = out ++ "type c_long = " ++ (if long_bits == 32: "i32" else: "i64") ++ "\n"
+    out = out ++ "type c_ulong = " ++ (if long_bits == 32: "u32" else: "u64") ++ "\n"
+    out = out ++ "type c_longlong = i64\ntype c_ulonglong = u64\n"
+    if long_double_64:
+        out = out ++ "type c_longdouble = f64\n"
+    out
+
+// #2176: whether the parsed target's `long double` has a With float.
+pub fn ci_c_long_double_representable(triple: &str) -> bool:
+    ci_str_contains(ci_c_type_aliases(triple), "c_longdouble")
+
+// #2230: every rewrite rule the migrator applies is tagged with the
+// function it rewrote, so `tools/migrate_diff.w` names the rule behind a
+// function whose lowering changed between two migrations. One line per
+// site, `rule<TAB>function<TAB>detail`; a directory migration writes them
+// as `rules.tsv` beside its output (never promoted into a corpus).
+var g_ci_rule_sites: Vec[str] = Vec.new()
+var g_ci_rule_fn: str = ""
+
+pub fn ci_set_rule_fn(name: &str): g_ci_rule_fn = with_str_clone_ref(name)
+
+pub fn ci_note_rule(rule: &str, detail: &str): ci_note_rule_for(g_ci_rule_fn, rule, detail)
+
+// A rule applied to a declaration (its signature renders outside any
+// body); one line per distinct site, however often the signature renders.
+pub fn ci_note_rule_for(fn_name: &str, rule: &str, detail: &str):
+    let line = rule ++ "\t" ++ fn_name ++ "\t" ++ detail
+    if not g_ci_rule_sites.contains(line): g_ci_rule_sites.push(line)
+
+pub fn ci_take_rule_sites() -> str:
+    var out = ""
+    for line in g_ci_rule_sites: out = out ++ line ++ "\n"
+    g_ci_rule_sites = Vec.new()
+    out
+
 fn ci_record_omitted_symbol_cat(name: &str, location: &str, category: &str, reason: &str):
     if name.len() == 0:
         return
@@ -708,19 +761,10 @@ pub fn process_c_import_with_defines(header_spec: &str, defines: &Vec[str], cxx:
         with_cimport_mark_name_emitted("c_void")
         ci_mark_type_name_emitted("c_void")
 
-    // Emit platform-specific C type aliases (matching Zig's c_int, c_long, etc.)
+    // Emit the C type aliases of the parsed target (matching Zig's c_int,
+    // c_long, etc.; #2176: `long` and `char` differ by target).
     if with_cimport_is_name_emitted("c_char") == 0:
-        // arm64 macOS: char=signed, int=32, long=64, short=16
-        output.push_str("type c_char = i8\n")
-        output.push_str("type c_short = i16\n")
-        output.push_str("type c_ushort = u16\n")
-        output.push_str("type c_int = i32\n")
-        output.push_str("type c_uint = u32\n")
-        output.push_str("type c_long = i64\n")
-        output.push_str("type c_ulong = u64\n")
-        output.push_str("type c_longlong = i64\n")
-        output.push_str("type c_ulonglong = u64\n")
-        output.push_str("type c_longdouble = f64\n")
+        output.push_str(ci_c_type_aliases(with_cimport_target_triple()))
         with_cimport_mark_name_emitted("c_char")
         with_cimport_mark_name_emitted("c_short")
         with_cimport_mark_name_emitted("c_ushort")
@@ -1072,7 +1116,7 @@ fn ci_translated_builtin_type_name(name: &str) -> bool:
     if name == "c_ulong": return true
     if name == "c_longlong": return true
     if name == "c_ulonglong": return true
-    if name == "c_longdouble": return true
+    if name == "c_longdouble": return ci_c_long_double_representable(with_cimport_target_triple())
     if name == "Complex32": return true
     if name == "Complex64": return true
     if name == "i8" or name == "u8": return true
@@ -6790,6 +6834,7 @@ impl CiExprPool:
         if (other_ty as i32) == 0: return 0 as CiExprId
         let other_text = ci_print_type(types, other_ty)
         if not ci_type_text_is_fn_ptr(other_text) or ci_nullable_fn_ptr_inner(other_text).len() > 0: return 0 as CiExprId
+        ci_note_rule("D107 a non-null fn-pointer parameter compared with NULL folds", other_text)
         if as_bool: return self.bool_lit(if is_eq: 0 else: 1, 0 as CiTypeId)
         let folded = self.add_string(if is_eq: "0" else: "1")
         self.int_lit(folded, 0 as CiTypeId)
@@ -7646,6 +7691,7 @@ pub fn ci_migrated_param_type(session: i64, idx: i32, pi: i32) -> str:
     if with_getenv_str("WITH_DEBUG_MIGRATE_NULLABLE").len() > 0:
         eprint("[migrate-nullable] " ++ with_cimport_decl_name(session, idx) ++ f" param {pi}: verdict {verdict} raw " ++ raw)
     if verdict == 1:
+        ci_note_rule_for(with_cimport_decl_name(session, idx), "D107 nullable-by-evidence fn-pointer parameter", f"param {pi}: " ++ ci_migrate_fn_param_reason(with_cimport_decl_name(session, idx), pi))
         return "Option[" ++ ci_unsafe_fn_ptr_type(raw) ++ "]"
     raw
 
@@ -8256,6 +8302,7 @@ impl CiExprPool:
                     g_ci_bail_message = "`{0}` initializer of '" ++ ty_str ++ "' has no `zeroed()`: " ++ invalid ++ " is not zero-valid (D101)"
                     g_ci_bail_location = with_ci_cursor_location(session, cursor)
                 return 0 as CiExprId
+            ci_note_rule("D101 a {0} record initializer is T.zeroed()", ty_str)
             let zero_start = self.extra_len() as i32
             ci_trace_port("STRUCTURAL[b11.11.init_list]")
             return self.designated_init(zero_start, 0, init_ty_id)
@@ -10932,6 +10979,7 @@ impl CiExprPool:
                 g_ci_bail_location = with_ci_cursor_location(session, cursor)
             return 0 as CiExprId
         let none: Vec[i32] = Vec.new()
+        ci_note_rule("D101 memset-to-zero of a record is T.zeroed()", record_text)
         let zeroed = self.build_named_call_expr_typed(record_text ++ ".zeroed", &none, record_ty)
         self.add(CiExprKind.CIE_ASSIGN, place as i32, zeroed as i32, 0, record_ty)
 
@@ -13694,6 +13742,7 @@ fn ci_try_translate_fn_body_at(session: i64, decl_idx: i32, found_cursor: i32) -
     g_ci_body_hoisted_decls = ""
     g_ci_body_tail_unit = false
     ci_clear_bail_location()
+    ci_set_rule_fn(with_cimport_decl_name(session, decl_idx))
     // B9: fresh per-function temp counter. This path is called
     // from ci_translate_function's static-inline branch — which
     // already resets — but also from other call sites for header
