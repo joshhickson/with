@@ -7574,7 +7574,6 @@ impl Sema:
             if method_name == "ends_with": return MirIntrinsic.STR_ENDS_WITH
             if method_name == "find": return MirIntrinsic.STR_FIND
             if method_name == "split": return MirIntrinsic.STR_SPLIT
-            if method_name == "trim": return MirIntrinsic.STR_TRIM
             if method_name == "to_upper" or method_name == "upper": return MirIntrinsic.STR_TO_UPPER
             if method_name == "to_lower" or method_name == "lower": return MirIntrinsic.STR_TO_LOWER
             if method_name == "replace": return MirIntrinsic.STR_REPLACE
@@ -15244,7 +15243,10 @@ impl Sema:
 
     fn fn_symbol_is_std_str_comptime_allowed(fn_sym: i32) -> i32:
         let source_path = self.fn_symbol_source_path(fn_sym)
-        if source_path.ends_with("string.w") and self.pool_resolve(fn_sym) == "str.to_owned": 1 else: 0
+        // D104 (#2225): every `impl str` method std.string spells with a With
+        // body runs at compile time (the evaluator takes the user-method path
+        // for one it has no builtin for); `to_owned` was the one allowed.
+        if source_path.ends_with("string.w") and self.pool_resolve(fn_sym).starts_with("str."): 1 else: 0
 
     // The comptime evaluator implements the Vec core (push/pop/get/set/
     // clear/len/is_empty) directly; the flip's method registration exposed
@@ -16456,6 +16458,20 @@ impl Sema:
                     // parameter views (the signature's through mask, from
                     // the callee's body; unproven is storage).
                     let views_storage = sema_param_origin_mask_contains(param_through_mask, origin_pi) == 0
+                    // #962 for a callee (#2225): the result views an
+                    // argument that is a statement temporary owning storage
+                    // (`s.slice(a, b).trim()`: the slice's owned str dies
+                    // when the statement ends, the trim view pointed into
+                    // it and a binding of it read freed memory in the
+                    // compiler itself), or a carrier of one. Remember it:
+                    // a binding or a return of this result is rejected.
+                    if views_storage and self.typed_expr_types.contains(origin_arg):
+                        let arg_ty: i32 = self.typed_expr_types.get(origin_arg).unwrap()
+                        if arg_ty != 0 and self.ast.kind(origin_arg) == NodeKind.NK_CALL and unpack_place_kind(self.classify_place(origin_arg)) == PlaceKind.PK_NotPlace and self.type_needs_drop(arg_ty) != 0 and self.type_is_view_handle(arg_ty) == 0 and self.type_is_ephemeral_value(arg_ty) == 0:
+                            self.expr_view_into_temporary.insert(call_node, arg_ty)
+                    let carried_temp = self.view_into_temporary_type(origin_arg)
+                    if carried_temp != 0:
+                        self.expr_view_into_temporary.insert(call_node, carried_temp)
                     union_mask = union_mask | self.compute_expr_view_origin_mask(origin_arg)
                     storage_mask = storage_mask | (if views_storage: self.arg_storage_origin_mask(origin_arg, is_recv) else: self.arg_viewed_storage_origin_mask(origin_arg, is_recv))
                     let dep_len_before = concrete_deps.len() as i32
@@ -29873,7 +29889,7 @@ impl Sema:
                 return self.ty_bool as i32
             if method_name == "find" or method_name == "index_of":
                 return self.ty_i64 as i32
-            if field == self.syms.trim or field == self.syms.to_lower or field == self.syms.to_upper or field == self.syms.lower or field == self.syms.upper or field == self.syms.replace or field == self.syms.slice or method_name == "repeat":
+            if field == self.syms.to_lower or field == self.syms.to_upper or field == self.syms.lower or field == self.syms.upper or field == self.syms.replace or field == self.syms.slice or method_name == "repeat":
                 return self.ty_str as i32
             if method_name == "split":
                 return self.ensure_vec_str_type()
