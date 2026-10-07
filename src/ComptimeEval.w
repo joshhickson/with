@@ -295,6 +295,11 @@ type ComptimeEvaluator {
     // Collection evaluators still perform their ordinary rebind, but expose
     // the updated receiver as the pipeline carrier instead of the Unit result.
     pipeline_receiver_carrier_depth: i32,
+    // #2220: the type a site demands of the expression being evaluated (Law
+    // 2's demand, in the evaluator). Top-level folding runs before Sema, so
+    // typed_expr_types is empty and `Vec.new()` under `var v: Vec[i32] =`
+    // saw only the generic base; the annotation is the demand that binds it.
+    expected_types: Vec[i32],
     // Top-level comptime folding precedes Sema, so D21 carrier roots cannot
     // rely only on Sema.pipeline_carrier_kinds. Record the root established by
     // each evaluated carrier stage for the next stage in the same chain.
@@ -394,6 +399,7 @@ fn ComptimeEvaluator.init(sema: Sema, ast: AstPool, pool: InternPool, require_su
         tool_identity_values: Vec.new(),
         strict_effects: 0,
         pipeline_receiver_carrier_depth: 0,
+        expected_types: Vec.new(),
         pipeline_receiver_carrier_roots: HashMap.new(),
         last_call_has_mut_receiver: 0,
         last_call_mut_receiver: comptime_value_invalid(),
@@ -3037,7 +3043,9 @@ impl ComptimeEvaluator:
             return self.fail(node, "collection.new() takes no arguments in comptime")
         let resolved = self.sema.resolve_alias(result_type)
         if self.sema.get_type_kind(resolved) != TypeKind.TY_GENERIC_INST:
-            return self.fail(node, "collection.new() requires a concrete generic type")
+            // #2220: the fold runs before Sema, so the use-site demand (D93)
+            // is not yet known here; the binding's annotation is.
+            return self.fail(node, "collection.new() has no element type here: comptime folding runs before Sema types the uses, so write the binding's type (`var v: " ++ self.sema.type_name(resolved) ++ "[…] = …`)")
         let type_name = self.sema.type_name(result_type)
         let empty_start = self.extra_values.len() as i32
         if comptime_type_name_has_base(type_name, "Vec") != 0:
@@ -7179,11 +7187,25 @@ impl ComptimeEvaluator:
             return self.fail(else_body, "a let-else branch must not fall through")
         else_signal
 
+    // The type a binding's annotation declares, 0 without one.
+    mut fn local_annotation_type(flags: i32) -> i32:
+        let ann_extra = self.sema.local_let_type_ann_extra(flags)
+        if ann_extra < 0: return 0
+        self.sema.resolve_type_expr(self.ast.get_extra(ann_extra)) as i32
+
+    // The innermost demanded type, 0 when nothing is demanded.
+    fn expected_type() -> i32:
+        if self.expected_types.len() == 0: 0 else: self.expected_types[self.expected_types.len() as i32 - 1]
+
     mut fn eval_let_binding(node: i32) -> ComptimeControl:
+        let flags = self.ast.get_data2(node)
+        // #2220: the annotation is the demand on the initializer.
+        let demanded = self.local_annotation_type(flags)
+        self.expected_types.push(demanded)
         var value_signal = self.eval_expr(self.ast.get_data1(node))
+        self.expected_types.pop()
         if value_signal.kind != ComptimeControlKind.CTL_VALUE:
             return value_signal
-        let flags = self.ast.get_data2(node)
         let is_mut = flags % 2
         // #943: a local `let`/`var` annotation is the declared type of the
         // binding, and pre-sema it is the only place that width is written.
@@ -7506,7 +7528,10 @@ impl ComptimeEvaluator:
         let binding = self.ast.get_data0(node)
         let body = self.ast.get_data2(node)
         var count = 0
-        if iterable_signal.value.kind == ComptimeValueKind.CV_ARRAY or iterable_signal.value.kind == ComptimeValueKind.CV_TUPLE or iterable_signal.value.kind == ComptimeValueKind.CV_VEC:
+        // #2220: a map iterates its entries as (key, value) tuples, D44's
+        // `for (k, v) in map`; the entries sit in extra_values as pairs.
+        let is_map = iterable_signal.value.kind == ComptimeValueKind.CV_MAP
+        if iterable_signal.value.kind == ComptimeValueKind.CV_ARRAY or iterable_signal.value.kind == ComptimeValueKind.CV_TUPLE or iterable_signal.value.kind == ComptimeValueKind.CV_VEC or is_map:
             count = iterable_signal.value.extra_count
         else if iterable_signal.value.kind == ComptimeValueKind.CV_RANGE:
             let start_value = iterable_signal.value.data0
@@ -7515,8 +7540,10 @@ impl ComptimeEvaluator:
             if count < 0:
                 count = 0
         else:
-            return self.fail(node, "comptime for requires an array, tuple, vec, or range")
+            return self.fail(node, "comptime for requires an array, tuple, vec, map, or range")
 
+        // `for (k, v) in …`: the binding is a pattern the parser marked.
+        let binds_pattern = self.ast.has_pattern_binding(node as NodeId, binding)
         let for_meta = self.ast.find_for_meta(node)
         let index_binding = if for_meta >= 0: self.ast.for_meta_index_binding(for_meta) else: 0
         let loop_label = if for_meta >= 0: self.ast.for_meta_label(for_meta) else: 0
@@ -7527,8 +7554,14 @@ impl ComptimeEvaluator:
                 let step_value = iterable_signal.value.data0 + i as i64
                 self.bind_value(binding, comptime_value_int(self.sema.ty_i64 as i32, step_value), 0)
             else:
-                let elem = self.extra_value_at((iterable_signal.value.extra_start + i) as i64)
-                self.bind_value(binding, elem, 0)
+                let elem = if is_map: comptime_value_tuple(0, iterable_signal.value.extra_start + i * 2, 2) else: self.extra_value_at((iterable_signal.value.extra_start + i) as i64)
+                if binds_pattern:
+                    if self.match_pattern(binding, elem, node) == 0:
+                        self.pop_scope()
+                        self.loop_labels.pop()
+                        return self.fail(node, "comptime for pattern does not match the element")
+                else:
+                    self.bind_value(binding, elem, 0)
             if index_binding != 0:
                 self.bind_value(index_binding, comptime_value_int(self.sema.ty_i64 as i32, i as i64), 0)
             let body_signal = self.eval_expr(body)
@@ -7765,7 +7798,20 @@ impl ComptimeEvaluator:
                     let result_type = self.node_type_or(node, recv_type)
                     return self.eval_static_string_builder_method_call(result_type, method_name, self.ast.get_data1(node), arg_count, node)
                 if method_name == "new":
-                    let result_type = self.node_type_or(node, recv_type)
+                    var result_type = self.node_type_or(node, recv_type)
+                    var type_source = if self.sema.typed_expr_types.contains(node): "sema" else: "receiver"
+                    // #2220: before Sema has typed the node, the generic base
+                    // is all the receiver gives; the demanded type (a let
+                    // annotation) names the instance, as Sema would (Law 2).
+                    if result_type != 0 and self.sema.get_type_kind(self.sema.resolve_alias(result_type)) != TypeKind.TY_GENERIC_INST:
+                        let recv_name = self.sema.type_name(self.sema.resolve_alias(result_type))
+                        let base = if comptime_type_name_has_base(recv_name, "Vec") != 0: "Vec" else if comptime_type_name_has_base(recv_name, "HashMap") != 0: "HashMap" else: ""
+                        let demanded = self.expected_type()
+                        if base.len() > 0 and demanded != 0 and self.sema.get_type_kind(self.sema.resolve_alias(demanded)) == TypeKind.TY_GENERIC_INST and comptime_type_name_has_base(self.sema.type_name(self.sema.resolve_alias(demanded)), base) != 0:
+                            result_type = demanded
+                            type_source = "demand"
+                    if with_getenv_str("WITH_TRACE_COMPTIME").len() > 0:
+                        with_eprint(f"[ct] static_new node={node} recv='{self.sema.type_name(recv_type)}' result='{self.sema.type_name(result_type)}' from={type_source}")
                     if result_type != 0:
                         let resolved_result = self.sema.resolve_alias(result_type)
                         let result_name = self.sema.type_name(resolved_result)
