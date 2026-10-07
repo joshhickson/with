@@ -303,6 +303,17 @@ fn analysis_collect_types(report: &AnalysisReport, sema: &Sema):
         fact.symbol = if kind == TypeKind.TY_STRUCT or kind == TypeKind.TY_ENUM or kind == TypeKind.TY_ALIAS: d0 else: 0
         fact.name = with_str_clone_ref(type_name)
         fact.detail = f"kind={kind} d0={d0} d1={d1} d2={d2}"
+        // #2211: a declared type names its declaration node, module and start
+        // byte, as a function declaration fact does, so a tool can find the
+        // declaration (pub_lint reads its `pub`).
+        if fact.symbol != 0 and sema.type_decl_nodes.contains(fact.symbol):
+            let decl_node: i32 = sema.type_decl_nodes.get(fact.symbol).unwrap()
+            fact.node = decl_node
+            fact.start = sema.ast.get_start(decl_node)
+            fact.end = sema.ast.get_end(decl_node)
+            if sema.decl_visibility_node_index.contains(decl_node):
+                let record: i32 = sema.decl_visibility_node_index.get(decl_node).unwrap()
+                fact.path = with_str_clone_ref(sema.decl_visibility_paths[record])
         report.add(move fact)
 
         if kind != TypeKind.TY_STRUCT:
@@ -704,6 +715,24 @@ fn analysis_collect_specializations(report: &AnalysisReport, sema: &Sema, source
         fact.detail = parts.join("")
         report.add(move fact)
 
+// #2211: every resolved name use Sema recorded (a global read, a function
+// taken as a value, a type name): `path` is the referencing module, `detail`
+// names the declaration's module and package, so a lint can ask whether
+// anything outside a declaration's package names it. Calls and method
+// resolutions are their own facts (join them by sig and owner.method).
+fn analysis_collect_name_references(report: &AnalysisReport, sema: &Sema, source_path: &str, source_text: &str):
+    for i in 0..sema.name_use_nodes.len() as i32:
+        var fact = AnalysisFact.new(AnalysisStage.Sema, AnalysisFactKind.Reference)
+        fact.id = i
+        fact.node = sema.name_use_nodes[i]
+        fact.name = with_str_clone_ref(sema.name_use_names[i])
+        fact.path = with_str_clone_ref(sema.name_use_from[i])
+        fact.detail = "use=" ++ sema.name_use_kinds[i] ++ " target-path=" ++ sema.name_use_paths[i] ++ " target-package=" ++ sema.package_of(sema.name_use_paths[i]) ++ " from-package=" ++ sema.package_of(sema.name_use_from[i])
+        let use_node = fact.node
+        if use_node != 0:
+            fact = analysis_with_node_location(move fact, sema, use_node, source_path, source_text)
+        report.add(move fact)
+
 fn analysis_collect_resolved_calls(report: &AnalysisReport, sema: &Sema, source_path: &str, source_text: &str):
     for node in 1..sema.ast.node_count():
         let sig_opt = sema.resolved_call_sigs.get(node)
@@ -832,6 +861,7 @@ fn analysis_collect_sema(report: &AnalysisReport, sema: &Sema, source_path: &str
     analysis_collect_specializations(report, sema, source_path)
     analysis_collect_resolved_calls(report, sema, source_path, source_text)
     analysis_collect_method_resolutions(report, sema, source_path, source_text)
+    analysis_collect_name_references(report, sema, source_path, source_text)
     analysis_collect_foreign_contracts(report, sema, source_path, source_text)
 
 fn analysis_operand_kind_name(kind: i32) -> str:
