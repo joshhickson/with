@@ -123,7 +123,7 @@ extend UserService:
 
     pub fn make_welcome_notification(user: &User) -> Notification:
         Notification {
-            recipient: user.email.clone(),
+            recipient: user.email,
             subject: "Welcome to the platform",
             body: self.welcome_body(user.role),
             priority: .Normal,
