@@ -417,6 +417,9 @@ pub enum CallBuiltin: i32:
     EnumFromInt = 21
     // D96: `with_key_hash[K](key)`, the body of `std.hash.hash_of`.
     KeyHash = 22
+    // D109 (#2131): `offsetof[T](field)`, the field's byte offset in T's
+    // layout for the compilation target.
+    OffsetOf = 23
 
 impl Copy for CallBuiltin
 
@@ -1649,6 +1652,14 @@ pub type Sema {
     method_owner_keys: HashMap[i32, i32],
     // #2043: each builtin call's CallBuiltin, by call node.
     call_builtins: HashMap[i32, i32],
+    // D109: each `offsetof[T](field)` call's field index in T's declaration,
+    // by call node (Law 3: Sema names the field; codegen reads the layout).
+    offsetof_field_indices: HashMap[i32, i32],
+    // ... and the record it measures, by call node, as checked outside any
+    // specialization (a specialization's own type comes from
+    // specialization_type_args). Codegen reads it in every body, a module's
+    // runtime initializer included, where no name resolves (#2131).
+    offsetof_owner_types: HashMap[i32, i32],
     // #2043: each builtin method call's MirIntrinsic, keyed (instance, node).
     method_intrinsics: HashMap[i64, i32],
     // ... and its MethodLowering kind (present for every checked method call).
@@ -3550,6 +3561,8 @@ fn sema_empty_state(pool: InternPool, diags: DiagnosticList, ast: AstPool) -> Se
         embed_file_contents: HashMap.new(),
         method_owner_keys: sema_new_map_i32_i32(),
         call_builtins: sema_new_map_i32_i32(),
+        offsetof_field_indices: sema_new_map_i32_i32(),
+        offsetof_owner_types: sema_new_map_i32_i32(),
         method_intrinsics: sema_new_map_i64_i32(),
         method_lowerings: sema_new_map_i64_i32(),
         method_name_syms: sema_new_map_i32_i32(),
