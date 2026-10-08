@@ -179,6 +179,31 @@ explicitly. During migrations the compiler may diagnose a legacy read-only `T`
 and offer an exact `&T` fix-it, but canonical mode never silently reinterprets
 the declared type. See specification §3.8 and `docs/meetings/2026-07-05-D5-historical-share-place-free-parameter-design-superseded.md` D5.
 
+**A parameter's mode is what the callee does with it (D110, Eric
+2026-10-08).** If the callee stores the argument, ownership transfers; if it
+only reads it, the argument is observed. This is a reading of the function,
+not a design choice: `get`, `contains`, `remove` take their key as a probe
+and observe it; `insert` stores its key and takes it; `increment`/`decrement`
+observe the probe and take their own copy of the key only on the insert
+path. Modes come from signatures, once: builtin container methods have
+declared signatures (`fn remove(key: &K) -> Option[V]`), and Sema's move
+checking, MIR lowering and drop emission all read the mode from the
+signature. A builtin never has a second ownership system — no hand list of
+"observed" or "consumed" intrinsic arguments in any stage.
+
+**Copy-or-move is decided by identity, not representation (D111, Eric
+2026-10-08).** Values have no identity (integers, floats, strings, keys):
+passing one copies it, and the caller's is untouched. Resources have identity
+(files, tasks, sockets, handles, buffers being filled): passing one transfers
+it. A heap buffer does not make something a resource. `str` is a value:
+passing a `str` always copies, code using `str` never sees "use of moved
+value" and never needs `.clone()`. The implementation is an immutable,
+shared, reference-counted buffer (atomic count — `str` is `Send`; literals
+immortal): a copy is a pointer plus a count increment, the last holder frees,
+and a variable's last use is a move with no count traffic (the drop plan's
+last-use facts). Text that is built or edited goes through a builder type
+that produces a `str`.
+
 **Receiver modes are separate.** `fn`/`&self` reads, `mut fn`/`mut self` mutates
 the receiver place in place, `move fn`/`move self` consumes it. Retiring
 free-parameter SHARE-PLACE doesn't change `mut fn` receiver semantics or D21's
@@ -270,6 +295,53 @@ physical ABI is indirect. See `docs/meetings/2026-07-06-D6-fnabi-is-the-single-a
 `docs/spec/abi/fn_abi_descriptor_design.md`.
 
 ---
+
+## Ceremony is a design defect, not a user error
+
+With's first law is that the user never writes what the compiler knows. Code
+that exists only to satisfy the compiler is evidence the language is wrong
+somewhere, and it is your job to notice it and raise it, not to write more of
+it.
+
+**The test.** For any token you write or encounter, ask: *would a person
+reading this think it means something?* If the honest answer is "no, it's
+there because the compiler requires it," you have found ceremony.
+
+**Signals that always trigger the test:**
+- `.clone()`, `copy`, `move`, an explicit `&`, an `as` cast, `Some(...)`,
+  `let _ =`, or a type annotation written only to make code compile.
+- A compiler error on code a person would consider obviously correct ("use of
+  moved value" on a lookup key, a cast on `len()` used as an index).
+- A rule you have to explain with "because of how X is represented" rather
+  than "because the program means Y."
+- The same fact encoded in two or more places (passes, tables, files), so
+  that adding a case means updating all of them.
+- A comment explaining a workaround for the language rather than the
+  program's intent.
+- A fix that leaves users or future agents with something to remember.
+
+**What to do.** Stop and raise it before writing more code in that pattern. A
+ceremony report is not a ruling request. It's always welcome, and you should
+send it even mid-task. Give:
+1. The code, as a person would read it.
+2. Why it exists (the rule or representation forcing it).
+3. Which law it violates.
+4. How many times the pattern occurs in the tree (count it).
+5. What the code would look like if the language were right, and what would
+   have to change.
+
+Do not copy a ceremonial pattern from neighboring code because it's local
+precedent. Precedent is evidence of how long the defect has gone unraised,
+not of what's correct. If you are about to write the same workaround a second
+time, that's a report.
+
+**The backstop: the ceremony census.** `tools/ceremony_census.w` counts the
+known ceremony patterns across the tree and `build/ceremony-census.tsv`
+records the counts. `src/main build :ceremony-census` (in the gate) fails
+when a count rises above the record; a PR that raises one updates the record
+and says why in its description, and a PR that lowers one lowers the record
+(`with run tools/ceremony_census.w --write`). A report that identifies a new
+pattern adds it to the census.
 
 ## No Silent Fallbacks
 
@@ -706,6 +778,12 @@ all four parts in one brief, then wait for the ruling:
 4. **Predict what Eric would say.** A committed BDFL prediction with confidence,
    derived from his decision record — not a menu of options with no stake. It's
    falsifiable; being wrong and told why improves the record.
+
+**An ownership question states two facts first (Eric, 2026-10-08).**
+Before bringing Eric an ownership question, state what the callee does with
+the argument (stores it, or only reads it) and whether the type has identity
+(a resource, or a value). If those two facts decide it, it is not a ruling:
+do the work (D110, D111).
 
 **Never present an option that plainly fails `docs/mission.md`.** If an
 option obviously and unambiguously violates the mission (it makes the
