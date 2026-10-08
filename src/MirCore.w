@@ -9,6 +9,10 @@ use SemaTypes
 use std.collections.HashMap
 use std.string.StringBuilder
 
+// D111: MirBody.operand_holds values.
+pub const MIR_HOLD_RETAIN: i32 = 1
+pub const MIR_HOLD_TAKE: i32 = 2
+
 pub type BlockId = distinct i32
 impl Copy for BlockId
 impl Copy for TermKind
@@ -232,6 +236,11 @@ pub type MirBody {
 
     // Call intrinsic markers (parallel to call_arg_starts)
     call_intrinsic_kinds: Vec[MirIntrinsic],
+    // D111: what a consumed copy operand takes (MirLower decides; codegen
+    // applies it where it evaluates the operand): MIR_HOLD_RETAIN, a hold on
+    // every str it carries; MIR_HOLD_TAKE, the value itself at the source's last
+    // use (the source is blanked: no retain, no release).
+    operand_holds: HashMap[i32, i32],
     // MathBuiltins row id for MATH_FN calls (parallel; -1 otherwise)
     call_math_fn_ids: Vec[i32],
     // AST call node for generic calls (parallel to call_arg_starts, 0 if N/A)
@@ -543,6 +552,7 @@ fn MirBody.init_for_fn(fn_sym: i32) -> MirBody:
         call_arg_counts: Vec.new(),
         call_arg_operands: Vec.new(),
         call_intrinsic_kinds: Vec.new(),
+        operand_holds: HashMap.new(),
         call_math_fn_ids: Vec.new(),
         call_ast_nodes: Vec.new(),
         call_sig_indices: Vec.new(),
@@ -815,6 +825,10 @@ impl MirBody:
         for i in 0..count:
             self.call_arg_operands.push(operands[i])
         id
+
+    mut fn set_operand_hold(operand_id: i32, hold: i32): self.operand_holds.insert(operand_id, hold)
+
+    fn operand_hold(operand_id: i32) -> i32: self.operand_holds.get(operand_id) ?? 0
 
     mut fn set_call_intrinsic(call_id: i32, kind: MirIntrinsic):
         if call_id >= 0 and call_id < self.call_intrinsic_kinds.len():
@@ -2470,6 +2484,11 @@ fn mir_copy_into_consuming_param(mir_mod: &MirModule, body: &MirBody, bb: i32, d
     for ai in 0..body.call_arg_counts[call_id]:
         let op = body.call_arg_operands[start + ai]
         if op < 0 or op >= body.operand_kinds.len() or body.operand_kinds[op] != OperandKind.OK_COPY:
+            continue
+        // D111: a copy that carries a hold is its own owner — a retain is
+        // one more holder, a take blanks the source — so the callee and this
+        // body each drop their own. An unheld copy is still two owners.
+        if body.operand_hold(op) != 0:
             continue
         let place = body.operand_d0[op]
         if place < 0 or place >= body.place_locals.len() or body.place_proj_counts[place] != 0:
@@ -4527,7 +4546,7 @@ pub fn validate_typed_mir_body(mir_mod: &MirModule, body: &MirBody) -> MirValida
                     return mir_validation_fail(body.fn_sym, span, f"array_fill assigned to a non-array place (ty={dest_ty})")
                 let fill_elem = mir_mod.mir_get_type_d0(fill_arr)
                 if mir_mod.sema_non_copy_fill_types.contains(fill_elem):
-                    return mir_validation_fail(body.fn_sym, span, f"array_fill of a non-Copy element (ty={fill_elem}) copies one value into every slot: N owners of one value (§2.3); a non-Copy fill evaluates its value once per element")
+                    return mir_validation_fail(body.fn_sym, span, f"array_fill of an element that is not plain bits (ty={fill_elem}: not Copy, or Copy with drop glue) copies one value into every slot: N owners of one value (§2.3); such a fill evaluates its value once per element (§4.3a)")
             else if rk == RvalueKind.RK_REF:
                 if mir_validate_place_type(mir_mod, body, rv_d1) == 0:
                     return mir_validation_fail(body.fn_sym, span, "ref rvalue does not resolve to a concrete place type")

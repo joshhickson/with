@@ -511,6 +511,8 @@ impl Sema:
     // - a `&T` source relabeled (`r as str`, `r as &Tag`) is the same
     //   reference, typed `&Target`, with the source's origins. A Copy target
     //   keeps D22 §6.2: a cast target is an owned demand, met by a copy.
+    //   (D111: a Copy target with drop glue, a str, stays the view until an
+    //   owned demand copies it, as any `&str` does.)
     // - an owned source cast to a view (`n as &str`, `s as []u8`) borrows
     //   it, exactly as `&n` does.
     // - an owned non-Copy source relabeled moves into the result; one that
@@ -527,7 +529,7 @@ impl Sema:
         if src_kind == TypeKind.TY_REF:
             if self.get_type_d1(src as TypeId) != 0 or not self.cast_relabels_value(self.get_type_d0(src as TypeId), target_value):
                 return cast_tid
-            if not target_is_view and self.is_copy(target as TypeId) != 0:
+            if not target_is_view and self.is_copy(target as TypeId) != 0 and self.type_needs_drop(target) == 0:
                 return cast_tid
             self.cast_modes.insert(node, CastMode.REF_RELABEL as i32)
             self.record_transparent_view_origins(node, src_node)
@@ -10943,7 +10945,15 @@ impl Sema:
                     let filter_ty = self.check_expr(filter)
                     if filter_ty != 0 and self.types_compatible(self.ty_bool as i32, filter_ty as i32) == 0:
                         self.emit_error("comprehension filter must be bool", filter)
-            let result_elem = if result_expected != 0: self.check_expr_with_owned_demand(expr, result_expected as TypeId) else: self.check_expr(expr)
+            var result_elem = if result_expected != 0: self.check_expr_with_owned_demand(expr, result_expected as TypeId) else: self.check_expr(expr)
+            // A collection stores its element, so the element is an owned
+            // demand (D22 §6.2): a view of a Copy value (a str under D111) is
+            // copied in. Stored as a view it outlived its origin: a
+            // generator's yielded `&buf` was overwritten by the next resume.
+            if result_expected == 0:
+                let elem_value = self.shared_copy_pointee(result_elem as i32)
+                if elem_value != 0 and self.record_contextual_copy_adjustment(expr, elem_value, result_elem as i32) != 0:
+                    result_elem = elem_value as TypeId
             self.record_gen_comprehension_captures(node, comp_start, &gen_outer_counts)
             for _ in 0..pushed_scopes:
                 self.pop_scope()
@@ -11223,7 +11233,7 @@ impl Sema:
                 self.record_name_use(node, "global", self.decl_path_of_symbol(sym), self.pool_resolve(sym))
             if sym != self.assign_target_revive_sym:
                 self.record_global_data_race_access(sym, node, GLOBAL_RACE_ACCESS_READ)
-            if self.in_comptime_fn != 0 and self.is_mutable_global(sym) != 0:
+            if not is_local and self.in_comptime_fn != 0 and self.is_mutable_global(sym) != 0:
                 self.emit_error("mutable global access is not allowed in comptime", node)
             if self.binding_poisoned_origin_sym(sym) != 0:
                 self.emit_returned_view_origin_use_error(sym, node)
@@ -12933,6 +12943,8 @@ impl Sema:
             // `sub in text` lowers as `text.contains(sub)`.
             if rhs_ty != 0 and self.get_type_kind(self.resolve_alias(rhs_ty as TypeId)) == TypeKind.TY_STR:
                 self.record_method_lowering(rhs_node, self.syms.contains, 1, node, self.ty_bool as i32, rhs_ty)
+                // D110: the call it lowers as reads its modes from the row.
+                let _ = self.record_builtin_call_sig(node, rhs_ty, self.syms.contains)
             self.typed_expr_types.insert(node, self.ty_bool as i32)
             return self.ty_bool as i32
         let contains_sym: i32 = self.syms.contains
@@ -15930,7 +15942,12 @@ impl Sema:
         let temp_ty = self.view_into_temporary_type(node)
         if temp_ty == 0: return 0
         let temp_name = self.type_name(temp_ty)
-        self.emit_error(what ++ " a view into a temporary `" ++ temp_name ++ "` that is freed when this statement ends (§21.1); bind the `" ++ temp_name ++ "` first, or take an owned value (`.clone()`)", node)
+        // A Copy value (an i32, a str under D111) is copied by an owned
+        // demand (D22 §6.2): the annotation, never a `.clone()`.
+        let viewed = self.recorded_expr_type_or_zero(node)
+        let owned = if viewed != 0: self.auto_deref_ref_ptr_type(self.resolve_alias(viewed as TypeId)) as i32 else: 0
+        let remedy = if owned != 0 and self.is_copy(owned as TypeId) != 0: f"or demand an owned `{self.type_name(owned)}` (`: {self.type_name(owned)}` on the binding or the return) to copy it" else: "or take an owned value (`.clone()`)"
+        self.emit_error(what ++ " a view into a temporary `" ++ temp_name ++ "` that is freed when this statement ends (§21.1); bind the `" ++ temp_name ++ "` first, " ++ remedy, node)
         1
 
     // Rule 10: a variant whose type says nothing (`Option[fn() -> i32]`)
@@ -19164,10 +19181,15 @@ impl Sema:
         let start = self.ast.get_data1(node)
         let end = self.ast.get_data2(node)
         let arr_type = self.check_expr(expr)
-        if start != 0:
-            self.check_expr(start)
-        if end != 0:
-            self.check_expr(end)
+        // A bound is an owned demand for its integer (D22 §6.2), as in
+        // check_range: an element view `let at = cuts[i]` used as `s[at..]`
+        // reached codegen as the pointer.
+        for bound in [start, end]:
+            if bound == 0: continue
+            let bound_ty = self.check_expr(bound) as i32
+            let bound_value = self.shared_copy_pointee(bound_ty)
+            if bound_value != 0:
+                let _ = self.record_contextual_copy_adjustment(bound, bound_value, bound_ty)
 
         if arr_type == 0:
             return 0
@@ -26911,6 +26933,12 @@ impl Sema:
             exact_i = exact_i - 1
         if existing != 0:
             if self.types_compatible(existing, tid) == 0:
+                // D22/D111: a parameter already bound to a Copy `X` (a
+                // `BTreeMap[str, V]` receiver's K) is an owned demand; a `&X`
+                // argument meets it with a copy.
+                let tid_r = self.resolve_alias(tid as TypeId)
+                if self.get_type_kind(tid_r) == TypeKind.TY_REF and self.get_type_d1(tid_r) == 0 and self.is_copy(existing as TypeId) != 0 and self.types_identical(self.get_type_d0(tid_r), existing):
+                    return
                 if self.arithmetic_result_type(existing, tid) == 0:
                     let tp_name: str = with_str_clone_ref(self.pool_resolve(param_sym))
                     let a = self.type_name(existing)
@@ -31410,7 +31438,7 @@ impl Sema:
             // `Iterable.iter`, declared `-> VecIter[T]`), it is what is made.
             let wanted = if self.has_expected_type != 0 and self.expected_expr_type != 0: self.resolve_alias(self.expected_expr_type) as i32 else: 0
             let wants_by_value = wanted != 0 and self.get_type_kind(wanted as TypeId) == TypeKind.TY_GENERIC_INST and self.get_generic_inst_base(wanted) == self.syms.veciter
-            if not wants_by_value and vec_ty != 0 and self.std_generic_of(vec_ty) == StdGeneric.Vec and self.is_copy(self.get_generic_inst_arg(vec_ty, 0) as TypeId) == 0:
+            if not wants_by_value and vec_ty != 0 and self.std_generic_of(vec_ty) == StdGeneric.Vec and not self.copy_is_bits(self.get_generic_inst_arg(vec_ty, 0)):
                 field = self.syms.iter_ref
         let ret = self.check_method_call_parts_inner(expr, field, extra_start, arg_count, node, known_recv_ty)
         // §15.3: `next()` advances the iterator, so it needs a place. The
@@ -35935,10 +35963,11 @@ impl Sema:
     // ── Helper functions ─────────────────────────────────────────────
 
     // D44 / §13.5: map traversal observes. One element rule with Vec above:
-    // a Copy-class key or value binds by value, a Drop-class one binds as a
-    // view into the map's slot (copying it would make a second owner, §2.3).
+    // a plain-bits key or value binds by value; one with drop glue (a str,
+    // D111, or a Drop-class value) binds as a view into the map's slot
+    // (copying a Drop-class one would make a second owner, §2.3).
     mut fn traversal_binding_type(elem: i32) -> i32:
-        if self.type_needs_drop(elem) != 0 and self.is_copy(elem as TypeId) == 0:
+        if self.type_needs_drop(elem) != 0:
             return self.ensure_exact_type(TypeKind.TY_REF, elem, 0, 0) as i32
         elem
 
@@ -35972,7 +36001,7 @@ impl Sema:
             // array's strings under the caller (the second traversal read
             // freed memory).
             let seq_elem = self.get_type_d0(resolved)
-            if self.type_needs_drop(seq_elem) != 0 and self.is_copy(seq_elem as TypeId) == 0:
+            if self.type_needs_drop(seq_elem) != 0:
                 return self.ensure_exact_type(TypeKind.TY_REF, seq_elem, 0, 0) as i32
             return seq_elem
         if tk == TypeKind.TY_REF:
@@ -36006,7 +36035,7 @@ impl Sema:
                 // §13: the implicit form borrows the collection. Copy-class
                 // elements bind by value; Drop-class elements bind as &T
                 // views (copying one would double-drop it).
-                if self.type_needs_drop(vec_elem) != 0 and self.is_copy(vec_elem as TypeId) == 0:
+                if self.type_needs_drop(vec_elem) != 0:
                     return self.ensure_exact_type(TypeKind.TY_REF, vec_elem, 0, 0) as i32
                 return vec_elem
             if base_name == "HashMap" and self.get_generic_inst_arg_count(resolved as i32) >= 2:
@@ -36925,7 +36954,7 @@ impl Sema:
                     if self.get_type_kind(recv_resolved) == TypeKind.TY_GENERIC_INST and self.get_generic_inst_arg_count(recv_resolved as i32) > 0:
                         if self.pool_resolve(self.get_type_d0(recv_resolved)) == "Vec":
                             let vec_elem = self.get_generic_inst_arg(recv_resolved as i32, 0)
-                            if self.type_needs_drop(vec_elem) != 0 and self.is_copy(vec_elem as TypeId) == 0:
+                            if self.type_needs_drop(vec_elem) != 0:
                                 return self.ensure_exact_type(TypeKind.TY_REF, vec_elem, 0, 0) as i32
                             return vec_elem
         self.infer_for_element_type(iter_type)
@@ -36942,21 +36971,21 @@ impl Sema:
             if self.get_type_kind(seq_resolved) == TypeKind.TY_REF: seq_resolved = self.resolve_alias(self.get_type_d0(seq_resolved) as TypeId)
             if self.get_type_kind(seq_resolved) == TypeKind.TY_ARRAY or self.get_type_kind(seq_resolved) == TypeKind.TY_SLICE:
                 let seq_elem = self.get_type_d0(seq_resolved)
-                return if self.type_needs_drop(seq_elem) != 0 and self.is_copy(seq_elem as TypeId) == 0: 1 else: 0
+                return if self.type_needs_drop(seq_elem) != 0: 1 else: 0
             // A `&Vec[T]` / `&HashMap[K, V]` iterable (a borrowed parameter,
             // a match-bound payload) yields the same views as the owned
             // collection (#1297).
             if self.get_type_kind(seq_resolved) == TypeKind.TY_GENERIC_INST and self.get_generic_inst_arg_count(seq_resolved as i32) > 0:
                 if self.pool_resolve(self.get_type_d0(seq_resolved)) == "Vec":
                     let bare_elem = self.get_generic_inst_arg(seq_resolved as i32, 0)
-                    if self.type_needs_drop(bare_elem) != 0 and self.is_copy(bare_elem as TypeId) == 0:
+                    if self.type_needs_drop(bare_elem) != 0:
                         return 1
                 // D44: a map's Drop-class keys and values bind as views too.
                 let seq_base = self.pool_resolve(self.get_type_d0(seq_resolved))
                 if (seq_base == "HashMap" or seq_base == "BTreeMap") and self.get_generic_inst_arg_count(seq_resolved as i32) >= 2:
                     for ai in 0..2:
                         let map_elem = self.get_generic_inst_arg(seq_resolved as i32, ai)
-                        if self.type_needs_drop(map_elem) != 0 and self.is_copy(map_elem as TypeId) == 0:
+                        if self.type_needs_drop(map_elem) != 0:
                             return 1
         if self.iter_of_self_call_receiver(iterable) != 0: 1 else: 0
 

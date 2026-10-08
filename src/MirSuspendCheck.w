@@ -835,27 +835,13 @@ fn suspend_check_body(ast: AstPool, sema: &Sema, body_by_fn: &HashMap[i32, i32],
     if suspend_body_has_may_suspend_term(body, body_by_fn, body_may_suspend) == 0:
         return out
 
-    let bit_count = local_count * bb_count
-    let live_in = suspend_bits_fill(bit_count, 0)
-    let live_out = suspend_bits_fill(bit_count, 0)
+    let liveness = suspend_liveness(sema, body)
+    let live_out = liveness.live_out
     let prov_in = suspend_compute_prov_in_for_body(sema, body, guard_locals)
     let reported_starts: Vec[i32] = Vec.new()
     let reported_ends: Vec[i32] = Vec.new()
     let reported_locals: Vec[i32] = Vec.new()
     let reported_origins: Vec[i32] = Vec.new()
-
-    var changed = 1
-    while changed != 0:
-        changed = 0
-        var bb = bb_count - 1
-        while bb >= 0:
-            let out_bits = suspend_compute_live_out_for_block(body, live_in, local_count, bb)
-            if suspend_store_block_bits(live_out, local_count, bb, out_bits) != 0:
-                changed = 1
-            let in_bits = suspend_compute_live_in_for_block(body, sema, live_out, local_count, bb)
-            if suspend_store_block_bits(live_in, local_count, bb, in_bits) != 0:
-                changed = 1
-            bb = bb - 1
 
     for bb in 0..bb_count:
         if suspend_term_may_suspend(body, body_by_fn, body_may_suspend, bb) == 0:
@@ -922,6 +908,240 @@ fn suspend_check_no_suspend_body(ast: AstPool, sema: &Sema, body_by_fn: &HashMap
         reported_ends.push(site.end)
         reported_nodes.push(no_suspend_node)
         out = suspend_emit_no_suspend_error(move out, sema, body, body_by_fn, body_may_suspend, site, bb)
+    out
+
+// Backward liveness of a body's locals to a fixed point: live_in holds, per
+// block, the locals some later statement on some path reads before the block
+// starts; live_out the same at its end. A drop of a value with no user Drop
+// is not a read. One analysis for the suspend check below and for MirLower's
+// last-use copies (D111).
+type SuspendLiveness { live_in: SuspendBits, live_out: SuspendBits }
+
+fn suspend_liveness(sema: &Sema, body: &MirBody) -> SuspendLiveness:
+    let local_count = body.local_count()
+    let bb_count = body.block_count()
+    let live_in = suspend_bits_fill(local_count * bb_count, 0)
+    let live_out = suspend_bits_fill(local_count * bb_count, 0)
+    var changed = 1
+    while changed != 0:
+        changed = 0
+        var bb = bb_count - 1
+        while bb >= 0:
+            let out_bits = suspend_compute_live_out_for_block(body, live_in, local_count, bb)
+            if suspend_store_block_bits(live_out, local_count, bb, out_bits) != 0:
+                changed = 1
+            let in_bits = suspend_compute_live_in_for_block(body, sema, live_out, local_count, bb)
+            if suspend_store_block_bits(live_in, local_count, bb, in_bits) != 0:
+                changed = 1
+            bb = bb - 1
+    SuspendLiveness { live_in, live_out }
+
+// The operand ids a statement's rvalue reads — the operands
+// suspend_gen_rvalue gens.
+fn suspend_rvalue_operands(body: &MirBody, rval_id: i32) -> Vec[i32]:
+    var out: Vec[i32] = Vec.new()
+    if rval_id < 0 or rval_id >= body.rval_kinds.len() as i32:
+        return out
+    let kind = body.rval_kinds[rval_id]
+    let d0 = body.rval_d0[rval_id]
+    let d1 = body.rval_d1[rval_id]
+    if kind == RvalueKind.RK_USE or kind == RvalueKind.RK_CAST or kind == RvalueKind.RK_ARRAY_FILL:
+        out.push(d0)
+    else if kind == RvalueKind.RK_BIN_OP:
+        out.push(d1)
+        out.push(body.rval_d2[rval_id])
+    else if kind == RvalueKind.RK_UN_OP:
+        out.push(d1)
+    else if kind == RvalueKind.RK_AGGREGATE and d1 >= 0 and d1 < body.agg_field_starts.len() as i32:
+        for fi in 0..body.agg_field_counts[d1]:
+            out.push(body.agg_field_operands[body.agg_field_starts[d1] + fi])
+    else if kind == RvalueKind.RK_STR_CONCAT_N:
+        out = suspend_call_operands(body, d0)
+    out
+
+fn suspend_call_operands(body: &MirBody, call_id: i32) -> Vec[i32]:
+    var out: Vec[i32] = Vec.new()
+    if call_id < 0 or call_id >= body.call_arg_starts.len() as i32:
+        return out
+    for ai in 0..body.call_arg_counts[call_id]:
+        out.push(body.call_arg_operands[body.call_arg_starts[call_id] + ai])
+    out
+
+// The whole local a retained copy operand names, or -1.
+fn suspend_held_copy_local(body: &MirBody, operand_id: i32) -> i32:
+    if operand_id < 0 or operand_id >= body.operand_kinds.len() as i32 or body.operand_kinds[operand_id] != OperandKind.OK_COPY or body.operand_hold(operand_id) != MIR_HOLD_RETAIN:
+        return -1
+    suspend_direct_place_local(body, body.operand_d0[operand_id])
+
+// What a statement does with `local` first: 1 reads it, 2 overwrites or ends
+// it whole, 0 neither. A borrow or a partial write counts as a read.
+fn last_use_stmt_event(body: &MirBody, stmt_id: i32, local: i32) -> i32:
+    let kind = body.stmt_kind(stmt_id)
+    let d0 = body.stmt_data0(stmt_id)
+    if kind == StmtKind.Assign:
+        let rval = body.stmt_data1(stmt_id)
+        let operands = suspend_rvalue_operands(body, rval)
+        for oi in 0..operands.len():
+            let op = operands[oi]
+            if op >= 0 and op < body.operand_kinds.len() as i32 and (body.operand_kinds[op] == OperandKind.OK_COPY or body.operand_kinds[op] == OperandKind.OK_MOVE) and suspend_place_root_local(body, body.operand_d0[op]) == local:
+                return 1
+        if rval >= 0 and rval < body.rval_kinds.len() as i32:
+            let rk = body.rval_kinds[rval]
+            let borrowed = if rk == RvalueKind.RK_REF: body.rval_d1[rval] else: if rk == RvalueKind.RK_ADDR_OF or rk == RvalueKind.RK_DISCRIMINANT or rk == RvalueKind.RK_LEN: body.rval_d0[rval] else: -1
+            if suspend_place_root_local(body, borrowed) == local:
+                return 1
+        if suspend_direct_place_local(body, d0) == local:
+            return 2
+        if suspend_place_root_local(body, d0) == local:
+            return 1
+        return 0
+    if (kind == StmtKind.StorageDead or kind == StmtKind.Drop) and suspend_place_root_local(body, d0) == local:
+        return 2
+    0
+
+// What a block's terminator does with `local`: 1 reads it, 2 defines it, 0
+// neither.
+fn last_use_term_event(body: &MirBody, bb: i32, local: i32) -> i32:
+    let kind = body.term_kind(bb)
+    if kind == TermKind.TK_CALL:
+        let operands = suspend_call_operands(body, body.term_data1(bb))
+        operands.push(body.term_data0(bb))
+        for oi in 0..operands.len():
+            let op = operands[oi]
+            if op >= 0 and op < body.operand_kinds.len() as i32 and (body.operand_kinds[op] == OperandKind.OK_COPY or body.operand_kinds[op] == OperandKind.OK_MOVE) and suspend_place_root_local(body, body.operand_d0[op]) == local:
+                return 1
+        if suspend_direct_place_local(body, body.term_data2(bb)) == local:
+            return 2
+        return 0
+    if kind == TermKind.TK_SWITCH_INT:
+        let op = body.term_data0(bb)
+        if op >= 0 and op < body.operand_kinds.len() as i32 and (body.operand_kinds[op] == OperandKind.OK_COPY or body.operand_kinds[op] == OperandKind.OK_MOVE) and suspend_place_root_local(body, body.operand_d0[op]) == local:
+            return 1
+        return 0
+    if kind == TermKind.TK_DROP_AND_GOTO and suspend_place_root_local(body, body.term_data0(bb)) == local:
+        return 2
+    0
+
+fn last_use_successors(body: &MirBody, bb: i32) -> Vec[i32]:
+    var out: Vec[i32] = Vec.new()
+    let kind = body.term_kind(bb)
+    if kind == TermKind.TK_GOTO:
+        out.push(body.term_data0(bb))
+    else if kind == TermKind.TK_CALL:
+        out.push(body.term_data3(bb))
+    else if kind == TermKind.TK_DROP_AND_GOTO:
+        out.push(body.term_data1(bb))
+    else if kind == TermKind.TK_SWITCH_INT:
+        let table = body.term_data1(bb)
+        if table >= 0 and table < body.switch_table_starts.len() as i32:
+            for ti in 0..body.switch_table_counts[table]:
+                out.push(body.switch_table_targets[body.switch_table_starts[table] + ti])
+        out.push(body.term_data2(bb))
+    out
+
+// For one local: per block, whether it is read on some path from the block's
+// start before anything overwrites or ends it (one bit per block, to a fixed
+// point).
+fn last_use_live_in(body: &MirBody, local: i32) -> Vec[i32]:
+    let bb_count = body.block_count()
+    var first: Vec[i32] = Vec.new()
+    for bb in 0..bb_count:
+        var event = 0
+        var si = 0
+        while si < body.bb_stmt_counts[bb] and event == 0:
+            event = last_use_stmt_event(body, body.bb_stmt_starts[bb] + si, local)
+            si = si + 1
+        if event == 0:
+            event = last_use_term_event(body, bb, local)
+        first.push(event)
+    var live: Vec[i32] = Vec.new()
+    for bb in 0..bb_count: live.push(if first[bb] == 1: 1 else: 0)
+    var changed = true
+    while changed:
+        changed = false
+        var bb = bb_count - 1
+        while bb >= 0:
+            if live[bb] == 0 and first[bb] == 0:
+                let succs = last_use_successors(body, bb)
+                for si in 0..succs.len():
+                    if succs[si] >= 0 and succs[si] < bb_count and live[succs[si]] != 0:
+                        live[bb] = 1
+                        changed = true
+                        break
+            bb = bb - 1
+    live
+
+// Whether `local` is read after point `stmt_index` of `bb` (the terminator
+// when stmt_index is the block's statement count), before anything ends it.
+fn last_use_live_after(body: &MirBody, live_in: &Vec[i32], bb: i32, stmt_index: i32, local: i32) -> bool:
+    var si = stmt_index + 1
+    while si < body.bb_stmt_counts[bb]:
+        let event = last_use_stmt_event(body, body.bb_stmt_starts[bb] + si, local)
+        if event != 0:
+            return event == 1
+        si = si + 1
+    if stmt_index < body.bb_stmt_counts[bb]:
+        let term_event = last_use_term_event(body, bb, local)
+        if term_event != 0:
+            return term_event == 1
+    let succs = last_use_successors(body, bb)
+    for i in 0..succs.len():
+        if succs[i] >= 0 and succs[i] < live_in.len() and live_in[succs[i]] != 0:
+            return true
+    false
+
+// D111: at a variable's last use a copy is a move. A retained copy of a
+// whole local that nothing reads afterwards on any path (a drop is not a
+// read) becomes a take: codegen hands the value over and blanks the local,
+// so its later drop releases nothing — no retain, no release. Only a local
+// no view can reach qualifies: nothing borrows it and every operand naming
+// it is a retained copy, since a view of its buffer must not outlive the
+// last hold. Liveness is per candidate local, one bit per block.
+pub fn mir_mark_last_use_holds(body: MirBody) -> MirBody:
+    var out = body
+    if out.operand_holds.len() == 0:
+        return out
+    let local_count = out.local_count()
+    var view_free: Vec[i32] = Vec.new()
+    var held: Vec[i32] = Vec.new()
+    for _ in 0..local_count:
+        view_free.push(1)
+        held.push(0)
+    for oi in 0..out.operand_kinds.len():
+        let kind = out.operand_kinds[oi]
+        if kind != OperandKind.OK_COPY and kind != OperandKind.OK_MOVE:
+            continue
+        let root = suspend_place_root_local(&out, out.operand_d0[oi])
+        if root < 0 or root >= local_count:
+            continue
+        if out.operand_hold(oi as i32) == MIR_HOLD_RETAIN and suspend_direct_place_local(&out, out.operand_d0[oi]) == root:
+            held[root] = 1
+        else:
+            view_free[root] = 0
+    for ri in 0..out.rval_kinds.len():
+        let rk = out.rval_kinds[ri]
+        let borrowed = if rk == RvalueKind.RK_REF: out.rval_d1[ri] else: if rk == RvalueKind.RK_ADDR_OF: out.rval_d0[ri] else: -1
+        let root = suspend_place_root_local(&out, borrowed)
+        if root >= 0 and root < local_count: view_free[root] = 0
+    for local in 1..local_count:
+        if held[local] == 0 or view_free[local] == 0 or out.local_is_global[local] != 0 or out.local_is_caller_place[local] != 0:
+            continue
+        let live_in = last_use_live_in(&out, local)
+        for bb in 0..out.block_count():
+            for si in 0..out.bb_stmt_counts[bb] + 1:
+                let operands = if si < out.bb_stmt_counts[bb]:
+                    let stmt_id = out.bb_stmt_starts[bb] + si
+                    if out.stmt_kind(stmt_id) == StmtKind.Assign: suspend_rvalue_operands(&out, out.stmt_data1(stmt_id)) else: Vec.new()
+                else if out.term_kind(bb) == TermKind.TK_CALL: suspend_call_operands(&out, out.term_data1(bb))
+                else: Vec.new()
+                var reads = 0
+                var held_op = -1
+                for oi in 0..operands.len():
+                    if suspend_place_root_local(&out, out.operand_d0[operands[oi]]) == local:
+                        reads = reads + 1
+                        if suspend_held_copy_local(&out, operands[oi]) == local: held_op = operands[oi]
+                if reads == 1 and held_op >= 0 and not last_use_live_after(&out, &live_in, bb, si, local):
+                    out.set_operand_hold(held_op, MIR_HOLD_TAKE)
     out
 
 pub fn check_no_await_guard_suspends(mir_mod: &MirModule, ast: AstPool, sema: &Sema, diags: DiagnosticList) -> DiagnosticList:

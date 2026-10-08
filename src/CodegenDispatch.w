@@ -1921,7 +1921,38 @@ impl Codegen:
 
         self.mir_bug_undef(f"MIR constant {const_id} of kind {ck} has no lowering", fallback_ty)
 
+    // D111: an operand's value with the hold MIR recorded for it applied
+    // where the consumer reads it, through the operand's source place (the
+    // value may already be coerced for its use): a retained copy takes a hold
+    // on every str the source carries; a taken copy hands the value over and
+    // blanks the source, so the source's drop releases nothing.
     mut fn mir_eval_operand(body: &MirBody, operand_id: i32, expected_ty: i64) -> i64:
+        let value = self.mir_eval_operand_raw(body, operand_id, expected_ty)
+        let hold = body.operand_hold(operand_id)
+        if hold == 0:
+            return value
+        let place = body.operand_d0[operand_id]
+        let sema_ty = if place >= 0 and place < body.place_sema_types.len(): body.place_sema_types[place] else: 0
+        let place_ty = if sema_ty > 0: self.mir_sema_type_to_llvm(sema_ty) else: 0
+        let src_ptr = if place_ty != 0: self.mir_place_ptr(body, place, false, 0) else: 0
+        if src_ptr == 0:
+            // A value local (SSA) has no storage to blank: its uncoerced
+            // value is retained through a slot, and its own drop releases.
+            let whole_local = if place >= 0 and place < body.place_locals.len() and body.place_proj_counts[place] == 0: body.place_locals[place] else: -1
+            let ssa_value = self.mir_local_values.get(whole_local)
+            if place_ty == 0 or whole_local < 0 or ssa_value.is_none():
+                sema_phase_bug(f"BUG: operand {operand_id} holds a copy (D111) but its place {place} has no storage in {self.intern.resolve(self.current_function_name_sym)}")
+            let slot = self.create_entry_alloca(place_ty)
+            wl_build_store(self.builder, ssa_value.unwrap() as i64, slot)
+            self.mir_emit_copy_glue_ptr(slot, place_ty, sema_ty)
+            return value
+        if hold == MIR_HOLD_TAKE:
+            wl_build_store(self.builder, self.build_default_value(place_ty), src_ptr)
+        else:
+            self.mir_emit_copy_glue_ptr(src_ptr, place_ty, sema_ty)
+        value
+
+    mut fn mir_eval_operand_raw(body: &MirBody, operand_id: i32, expected_ty: i64) -> i64:
         let fallback_ty = if expected_ty != 0: expected_ty else: wl_i32_type(self.context)
         if operand_id < 0 or operand_id >= body.operand_kinds.len() as i32:
             return self.mir_bug_undef(f"MIR operand id {operand_id} is out of range", fallback_ty)
@@ -5846,6 +5877,100 @@ impl Codegen:
 
     // #747: free a str's buffer via the ownership-checked runtime helper and
     // blank the place. Mirrors the Vec pattern including drop-origin tagging.
+    // D111: a copied value is one more holder of every str it carries. A Copy
+    // type with drop glue (a str, or a tuple, array, struct or enum holding
+    // one) is dropped in the source and in the copy, so the copy retains what
+    // the drop releases. The walk mirrors mir_emit_drop_ptr_for_sema_type
+    // shape for shape, so retains and releases touch the same strs.
+    mut fn mir_emit_copy_glue_ptr(ptr: i64, ty: i64, sema_ty: i32):
+        if ptr == 0 or ty == 0 or sema_ty <= 0 or self.sema.type_needs_drop_frozen(sema_ty) == 0:
+            return
+        let resolved = self.sema.resolve_alias(sema_ty as TypeId) as i32
+        let tk = self.sema.get_type_kind(resolved as TypeId)
+        if tk == TypeKind.TY_STRUCT and self.sema.distinct_type_names.contains(self.sema.get_type_d0(resolved as TypeId)):
+            self.mir_emit_copy_glue_ptr(ptr, ty, self.sema.type_extra[(self.sema.get_type_d1(resolved as TypeId) + 1)])
+            return
+        if tk == TypeKind.TY_STR:
+            let retain_fn = self.ensure_with_str_retain_fn()
+            let args: Vec[i64] = Vec.new()
+            args.push(ptr)
+            let _ = wl_build_call(self.builder, wl_global_get_value_type(retain_fn), retain_fn, vec_data_i64(&args), 1)
+            return
+        if tk == TypeKind.TY_TUPLE:
+            for i in 0..self.sema.get_type_d1(resolved as TypeId):
+                let elem_sema = self.mir_project_field_sema_type(resolved, i)
+                if elem_sema > 0 and self.sema.type_needs_drop_frozen(elem_sema) != 0:
+                    let elem_ptr = self.tuple_elem_ptr(ty, ptr, i)
+                    let elem_llvm = self.mir_sema_type_to_llvm(elem_sema)
+                    self.mir_emit_copy_glue_ptr(elem_ptr, elem_llvm, elem_sema)
+            return
+        if tk == TypeKind.TY_ARRAY:
+            let elem_sema = self.sema.get_type_d0(resolved as TypeId)
+            let elem_llvm = wl_get_element_type(ty)
+            for i in 0..self.sema.get_type_d1(resolved as TypeId):
+                let gep_indices: Vec[i64] = Vec.new()
+                gep_indices.push(wl_const_int(wl_i32_type(self.context), 0, 0))
+                gep_indices.push(wl_const_int(wl_i32_type(self.context), i, 0))
+                self.mir_emit_copy_glue_ptr(wl_build_gep(self.builder, ty, ptr, vec_data_i64(&gep_indices), 2), elem_llvm, elem_sema)
+            return
+        if tk == TypeKind.TY_STRUCT and wl_get_type_kind(ty) == wl_struct_type_kind():
+            let struct_idx = self.find_struct_index_by_type(ty)
+            if struct_idx < 0 or self.is_union_struct_index(struct_idx) or self.is_bitpacked_struct(ty):
+                sema_phase_bug(f"BUG: no copy glue for Copy type {self.sema.type_name(resolved)} (D111)")
+            let field_start: i32 = self.struct_field_starts[struct_idx]
+            for fi in 0..self.struct_field_counts[struct_idx]:
+                let field_sema = self.mir_project_field_sema_type(resolved, self.struct_field_names[field_start + fi])
+                let field_index = self.get_llvm_field_index(ty, fi)
+                let field_ptr = wl_build_struct_gep(self.builder, ty, ptr, field_index)
+                let field_llvm: i64 = self.struct_field_types[field_start + fi]
+                self.mir_emit_copy_glue_ptr(field_ptr, field_llvm, field_sema)
+            return
+        if (tk == TypeKind.TY_ENUM or tk == TypeKind.TY_GENERIC_INST) and wl_get_type_kind(ty) == wl_struct_type_kind() and wl_count_struct_elem_types(ty) >= 2:
+            self.mir_emit_copy_glue_enum_ptr(ptr, ty, resolved)
+            return
+        sema_phase_bug(f"BUG: no copy glue for Copy type {self.sema.type_name(resolved)} (D111)")
+
+    // The active variant's payloads, by tag, as mir_emit_drop_enum_ptr walks them.
+    mut fn mir_emit_copy_glue_enum_ptr(ptr: i64, ty: i64, enum_sema_ty: i32):
+        let variant_count = self.mir_enum_variant_count(enum_sema_ty)
+        let tag_field_ty = wl_struct_get_type_at(ty, 0)
+        let tag_val = wl_build_load(self.builder, tag_field_ty, wl_build_struct_gep(self.builder, ty, ptr, 0))
+        let data_ptr = wl_build_bitcast(self.builder, wl_build_struct_gep(self.builder, ty, ptr, 1), wl_ptr_type(self.context))
+        let merge_bb = wl_append_bb(self.context, self.current_function, "copy.enum.merge")
+        for vi in 0..variant_count:
+            let pc = self.mir_enum_variant_payload_count(enum_sema_ty, vi)
+            var variant_has_glue = false
+            for pf in 0..pc:
+                if self.sema.type_needs_drop_frozen(self.mir_enum_payload_sema_type(enum_sema_ty, vi, pf)) != 0: variant_has_glue = true
+            if not variant_has_glue: continue
+            let case_bb = wl_append_bb(self.context, self.current_function, "copy.enum.case")
+            let next_bb = wl_append_bb(self.context, self.current_function, "copy.enum.next")
+            let cond = wl_build_icmp(self.builder, wl_int_eq(), tag_val, wl_const_int(tag_field_ty, self.mir_enum_variant_discriminant(enum_sema_ty, vi), 0))
+            wl_build_cond_br(self.builder, cond, case_bb, next_bb)
+            wl_position_at_end(self.builder, case_bb)
+            let payload_ty = self.mir_enum_variant_payload_llvm_type(enum_sema_ty, vi)
+            if pc == 1:
+                let payload_sema = self.mir_enum_payload_sema_type(enum_sema_ty, vi, 0)
+                self.mir_emit_copy_glue_ptr(data_ptr, payload_ty, payload_sema)
+            else if payload_ty != 0 and wl_get_type_kind(payload_ty) == wl_struct_type_kind():
+                for pf in 0..pc:
+                    let field_ptr = self.tuple_elem_ptr(payload_ty, data_ptr, pf)
+                    let field_llvm = self.tuple_elem_type(payload_ty, pf)
+                    let field_sema = self.mir_enum_payload_sema_type(enum_sema_ty, vi, pf)
+                    self.mir_emit_copy_glue_ptr(field_ptr, field_llvm, field_sema)
+            wl_build_br(self.builder, merge_bb)
+            wl_position_at_end(self.builder, next_bb)
+        wl_build_br(self.builder, merge_bb)
+        wl_position_at_end(self.builder, merge_bb)
+
+    fn ensure_with_str_retain_fn() -> i64:
+        let retain_fn = wl_get_named_function(self.llmod, "with_str_retain")
+        if retain_fn != 0:
+            return retain_fn
+        let params: Vec[i64] = Vec.new()
+        params.push(wl_ptr_type(self.context))
+        wl_add_function(self.llmod, "with_str_retain", wl_function_type(wl_void_type(self.context), vec_data_i64(&params), 1, 0))
+
     fn ensure_with_str_free_fn() -> i64:
         var free_fn = wl_get_named_function(self.llmod, "with_str_free")
         if free_fn != 0:

@@ -10498,6 +10498,10 @@ impl Sema:
             return lhs_numeric as TypeId
         rhs_numeric as TypeId
 
+    // D111: a copy of this type is plain bits — Copy, with no drop glue —
+    // so nothing retains or releases it. A str is Copy with drop glue.
+    mut fn copy_is_bits(tid: i32) -> bool: self.is_copy(tid as TypeId) != 0 and self.type_needs_drop(tid) == 0
+
     mut fn is_copy(tid: TypeId) -> i32:
         if tid == 0:
             return 1
@@ -10505,10 +10509,11 @@ impl Sema:
         let tk = self.get_type_kind(resolved)
         if tk == TypeKind.TY_ERR or tk == TypeKind.TY_INT or tk == TypeKind.TY_FLOAT or tk == TypeKind.TY_BOOL or tk == TypeKind.TY_VOID or tk == TypeKind.TY_NEVER:
             return 1
-        // #747 / D28 ruling 1: str owns its buffer — moves, not copies.
-        // The explicit arm matters: this function's tail DEFAULTS to Copy.
+        // D111 (supersedes D28 ruling 1): a str is a value — passing one
+        // copies it. The buffer is shared and counted, so a copy is a retain
+        // (codegen's copy glue) and a str still has drop glue (the release).
         if tk == TypeKind.TY_STR:
-            return 0
+            return 1
         // D63 (§12.4 "The callable type"): `fn(A) -> R` is not Copy, bare
         // functions included — a `move ||` closure owns its environment and
         // Copy is a property of the type, not of a value's provenance.

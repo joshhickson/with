@@ -513,8 +513,9 @@ fn str_length(s: &str): s.len()
 
 fn make_str(ptr: *const u8, len: i64) -> str:
     let raw = RawStr { ptr: ptr, len: len }
-    let p = &raw as *const str
-    unsafe *p
+    // D111: built from its parts, not copied out of memory: a raw-pointer
+    // read of a str is a copy, one more holder, and these parts hold nothing.
+    unsafe { transmute[str](raw) }
 
 fn cstr_len(s: *const u8) -> i64:
     if s as i64 == 0:
@@ -868,8 +869,11 @@ fn alloc_header_ptr(ptr: *const u8) -> *mut u8:
 fn alloc_payload_size(ptr: *const u8) -> i64:
     unsafe *(alloc_header_ptr(ptr) as *const i64)
 
+// The header's second word is a str buffer's holder count (D111, see
+// with_str_retain); a recycled block's count starts over at zero.
 fn alloc_store_small_header(block: i64, size: i64):
     unsafe *(block as *mut i64) = size
+    unsafe *((block + 8) as *mut i64) = 0
 
 // Reset-on-move drop guard (spec §2.5.1). Returns 1 if all `size` bytes at `ptr`
 // are zero (the reset sentinel), else 0. The compiler emits a call to this in
@@ -2741,7 +2745,9 @@ pub fn with_str_concat_n_move_first(parts: *const str, count: i64) -> str:
     let first_ptr = str_concat_part_data(parts, 0)
     let first_owned = rt_payload_start_is_owned(first_ptr)
     let first_cap = str_owned_capacity_from_ptr(first_ptr)
-    if first_owned != 0 and first_ptr as i64 != 0 and first_cap >= total:
+    // D111: the first buffer is written in place only when this str is its
+    // sole holder; a shared one is copied like any other part.
+    if first_owned != 0 and first_ptr as i64 != 0 and first_cap >= total and str_is_unique(first_ptr):
         var offset = first_len
         for i in 1..count:
             let part_len = str_concat_part_len(parts, i)
@@ -2773,7 +2779,9 @@ pub fn with_str_concat_n_move_first(parts: *const str, count: i64) -> str:
     unsafe *((out as i64 + total) as *mut u8) = 0
     let result = make_str(out as *const u8, total)
     if first_owned != 0 and first_ptr as i64 != 0:
-        rt_free(first_ptr as *mut u8)
+        // The first part was moved in: its hold is released, not freed.
+        if unsafe { (*str_holders(first_ptr)).fetch_sub(1, .AcqRel) } == 0:
+            rt_free(first_ptr as *mut u8)
     result
 
 pub fn with_str_eq_ref(a: &str, b: &str) -> i32:
@@ -3207,7 +3215,10 @@ pub fn with_getenv_str(name: &str) -> str:
     cstr_free(cname)
     if val as i64 == 0:
         return make_str("" as *const u8, 0)
-    make_str(val, cstr_len(val))
+    // An owned copy: the environment block is libc's, and a later
+    // setenv may free or rewrite the bytes a shared str would still name
+    // (D111 copies share their buffer).
+    alloc_str(val, cstr_len(val))
 
 // with_setenv_str: provided by compat_runtime.w (needs libc)
 
@@ -3378,20 +3389,37 @@ pub fn with_vec_free_buffer_drop_origin(p: *mut u8, cap: i64, es: i64, drop_orig
             with_panic_core(make_str("corrupt vec header: freed memory reused or overwritten" as *const u8, 54), make_str("" as *const u8, 0), 0)
         rt_free_sized_with_drop_origin(p, cap * es, drop_origin, drop_origin_len)
 
-// #747 (#691 second half): dropping a str frees its buffer. A str place is
-// {data_ptr, len}; only a pointer that is the START of a live allocation
+// D111: a str is a value — an immutable, shared, counted buffer. A str place
+// is {data_ptr, len}; only a pointer that is the START of a live allocation
 // payload is owned — literals (static), views (interior pointers), and
-// blanked moved-from strs all fail the check and are no-ops. The place is
-// blanked afterwards so double-drop of a copied header stays safe. Under
-// WITH_ALLOC_SYSTEM=1 the range tables don't track, so strs leak there —
-// the safe direction for a diagnostic mode.
+// blanked moved-from strs all fail the check, and retain and release are
+// no-ops for them. The allocation header's second word counts the buffer's
+// holders beyond the first (alloc_store_small_header zeroes it): a copy is a
+// retain, a drop a release, and the release that finds no other holder
+// frees. The count is atomic: a str is Send, and two threads may hold copies
+// of one buffer through shared state. Under WITH_ALLOC_SYSTEM=1 the range
+// tables don't track, so strs leak there — the safe direction for a
+// diagnostic mode.
+fn str_holders(p: *const u8) -> *mut Atomic[i64]: (p as i64 - 8) as *mut Atomic[i64]
+
+pub fn with_str_retain(s: *const u8):
+    let p = unsafe *(s as *const *const u8)
+    if p as i64 != 0 and rt_payload_start_is_owned(p) != 0:
+        unsafe { (*str_holders(p)).fetch_add(1, .AcqRel) }
+
+// Whether `p` names a buffer this str alone holds, so it may be written in
+// place (the `s = s ++ x` append).
+fn str_is_unique(p: *const u8) -> bool:
+    rt_payload_start_is_owned(p) != 0 and unsafe { (*str_holders(p)).load(.Acquire) } == 0
+
 pub fn with_str_free(s: *mut u8) -> Unit:
     with_str_free_drop_origin(s, 0 as *const u8, 0)
 
 pub fn with_str_free_drop_origin(s: *mut u8, drop_origin: *const u8, drop_origin_len: i64) -> Unit:
     let p = unsafe *(s as *const *mut u8)
     if p as i64 != 0 and rt_payload_start_is_owned(p as *const u8) != 0:
-        rt_free_with_drop_origin(p, drop_origin, drop_origin_len)
+        if unsafe { (*str_holders(p)).fetch_sub(1, .AcqRel) } == 0:
+            rt_free_with_drop_origin(p, drop_origin, drop_origin_len)
     else if p as i64 != 0 and dbg_on() != 0:
         // #1363: the ownership check above turns a second free of a str
         // buffer into a silent no-op (the freed block is no longer an owned
@@ -4069,19 +4097,12 @@ pub fn with_hashmap_free(map: *mut u8):
     rt_free_sized(map, HM_SIZE)
 
 // D110: insert `val` under an observed key: a present key's value is replaced
-// where it stands; an absent key goes in as the map's own copy (a str key's
-// bytes are copied; Sema admits only str or drop-free keys here). Raw words,
-// not a str binding: the map owns the copy, nothing here drops it.
+// where it stands; an absent key goes in as the map's own copy. A str key is
+// a value (D111): the copy shares the probe's buffer, one more holder.
 pub fn with_hashmap_put_copy_key(map: *mut u8, key: *const u8, val: *const u8, is_str_key: i64):
-    if is_str_key == 0 or with_hashmap_get_ptr(map, key, is_str_key) as i64 != 0:
-        with_hashmap_insert(map, key, val, is_str_key)
-        return
-    let len = unsafe *((key as i64 + 8) as *const i64)
-    let bytes = rt_alloc(len + 1)
-    rt_memcpy(bytes, unsafe *(key as *const *const u8), len)
-    unsafe *((bytes as i64 + len) as *mut u8) = 0
-    let key_copy: [2]i64 = [bytes as i64, len]
-    with_hashmap_insert(map, &raw const key_copy as *const u8, val, 1)
+    if is_str_key != 0 and with_hashmap_get_ptr(map, key, is_str_key) as i64 == 0:
+        with_str_retain(key)
+    with_hashmap_insert(map, key, val, is_str_key)
 
 // D110: increment/decrement observe their key: a present key's count moves
 // where it stands; an absent one is inserted under the map's own copy.

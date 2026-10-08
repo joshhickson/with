@@ -12,6 +12,7 @@ use MathBuiltins
 use MirCore
 use SemaTypes
 use MirVector
+use MirSuspendCheck
 extern fn with_str_clone_ref(s: &str) -> str
 extern fn with_eprint(s: &str) -> Unit
 
@@ -277,6 +278,10 @@ pub type MirBuilder = ephemeral {
     // only view/constant result arms — the result is a VIEW of storage owned
     // elsewhere, so neither the result temp nor a binding of it may drop.
     last_if_result_view: i32,
+    // D111: the operand node being lowered that only reads its bytes (a
+    // str comparison or concat part): a &str read there is its pointee's
+    // bits, never a materialized owner.
+    observing_str_read: i32,
     string_field_alias_base_locals: Vec[i32],
     string_field_alias_path_starts: Vec[i32],
     string_field_alias_path_counts: Vec[i32],
@@ -378,6 +383,7 @@ fn MirBuilder.init(sema: &Sema, ast: AstPool, pool: InternPool, fn_sym: i32) -> 
         string_alias_local_ids: Vec.new(),
         string_alias_flags: Vec.new(),
         last_if_result_view: 0,
+        observing_str_read: 0,
         string_field_alias_base_locals: Vec.new(),
         string_field_alias_path_starts: Vec.new(),
         string_field_alias_path_counts: Vec.new(),
@@ -642,8 +648,40 @@ impl MirBuilder:
     // unwrap_or and unwrap_or_else: `read_file(p).unwrap_or("")` returned a
     // str over a freed buffer). Returns the subject's local, or -1 when the
     // subject is not a plain local (nothing of ours was scheduled).
+    // D111: an eliminator's subject that is Copy with drop glue (an
+    // Option[str]) holds its own count: its payload is copied out with
+    // another, so the subject is neither retired nor marked moved — it drops
+    // like any statement temp, and a named one stays its binding's.
+    fn carrier_copies(ty: i32) -> bool: self.sema.is_copy_frozen(ty as TypeId) != 0 and not self.copy_is_bits(ty)
+
+    // D111: a payload or field read out of a carrier the read consumes (an
+    // eliminator's subject, a pattern's scrutinee, an iterator's Some):
+    // plain bits are copied; one with drop glue moves out of a non-Copy
+    // carrier (as before D111) and is copied, with its own hold, out of a
+    // Copy carrier, which keeps its own hold and its drop.
+    fn carrier_read_kind(read_ty: i32, carrier_ty: i32) -> i32:
+        if self.copy_is_bits(read_ty) or (self.sema.is_copy_frozen(read_ty as TypeId) != 0 and self.carrier_copies(carrier_ty)): OperandKind.OK_COPY else: OperandKind.OK_MOVE
+
+    // A pattern binding over an observed subject (`match m:` on a place)
+    // copies a Copy payload with its own hold; the subject keeps its own.
+    fn pattern_read_kind(read_ty: i32, carrier_ty: i32) -> i32:
+        if self.pattern_subject_observed != 0 and self.sema.is_copy_frozen(read_ty as TypeId) != 0: OperandKind.OK_COPY else: self.carrier_read_kind(read_ty, carrier_ty)
+
+    // The whole subject bound by name (`s =>`, `s @ ...`): same rule.
+    fn pattern_whole_read_kind(ty: i32) -> i32:
+        if self.type_needs_value_drop(ty) == 0 or (self.pattern_subject_observed != 0 and self.sema.is_copy_frozen(ty as TypeId) != 0): OperandKind.OK_COPY else: OperandKind.OK_MOVE
+
+    mut fn mark_carrier_consumed(local: i32):
+        if local >= 0 and not self.carrier_copies(self.local_type(local)):
+            self.mark_local_value_moved(local)
+
     mut fn retire_decomposed_carrier(value_place: i32) -> i32:
         let local = mir_place_plain_local(&self.body, value_place)
+        // D111: a Copy carrier with drop glue (an Option[str]) had its payload
+        // copied out with its own hold, so the carrier still holds one and
+        // keeps its drop.
+        if local >= 0 and self.carrier_copies(self.local_type(local)):
+            return local
         if local >= 0:
             self.cancel_stmt_temp_for_local(local)
             self.cancel_scheduled_value_drop_for_local(local)
@@ -902,7 +940,7 @@ impl MirBuilder:
             return 0
         if self.type_is_channel_endpoint(type_id) != 0:
             return 1
-        if self.sema.is_copy_frozen(type_id as TypeId) != 0:
+        if self.copy_is_bits(type_id):
             return 0
         if self.sema.type_is_task(type_id) != 0 or self.sema.type_is_scoped_task(type_id) != 0 or self.sema.type_is_scoped_join_handle(type_id) != 0:
             return 0
@@ -917,10 +955,15 @@ impl MirBuilder:
         let std_kind = self.sema.std_generic_of(resolved as i32)
         if std_kind == StdGeneric.Sender or std_kind == StdGeneric.Receiver: 1 else: 0
 
+    // D111: a copy of this type is plain bits — Copy, with no drop glue —
+    // so it has nothing to drop and nothing to retain. A str, or a value
+    // holding one, is Copy with drop glue: every holder is dropped.
+    fn copy_is_bits(ty: i32) -> bool: self.sema.is_copy_frozen(ty as TypeId) != 0 and self.sema.type_needs_drop_frozen(ty) == 0
+
     fn type_needs_value_drop(type_id: i32) -> i32:
         if self.type_is_channel_endpoint(type_id) != 0:
             return 1
-        if self.sema.is_copy_frozen(type_id) == 0:
+        if not self.copy_is_bits(type_id):
             return 1
         0
 
@@ -972,11 +1015,24 @@ impl MirBuilder:
             return op
         self.body.new_operand(OperandKind.OK_COPY, self.body.operand_d0[op])
 
+    // D111: a consumed copy of a Copy type with drop glue (a str, or a value
+    // holding one) is one more holder, since the source and the consumer each
+    // drop theirs. The operand stays a copy and records the hold; codegen
+    // retains where it evaluates the operand, which is where the consumer
+    // reads it, whatever order lowering emitted the two in.
+    mut fn retain_consumed_copy(operand_id: i32):
+        let place: i32 = self.body.operand_d0[operand_id]
+        let ty = if place >= 0 and place < self.body.place_sema_types.len(): self.body.place_sema_types[place] else: 0
+        if ty > 0 and self.sema.is_copy_frozen(ty as TypeId) != 0 and self.sema.type_needs_drop_frozen(ty) != 0:
+            self.body.set_operand_hold(operand_id, MIR_HOLD_RETAIN)
+
     mut fn consume_moved_operand(operand_id: i32) -> Unit:
         if operand_id < 0 or operand_id >= self.body.operand_kinds.len():
             return
         if with_getenv_str("WITH_TRACE_RESETS").len() > 0:
             with_eprint(f"[consume] op={operand_id} kind={self.body.operand_kinds[operand_id]} place={self.body.operand_d0[operand_id]}")
+        if self.body.operand_kinds[operand_id] == OperandKind.OK_COPY:
+            self.retain_consumed_copy(operand_id)
         if self.body.operand_kinds[operand_id] != OperandKind.OK_MOVE:
             return
         let place = self.body.operand_d0[operand_id]
@@ -4043,11 +4099,13 @@ impl MirBuilder:
             // reset-on-move (§2.5.1). Borrowed bases — mut-fn receiver place,
             // share/ref params — have no scheduled value drop here and keep
             // the pure view.
+            // D111: a Copy field (a str) is read by copy; its consumer takes
+            // its own hold, and the field keeps its value.
             let alias_path_count = self.place_field_projection_count(alias_place)
             if alias_path_count > 0:
                 let alias_base = self.place_base_local(alias_place)
                 let alias_ty = self.place_local_type(alias_place)
-                if alias_base >= 0 and alias_ty > 0 and self.sema.type_needs_drop_frozen(alias_ty) != 0 and self.local_has_scheduled_value_drop(alias_base) != 0:
+                if alias_base >= 0 and alias_ty > 0 and self.sema.type_needs_drop_frozen(alias_ty) != 0 and self.sema.is_copy_frozen(alias_ty as TypeId) == 0 and self.local_has_scheduled_value_drop(alias_base) != 0:
                     return self.body.new_operand(OperandKind.OK_MOVE, alias_place)
             if self.place_type_is_str(alias_place) != 0:
                 self.mark_string_place_copied(alias_place)
@@ -4672,7 +4730,7 @@ impl MirBuilder:
         let place = self.place_for_local(temp)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, place, rv, self.ast.get_start(node))
         self.set_string_local_flags(temp, 2)
-        if self.sema.is_copy_frozen(ty) != 0:
+        if self.copy_is_bits(ty):
             return self.body.new_operand(OperandKind.OK_COPY, place)
         self.body.new_operand(OperandKind.OK_MOVE, place)
 
@@ -4687,7 +4745,11 @@ impl MirBuilder:
         0
 
     mut fn lower_str_concat_part(node: i32) -> i32:
+        // D111: a concat part only reads its bytes.
+        let saved_observing = self.observing_str_read
+        self.observing_str_read = node
         let lowered = self.lower_expr(node)
+        self.observing_str_read = saved_observing
         if self.body.operand_kinds[lowered] != OperandKind.OK_MOVE:
             return lowered
         let place: i32 = self.body.operand_d0[lowered]
@@ -5050,6 +5112,9 @@ impl MirBuilder:
         // value it read `move v.text` (#1394), a move no reset follows and
         // the owner's drop frees again.
         let observes_strings = is_cmp and self.type_id_is_str_or_str_ref(lhs_ty) != 0 and self.type_id_is_str_or_str_ref(rhs_ty) != 0
+        // D111: a compared &str reads its bytes; it is never materialized.
+        let saved_observing = self.observing_str_read
+        if observes_strings: self.observing_str_read = lhs_expr
         let lhs = if observes_strings and self.type_id_is_str(lhs_ty) != 0: self.lower_observer_probe_arg(lhs_expr) else: self.lower_comparison_operand(is_cmp, lhs_expr)
         if self.is_bare_none(rhs_expr) and (lhs_tk == TypeKind.TY_PTR or lhs_tk == TypeKind.TY_REF):
             self.expected_type = lhs_ty
@@ -5057,7 +5122,9 @@ impl MirBuilder:
             self.expected_type = lhs_ty
         else:
             self.expected_type = saved_expected
+        if observes_strings: self.observing_str_read = rhs_expr
         let rhs = if observes_strings and self.type_id_is_str(rhs_ty) != 0: self.lower_observer_probe_arg(rhs_expr) else: self.lower_comparison_operand(is_cmp, rhs_expr)
+        self.observing_str_read = saved_observing
         self.expected_type = saved_expected
         let rv = self.body.new_rvalue(RvalueKind.RK_BIN_OP, op, lhs, rhs)
         var ty = self.expr_type(node)
@@ -5077,7 +5144,7 @@ impl MirBuilder:
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, place, rv, self.ast.get_start(node))
         if op == BinaryOp.OP_CONCAT and self.type_id_is_str(ty) != 0:
             self.set_string_local_flags(temp, 2)
-        if self.sema.is_copy_frozen(ty) != 0:
+        if self.copy_is_bits(ty):
             return self.body.new_operand(OperandKind.OK_COPY, place)
         self.body.new_operand(OperandKind.OK_MOVE, place)
 
@@ -5438,7 +5505,7 @@ impl MirBuilder:
         let ret_ty = self.fn_return_type()
         let break_downcast = self.body.new_downcast_place(branch_place, break_idx)
         let break_payload_place = self.body.new_field_place(break_downcast, 0, break_ty)
-        let break_op = self.operand_for_place(break_payload_place, break_ty)
+        let break_op = self.body.new_operand(self.carrier_read_kind(break_ty, self.local_type(self.place_base_local(break_payload_place))), break_payload_place)
         let from_break_args: Vec[i32] = Vec.new()
         from_break_args.push(break_op)
         let ret_op = self.lower_resolved_call_with_operand_args_contract(from_break_fn, from_break_args, ret_ty, node, from_break_sig, from_break_mono_sym)
@@ -5454,7 +5521,7 @@ impl MirBuilder:
         let result_place = self.place_for_local(result_local)
         let continue_downcast = self.body.new_downcast_place(branch_place, continue_idx)
         let payload_place = self.body.new_field_place(continue_downcast, 0, continue_ty)
-        let pass_op = self.operand_for_place(payload_place, continue_ty)
+        let pass_op = self.body.new_operand(self.carrier_read_kind(continue_ty, self.local_type(self.place_base_local(payload_place))), payload_place)
         self.assign_operand_to_place(result_place, pass_op, self.ast.get_start(expr))
         self.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
 
@@ -6147,7 +6214,7 @@ impl MirBuilder:
         self.lower_vec_literal_push(vec_place, first_elem, elem_ty)
         if second_elem != 0:
             self.lower_vec_literal_push(vec_place, second_elem, elem_ty)
-        if self.sema.is_copy_frozen(vec_ty) != 0:
+        if self.copy_is_bits(vec_ty):
             return self.body.new_operand(OperandKind.OK_COPY, vec_place)
         self.body.new_operand(OperandKind.OK_MOVE, vec_place)
 
@@ -6252,7 +6319,7 @@ impl MirBuilder:
             let elem_op = self.lower_expr(elem_node)
             self.expected_type = saved_expected
             self.emit_btree_set_insert(out_place, elem_op, elem_node)
-        if self.sema.is_copy_frozen(target_ty) != 0:
+        if self.copy_is_bits(target_ty):
             return self.body.new_operand(OperandKind.OK_COPY, out_place)
         self.body.new_operand(OperandKind.OK_MOVE, out_place)
 
@@ -6280,7 +6347,7 @@ impl MirBuilder:
             let val_op = self.lower_expr(val_node)
             self.expected_type = saved_expected
             self.emit_btree_map_insert(out_place, key_op, val_op, key_node)
-        if self.sema.is_copy_frozen(target_ty) != 0:
+        if self.copy_is_bits(target_ty):
             return self.body.new_operand(OperandKind.OK_COPY, out_place)
         self.body.new_operand(OperandKind.OK_MOVE, out_place)
 
@@ -6306,7 +6373,7 @@ impl MirBuilder:
         // builds the aggregate in its place and states the elision.
         self.body.note_elided_call_node(node)
         self.emit_btree_new_into(out_place, target_ty, self.ast.get_start(node))
-        if self.sema.is_copy_frozen(target_ty) != 0:
+        if self.copy_is_bits(target_ty):
             return self.body.new_operand(OperandKind.OK_COPY, out_place)
         self.body.new_operand(OperandKind.OK_MOVE, out_place)
 
@@ -6324,7 +6391,7 @@ impl MirBuilder:
         self.body.set_call_intrinsic(args_id, intrinsic)
         self.body.set_call_ast_node(args_id, node)
         self.switch_to(next_bb)
-        if self.sema.is_copy_frozen(ret_type) != 0:
+        if self.copy_is_bits(ret_type):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -6528,7 +6595,7 @@ impl MirBuilder:
             if rhs_kind == OperandKind.OK_MOVE or rhs_kind == OperandKind.OK_COPY:
                 if self.places_are_identical(place, self.body.operand_d0[rhs]) != 0:
                     return rhs
-        if dest_ty != 0 and self.sema.is_copy_frozen(dest_ty) == 0 and self.sema.type_needs_drop_frozen(dest_ty) != 0:
+        if dest_ty != 0 and self.sema.type_needs_drop_frozen(dest_ty) != 0:
             // #747 (03h): D27 — a binding names WHAT'S THERE. A live view
             // binding aliasing exactly this place names the OLD value, so
             // re-targeting the place must not free or re-read it through the
@@ -6887,7 +6954,7 @@ impl MirBuilder:
             // path (an alias left the field glue skipping a field nobody
             // owned: the 84ebff6d leak, now bound as an owning local whose
             // drop precedes the glue — spec_ss02_4 pins the WFN order).
-            if self.sema.is_copy_frozen(bind_ty) == 0 and not self.sema.drop_consumed_binding_values.contains(rhs_expr):
+            if not self.copy_is_bits(bind_ty) and not self.sema.drop_consumed_binding_values.contains(rhs_expr):
                 let alias_place = self.lower_binding_alias_place(rhs_expr)
                 if alias_place >= 0:
                     // A live str view of this place: later self-appends must
@@ -6943,14 +7010,14 @@ impl MirBuilder:
             if mutable == 0 and self.ast.kind(rhs_expr) == NodeKind.NK_IF_EXPR and self.last_if_result_view != 0:
                 rhs_is_view_if = 1
         if is_discard_binding != 0:
-            if self.sema.is_copy_frozen(bind_ty) == 0 and rhs_is_view_if == 0:
+            if not self.copy_is_bits(bind_ty) and rhs_is_view_if == 0:
                 self.emit_drop_entry(local_id, scheduled_drop_kind)
             else:
                 self.body.push_stmt(self.cur_bb, StmtKind.StorageDead, local_id, 0, self.ast.get_start(node))
             return
         // An initializer may return, break, continue, or propagate an error.
         // Only the edge that acquired the value owns its eventual cleanup.
-        if self.sema.is_copy_frozen(bind_ty) == 0 and rhs_is_view_if == 0:
+        if not self.copy_is_bits(bind_ty) and rhs_is_view_if == 0:
             self.schedule_drop(local_id, scheduled_drop_kind)
         self.bind_local(name_sym, local_id)
 
@@ -7046,14 +7113,18 @@ impl MirBuilder:
                 let obs_cont_bb = self.new_block()
                 self.pattern_subject_observed = 1
                 self.lower_pattern_match(observed_place, pat, obs_success_bb, obs_fail_bb)
-                self.switch_to(obs_success_bb)
-                self.lower_let_pattern_bindings(node, pat, observed_place)
+                // The failing path first, as below (#1365): a binding's drop
+                // (a str under D111) is scheduled only on the success path.
                 self.pattern_subject_observed = saved_observed
-                self.terminate(TermKind.TK_GOTO, obs_cont_bb, 0, 0, 0)
                 self.switch_to(obs_fail_bb)
                 let obs_move_state = self.save_move_state()
                 self.lower_let_else_branch(else_body)
                 self.restore_move_state(&obs_move_state)
+                self.switch_to(obs_success_bb)
+                self.pattern_subject_observed = 1
+                self.lower_let_pattern_bindings(node, pat, observed_place)
+                self.pattern_subject_observed = saved_observed
+                self.terminate(TermKind.TK_GOTO, obs_cont_bb, 0, 0, 0)
                 self.switch_to(obs_cont_bb)
             return
         let rhs_reset_start = self.pending_reset_locals.len() as i32
@@ -7110,7 +7181,7 @@ impl MirBuilder:
         if le_scrut_local >= 0:
             self.cancel_stmt_temp_for_local(le_scrut_local)
             self.cancel_scheduled_value_drop_for_local(le_scrut_local)
-            self.mark_local_value_moved(le_scrut_local)
+            self.mark_carrier_consumed(le_scrut_local)
         self.cancel_scheduled_value_drop_for_receiver_expr(rhs)
         let branch_move_state = self.save_move_state()
 
@@ -7447,6 +7518,11 @@ impl MirBuilder:
                     self.finish_stmt_temp_frame(diverging_frame)
                 if tail_read != 0:
                     self.cancel_scheduled_value_drop_for_receiver_expr(self.ast.get_data0(tail_read))
+                    // D111: the read moves the local out, as a plain tail does
+                    // (its drop was cancelled just above).
+                    result = self.tail_local_moves_out(result, self.ast.get_data0(tail_read))
+                if tail_read == 0:
+                    result = self.tail_local_moves_out(result, tail_expr)
                 result = self.materialize_tail_field_move(result, tail_expr)
                 result = self.materialize_tail_read_of_dropped_local(result, tail_expr)
             else:
@@ -7635,7 +7711,7 @@ impl MirBuilder:
         if self.last_if_result_view != 0:
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.register_stmt_temp(result_local, result_ty)
-        if self.sema.is_copy_frozen(result_ty) != 0:
+        if self.copy_is_bits(result_ty):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -7685,13 +7761,13 @@ impl MirBuilder:
         if iflet_scrut_local >= 0:
             self.cancel_stmt_temp_for_local(iflet_scrut_local)
             self.cancel_scheduled_value_drop_for_local(iflet_scrut_local)
-            self.mark_local_value_moved(iflet_scrut_local)
+            self.mark_carrier_consumed(iflet_scrut_local)
         self.cancel_scheduled_value_drop_for_receiver_expr(scrutinee_expr)
 
         self.switch_to(join_bb)
         self.forget_string_flow_facts()
         self.register_stmt_temp(result_local, result_ty)
-        if self.sema.is_copy_frozen(result_ty) != 0:
+        if self.copy_is_bits(result_ty):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -7961,12 +8037,14 @@ impl MirBuilder:
                 let iter_std = self.sema.std_generic_of(resolved as i32)
                 if iter_std != StdGeneric.None:
                     if iter_std == StdGeneric.Vec:
-                        // §13 implicit iteration borrows the collection.
-                        // Drop-class elements iterate as &T views; Copy-class
-                        // elements keep owned bindings read through the
-                        // borrowed place (lower_for_vec no longer moves it).
+                        // §13 implicit iteration borrows the collection. An
+                        // element with drop glue (Drop-class, or a str under
+                        // D111) iterates as a &T view, as Sema binds it
+                        // (for_iterable_yields_views); any other element keeps
+                        // an owned binding read through the borrowed place
+                        // (lower_for_vec no longer moves it).
                         let bare_elem = self.sema.get_generic_inst_arg(resolved as i32, 0)
-                        if self.sema.type_needs_drop_frozen(bare_elem) != 0 and self.sema.is_copy_frozen(bare_elem) == 0:
+                        if self.sema.type_needs_drop_frozen(bare_elem) != 0:
                             return self.lower_for_iter_ref(for_node, pat_or_sym, iter_expr, body_expr)
                         return self.lower_for_vec(for_node, pat_or_sym, iter_expr, body_expr)
                     if iter_std == StdGeneric.HashMap:
@@ -7991,7 +8069,7 @@ impl MirBuilder:
                         // borrow split as the bare-Vec dispatch.
                         self.body.note_elided_call_node(iter_expr)
                         let it_elem = self.sema.get_generic_inst_arg(recv_resolved as i32, 0)
-                        if self.sema.type_needs_drop_frozen(it_elem) != 0 and self.sema.is_copy_frozen(it_elem) == 0:
+                        if self.sema.type_needs_drop_frozen(it_elem) != 0:
                             return self.lower_for_iter_ref(for_node, pat_or_sym, recv, body_expr)
                         return self.lower_for_vec(for_node, pat_or_sym, recv, body_expr)
                 if iter_intrinsic == MirIntrinsic.VEC_ITER_REF and self.sema.std_generic_of(self.expr_type(recv)) == StdGeneric.Vec:
@@ -8083,7 +8161,7 @@ impl MirBuilder:
         let payload_place = self.body.new_field_place(downcast_place, 0, elem_ty)
         // Drop-class elements MOVE out of the Option temp (the `?` idiom) —
         // a copy leaves the stale Some to double-drop the payload at cleanup.
-        let next_payload = self.body.new_operand(if self.sema.is_copy_frozen(elem_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, payload_place)
+        let next_payload = self.body.new_operand(self.carrier_read_kind(elem_ty, self.local_type(self.place_base_local(payload_place))), payload_place)
         self.assign_operand_to_place(item_place, next_payload, self.ast.get_start(iter_expr))
 
         // #614b + D33: the binding itself lives in a per-iteration scope. A
@@ -8318,6 +8396,7 @@ impl MirBuilder:
         let used_codes = child.gen_loop_used_codes
         let exit_labels = mir_clone_i32_vec(&child.gen_loop_exit_labels)
         let exit_kinds = mir_clone_i32_vec(&child.gen_loop_exit_kinds)
+        child.body = mir_mark_last_use_holds(move child.body)
         var finished = LoweredFunction { body: move child.body, anonymous_bodies: move child.anonymous_bodies }
         self.anonymous_bodies.push(move finished.body)
         while finished.anonymous_bodies.len() > 0:
@@ -8442,7 +8521,7 @@ impl MirBuilder:
             let bind_local = self.body.new_local(elem_ty, 0, pat_or_sym, 1)
             self.bind_local(pat_or_sym, bind_local)
             self.body.push_stmt(self.cur_bb, StmtKind.StorageLive, bind_local, 0, self.ast.get_start(body_expr))
-            if self.sema.is_copy_frozen(elem_ty) == 0:
+            if not self.copy_is_bits(elem_ty):
                 self.schedule_drop(bind_local, DropKind.DK_VALUE)
             let bind_place = self.place_for_local(bind_local)
             let item_op = self.body.new_operand(OperandKind.OK_COPY, item_place)
@@ -8493,7 +8572,7 @@ impl MirBuilder:
             let bind_local = self.body.new_local(elem_ty, 0, pat_or_sym, 1)
             self.bind_local(pat_or_sym, bind_local)
             self.body.push_stmt(self.cur_bb, StmtKind.StorageLive, bind_local, 0, self.ast.get_start(span_node))
-            if self.sema.is_copy_frozen(elem_ty) == 0:
+            if not self.copy_is_bits(elem_ty):
                 self.schedule_drop(bind_local, DropKind.DK_VALUE)
             let bind_place = self.place_for_local(bind_local)
             let item_op = self.body.new_operand(OperandKind.OK_COPY, item_place)
@@ -8508,7 +8587,11 @@ impl MirBuilder:
     // may already produce the OK_MOVE (Sema's owned demand) without
     // registering it — register either way.
     mut fn move_into_comprehension_output(op: i32, ty: i32) -> i32:
-        if ty <= 0 or self.sema.is_copy_frozen(ty) != 0:
+        if ty <= 0 or self.copy_is_bits(ty):
+            return op
+        // D111: a value with copy glue is copied in, one more holder.
+        if self.sema.is_copy_frozen(ty as TypeId) != 0:
+            self.consume_moved_operand(op)
             return op
         var moved = op
         if self.body.operand_kinds[moved] == OperandKind.OK_COPY:
@@ -8961,7 +9044,7 @@ impl MirBuilder:
         let payload_place = self.body.new_field_place(downcast_place, 0, elem_ty)
         // Drop-class elements MOVE out of the Option temp (the `?` idiom) —
         // a copy leaves the stale Some to double-drop the payload at cleanup.
-        let next_payload = self.body.new_operand(if self.sema.is_copy_frozen(elem_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, payload_place)
+        let next_payload = self.body.new_operand(self.carrier_read_kind(elem_ty, self.local_type(self.place_base_local(payload_place))), payload_place)
         self.assign_operand_to_place(item_place, next_payload, self.ast.get_start(iter_expr))
         // #614b + D33: the binding lives in a per-iteration scope so an
         // owned Drop element drops once on the back-edge — including
@@ -9100,7 +9183,7 @@ impl MirBuilder:
             self.emit_vec_new_into(out_place, self.ast.get_start(comp_node))
         self.lower_comprehension_clause(comp_node, 0, out_place, elem_ty)
 
-        if self.sema.is_copy_frozen(out_ty) != 0:
+        if self.copy_is_bits(out_ty):
             return self.body.new_operand(OperandKind.OK_COPY, out_place)
         self.body.new_operand(OperandKind.OK_MOVE, out_place)
 
@@ -9570,7 +9653,7 @@ impl MirBuilder:
         let entries_place = self.named_field_place(map_place, self.pool.intern("entries"), storage_ty, 0)
         let resolved_storage = self.sema.resolve_alias(storage_ty)
         let pair_ty = self.sema.get_generic_inst_arg(resolved_storage as i32, 0)
-        if self.sema.type_needs_drop_frozen(pair_ty) != 0 and self.sema.is_copy_frozen(pair_ty) == 0:
+        if self.sema.type_needs_drop_frozen(pair_ty) != 0:
             return self.lower_for_iter_ref_place(for_node, pat_or_sym, entries_place, self.ast.get_start(iter_expr), body_expr)
         self.lower_for_vec_place(for_node, pat_or_sym, entries_place, self.loop_element_type(for_node), self.ast.get_start(iter_expr), body_expr)
 
@@ -10045,7 +10128,9 @@ impl MirBuilder:
         if value_expr != 0:
             self.cancel_scheduled_value_drop_for_receiver_expr(value_expr)
         let ret_op_raw = if value_expr != 0:
-            self.lower_expr(value_expr)
+            // D111: a returned local is its last use, as a block tail is.
+            let returned = self.lower_expr(value_expr)
+            self.tail_local_moves_out(returned, value_expr)
         else if ret_ty > 0 and ret_ty != self.sema.ty_void as i32:
             // Bare `return` in a value-returning fn yields the implicit
             // default (spec: implicit default return) — a unit operand
@@ -11022,7 +11107,7 @@ impl MirBuilder:
             self.body.push_stmt(self.cur_bb, StmtKind.StorageLive, local_id, 0, self.ast.get_start(pat_node))
             if self.type_needs_value_drop(bind_ty) != 0:
                 self.schedule_drop(local_id, DropKind.DK_VALUE)
-            let src_op = self.body.new_operand(if self.type_needs_value_drop(bind_ty) == 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, scrutinee_place)
+            let src_op = self.body.new_operand(self.pattern_whole_read_kind(bind_ty), scrutinee_place)
             let local_place = self.place_for_local(local_id)
             self.bind_pattern_value(local_place, src_op, self.ast.get_start(pat_node))
             out.push(local_id)
@@ -11037,7 +11122,7 @@ impl MirBuilder:
             self.body.push_stmt(self.cur_bb, StmtKind.StorageLive, outer_local, 0, self.ast.get_start(pat_node))
             if self.type_needs_value_drop(outer_ty) != 0:
                 self.schedule_drop(outer_local, DropKind.DK_VALUE)
-            let outer_op = self.body.new_operand(if self.type_needs_value_drop(outer_ty) == 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, scrutinee_place)
+            let outer_op = self.body.new_operand(self.pattern_whole_read_kind(outer_ty), scrutinee_place)
             let outer_place = self.place_for_local(outer_local)
             self.bind_pattern_value(outer_place, outer_op, self.ast.get_start(pat_node))
             out.push(outer_local)
@@ -11121,9 +11206,9 @@ impl MirBuilder:
                 let local_id = self.body.new_local(bind_ty, self.pattern_bind_mut, raw, 1)
                 self.bind_local(raw, local_id)
                 self.body.push_stmt(self.cur_bb, StmtKind.StorageLive, local_id, 0, self.ast.get_start(pat_node))
-                if self.sema.is_copy_frozen(bind_ty) == 0:
+                if not self.copy_is_bits(bind_ty):
                     self.schedule_drop(local_id, DropKind.DK_VALUE)
-                let src_op = self.body.new_operand(if self.sema.is_copy_frozen(bind_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, child_place)
+                let src_op = self.body.new_operand(self.pattern_read_kind(bind_ty, self.local_type(self.place_base_local(child_place))), child_place)
                 let local_place = self.place_for_local(local_id)
                 self.bind_pattern_value(local_place, src_op, self.ast.get_start(pat_node))
                 out.push(local_id)
@@ -11192,9 +11277,9 @@ impl MirBuilder:
                     let local_id = self.body.new_local(bind_ty, self.pattern_bind_mut, field_name, 1)
                     self.bind_local(field_name, local_id)
                     self.body.push_stmt(self.cur_bb, StmtKind.StorageLive, local_id, 0, self.ast.get_start(pat_node))
-                    if self.sema.is_copy_frozen(bind_ty) == 0:
+                    if not self.copy_is_bits(bind_ty):
                         self.schedule_drop(local_id, DropKind.DK_VALUE)
-                    let src_op = self.body.new_operand(if self.sema.is_copy_frozen(bind_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, child_place)
+                    let src_op = self.body.new_operand(self.pattern_read_kind(bind_ty, self.local_type(self.place_base_local(child_place))), child_place)
                     let local_place = self.place_for_local(local_id)
                     self.bind_pattern_value(local_place, src_op, self.ast.get_start(pat_node))
                     out.push(local_id)
@@ -11292,7 +11377,7 @@ impl MirBuilder:
                 let local_id = self.body.new_local(sp_elem_ty, self.pattern_bind_mut, sym, 1)
                 self.bind_local(sym, local_id)
                 self.body.push_stmt(self.cur_bb, StmtKind.StorageLive, local_id, 0, self.ast.get_start(pat_node))
-                let src_op = self.body.new_operand(if self.sema.is_copy_frozen(sp_elem_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, field_place)
+                let src_op = self.body.new_operand(self.pattern_read_kind(sp_elem_ty, self.local_type(self.place_base_local(field_place))), field_place)
                 let local_place = self.place_for_local(local_id)
                 self.assign_operand_to_place(local_place, src_op, self.ast.get_start(pat_node))
                 out.push(local_id)
@@ -11319,7 +11404,7 @@ impl MirBuilder:
                 let local_id = self.body.new_local(sp_elem_ty, self.pattern_bind_mut, sym, 1)
                 self.bind_local(sym, local_id)
                 self.body.push_stmt(self.cur_bb, StmtKind.StorageLive, local_id, 0, self.ast.get_start(pat_node))
-                let src_op = self.body.new_operand(if self.sema.is_copy_frozen(sp_elem_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, field_place)
+                let src_op = self.body.new_operand(self.pattern_read_kind(sp_elem_ty, self.local_type(self.place_base_local(field_place))), field_place)
                 let local_place = self.place_for_local(local_id)
                 self.assign_operand_to_place(local_place, src_op, self.ast.get_start(pat_node))
                 out.push(local_id)
@@ -11359,7 +11444,7 @@ impl MirBuilder:
         else if kind != NodeKind.NK_FIELD_ACCESS and kind != NodeKind.NK_INDEX:
             return -1
         let ty = self.expr_type(expr)
-        if ty == 0 or self.sema.is_copy_frozen(ty) != 0:
+        if ty == 0 or self.copy_is_bits(ty):
             return -1
         let tk = self.sema.get_type_kind(self.sema.resolve_alias(ty as TypeId))
         if tk == TypeKind.TY_REF or tk == TypeKind.TY_PTR:
@@ -11405,7 +11490,7 @@ impl MirBuilder:
             if match_scrut_local >= 0:
                 self.cancel_stmt_temp_for_local(match_scrut_local)
                 self.cancel_scheduled_value_drop_for_local(match_scrut_local)
-                self.mark_local_value_moved(match_scrut_local)
+                self.mark_carrier_consumed(match_scrut_local)
             self.cancel_scheduled_value_drop_for_receiver_expr(scrutinee_expr)
 
         let match_entry_bb = self.cur_bb as i32
@@ -11519,7 +11604,7 @@ impl MirBuilder:
         self.forget_string_flow_facts()
         if result_is_void != 0:
             return self.unit_operand()
-        if self.sema.is_copy_frozen(result_ty) != 0:
+        if self.copy_is_bits(result_ty):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -11566,7 +11651,7 @@ impl MirBuilder:
         self.terminate(TermKind.TK_CALL, math_unit, math_args_id, math_place, math_next)
         self.switch_to(math_next)
         self.register_stmt_temp(math_local, ret_type_id)
-        if self.sema.is_copy_frozen(ret_type_id) != 0:
+        if self.copy_is_bits(ret_type_id):
             return self.body.new_operand(OperandKind.OK_COPY, math_place)
         self.body.new_operand(OperandKind.OK_MOVE, math_place)
 
@@ -11691,7 +11776,7 @@ impl MirBuilder:
 
         if conv_sym != 0:
             return self.lower_value_conversion(conv_sym, result_place, node)
-        if self.sema.is_copy_frozen(actual_ret_type_id) != 0:
+        if self.copy_is_bits(actual_ret_type_id):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -11821,7 +11906,7 @@ impl MirBuilder:
         self.terminate(TermKind.TK_CALL, fn_op, args_id, result_place, next_bb)
         self.switch_to(next_bb)
         self.register_stmt_temp(result_local, actual_ret_type_id)
-        if self.sema.is_copy_frozen(actual_ret_type_id) != 0:
+        if self.copy_is_bits(actual_ret_type_id):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -11875,7 +11960,7 @@ impl MirBuilder:
         self.terminate(TermKind.TK_CALL, fn_op, args_id, result_place, next_bb)
         self.switch_to(next_bb)
         self.register_stmt_temp(result_local, actual_ret_type_id)
-        if self.sema.is_copy_frozen(actual_ret_type_id) != 0:
+        if self.copy_is_bits(actual_ret_type_id):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -12051,9 +12136,22 @@ impl MirBuilder:
             let param_kind = self.sema.get_type_kind(self.sema.resolve_alias(param_ty))
             if param_kind != TypeKind.TY_REF and self.sema.is_copy_frozen(param_ty) == 0:
                 sema_phase_bug(f"BUG: an implicit fill reached a non-Copy by-value parameter {param_i} (D87: an implicit fill never consumes; Sema fills only `implicit &T` or a Copy `implicit T`)")
-        if op >= 0 and self.body.operand_kinds[op] == OperandKind.OK_MOVE:
-            return self.body.new_operand(OperandKind.OK_COPY, self.body.operand_d0[op])
-        op
+        let fill = if op >= 0 and self.body.operand_kinds[op] == OperandKind.OK_MOVE: self.body.new_operand(OperandKind.OK_COPY, self.body.operand_d0[op]) else: op
+        // D111: a Copy fill with drop glue (an `implicit str`) takes its own hold.
+        if fill >= 0 and self.body.operand_kinds[fill] == OperandKind.OK_COPY and sig_idx >= 0 and param_i >= 0 and param_i < self.sema.sig_get_param_count(sig_idx) and self.call_param_owns(sig_idx, param_i, self.sema.sig_param_type(sig_idx, param_i)):
+            self.retain_consumed_copy(fill)
+        fill
+
+    // A share-place (value_ref_abi) parameter borrows its argument.
+    fn call_param_borrows(sig_idx: i32, arg_i: i32, expected_ty: i32) -> bool:
+        if sig_idx >= 0: arg_i >= 0 and self.sema.sig_param_uses_value_ref_abi(sig_idx, arg_i) != 0 else: self.sema.type_uses_c_va_list_place(expected_ty) != 0
+
+    // A parameter that owns what it is passed: neither a `&T` nor a
+    // share-place one. A copy into it takes its own hold (D111).
+    fn call_param_owns(sig_idx: i32, arg_i: i32, expected_ty: i32) -> bool:
+        if expected_ty > 0 and self.sema.get_type_kind(self.sema.resolve_alias(expected_ty as TypeId)) == TypeKind.TY_REF:
+            return false
+        not self.call_param_borrows(sig_idx, arg_i, expected_ty)
 
     mut fn lower_call_arg(arg_node: i32, sig_idx: i32, callable_fn_tid: i32, arg_i: i32, callee_sym: i32 = 0) -> i32:
         let saved_expected = self.expected_type
@@ -12070,13 +12168,18 @@ impl MirBuilder:
         if autoref_op >= 0:
             self.expected_type = saved_expected
             return autoref_op
+        // A copy through a reference into an owning parameter takes its own
+        // hold (D111: a str element passed to `s: str`); the callee drops it.
+        let callee_share_place = self.call_param_borrows(sig_idx, arg_i, expected_ty)
         let autocopy_ref_op = self.lower_auto_copy_ref_call_arg(arg_node, expected_ty)
         if autocopy_ref_op >= 0:
             self.expected_type = saved_expected
+            if self.call_param_owns(sig_idx, arg_i, expected_ty): self.consume_moved_operand(autocopy_ref_op)
             return autocopy_ref_op
         let autoderef_op = self.lower_auto_deref_call_arg(arg_node, expected_ty)
         if autoderef_op >= 0:
             self.expected_type = saved_expected
+            if self.call_param_owns(sig_idx, arg_i, expected_ty): self.consume_moved_operand(autoderef_op)
             return autoderef_op
         // #604 stage 1: a Vec/array arg coerced to a []T / []mut T param borrows
         // the place into a fat-pointer view. Never materialize the collection —
@@ -12106,10 +12209,6 @@ impl MirBuilder:
         // a non-share-place param is extern/copy — keep the existing behavior.)
         let arg_kind = self.ast.kind(arg_node)
         let arg_is_copy = arg_kind == NodeKind.NK_COPY_ARG
-        let callee_share_place = if sig_idx >= 0:
-            arg_i >= 0 and self.sema.sig_param_uses_value_ref_abi(sig_idx, arg_i) != 0
-        else:
-            self.sema.type_uses_c_va_list_place(expected_ty) != 0
         // D16 (rvalue-uniform `move`): `move x` always moves, callee-independent.
         // Into a share-place callee, the moved value becomes a statement
         // temporary — the callee borrows the temporary, the source is reset now
@@ -12313,20 +12412,15 @@ impl MirBuilder:
 
         let reference_place = self.materialize_operand(reference_op, adjustment.exact_source_type, self.ast.get_start(node))
         let pointee_place = self.new_deref_place(reference_place)
-        // #781: a str materialization mints an independent owner (two-part
-        // concat copy); a shallow pointee copy would alias the buffer into a
-        // double free.
-        if self.type_id_is_str(adjustment.owned_value_type) != 0:
-            let sc_parts: Vec[i32] = Vec.new()
-            sc_parts.push(self.body.new_operand(OperandKind.OK_COPY, pointee_place))
-            sc_parts.push(self.lower_str_lit(self.pool.intern("")))
-            let sc_args = self.body.new_call_args(sc_parts)
-            let sc_rv = self.body.new_rvalue(RvalueKind.RK_STR_CONCAT_N, sc_args, 2, 0)
-            let sc_tmp = self.new_temp(adjustment.owned_value_type)
-            let sc_place = self.place_for_local(sc_tmp)
-            self.body.push_stmt(self.cur_bb, StmtKind.Assign, sc_place, sc_rv, self.ast.get_start(node))
-            self.set_string_local_flags(sc_tmp, 2)
-            return self.body.new_operand(OperandKind.OK_MOVE, sc_place)
+        // D111: an operand that only reads bytes (a comparison, a concat part)
+        // takes the pointee's bits and owns nothing.
+        if self.observing_str_read == node and node != 0 and self.type_id_is_str(adjustment.owned_value_type) != 0:
+            return self.body.new_operand(OperandKind.OK_COPY, pointee_place)
+        // D111: a str materializes as every Copy value does, a pointee copy;
+        // whatever consumes it takes its own hold (retain_consumed_copy).
+        // The old fresh-buffer concat was a statement temp that a consuming
+        // Copy argument never cancelled: it was dropped after the callee
+        // freed it.
         let owned_op = self.body.new_operand(OperandKind.OK_COPY, pointee_place)
         if adjustment.post_copy_type == 0:
             return owned_op
@@ -12355,7 +12449,7 @@ impl MirBuilder:
         let exact_type: i32 = self.sema.contextual_join_arm_types[arm_index]
         let arm_kind: i32 = self.sema.contextual_join_arm_kinds[arm_index]
         var source_type: i32 = exact_type
-        var op = self.operand_for_place(exact_place, exact_type)
+        var op = self.body.new_operand(self.carrier_read_kind(exact_type, self.local_type(self.place_base_local(exact_place))), exact_place)
         if arm_kind == D22_JOIN_ARM_MATERIALIZED_REF:
             let resolved = self.sema.resolve_alias(exact_type as TypeId)
             if self.sema.get_type_kind(resolved) != TypeKind.TY_REF:
@@ -12687,7 +12781,7 @@ impl MirBuilder:
         // #693 (secondary): the constructed variant is OWNED by this temp — a
         // Drop-payload enum must MOVE into its destination; Copy stays for
         // Copy enums only, matching every other result-operand site.
-        if self.sema.is_copy_frozen(result_ty) != 0:
+        if self.copy_is_bits(result_ty):
             return self.body.new_operand(OperandKind.OK_COPY, place)
         self.body.new_operand(OperandKind.OK_MOVE, place)
 
@@ -13150,13 +13244,22 @@ impl MirBuilder:
                     recv_op = self.lower_expr(self_expr)
                 else if recv_owner != 0 and self.sema.builtin_method_requires_move_receiver(recv_owner, method_sym) != 0:
                     let recv_place = self.lower_expr_place(self_expr)
-                    recv_op = self.body.new_operand(OperandKind.OK_MOVE, recv_place)
+                    // D111: a Copy receiver with drop glue (an Option[str]) is
+                    // copied in with its own hold, not moved: the source keeps
+                    // its value and the method takes the copy.
+                    if not self.copy_is_bits(recv_type_for_args) and self.sema.is_copy_frozen(recv_type_for_args as TypeId) != 0:
+                        recv_op = self.body.new_operand(OperandKind.OK_COPY, recv_place)
+                        self.body.set_operand_hold(recv_op, MIR_HOLD_RETAIN)
+                    else:
+                        recv_op = self.body.new_operand(OperandKind.OK_MOVE, recv_place)
                 else if raw_pointer_option_receiver:
                     recv_op = self.lower_expr(self_expr)
                 else:
                     recv_op = self.lower_receiver_with_method_autoderef_for_method(self_expr, method_sym)
                 let channel_endpoint_method = intrinsic == MirIntrinsic.CHAN_SEND or intrinsic == MirIntrinsic.CHAN_RECV or intrinsic == MirIntrinsic.CHAN_CLOSE
-                if intrinsic != MirIntrinsic.FIBER_CANCEL and not channel_endpoint_method:
+                // A builtin reads its receiver in place (D110): only a move
+                // receiver transfers, so a copied one takes no hold.
+                if intrinsic != MirIntrinsic.FIBER_CANCEL and not channel_endpoint_method and self.body.operand_kinds[recv_op] == OperandKind.OK_MOVE:
                     self.consume_moved_operand(recv_op)
                 call_args.push(recv_op)
         let sig_row = self.sema.builtin_call_sig(node)
@@ -13246,6 +13349,22 @@ impl MirBuilder:
         // Conservative lowering: treat as method call on dynamic receiver.
         self.lower_method_call(dyn_expr, method_sym, args_start, args_count, node)
 
+    // D111: a block tail naming a local is that local's last use, and
+    // cancel_scheduled_value_drop_for_receiver_expr retired its drop: a value
+    // with copy glue moves out (no hold taken), as a non-Copy local does; a
+    // copy would retain what nothing then releases.
+    mut fn tail_local_moves_out(op: i32, tail_expr: i32) -> i32:
+        var expr = tail_expr
+        while expr != 0 and self.ast.kind(expr) == NodeKind.NK_GROUPED:
+            expr = self.ast.get_data0(expr)
+        if expr == 0 or self.ast.kind(expr) != NodeKind.NK_IDENT or op < 0 or self.body.operand_kinds[op] != OperandKind.OK_COPY:
+            return op
+        let local = self.lookup_local(self.ast.get_data0(expr))
+        let place: i32 = self.body.operand_d0[op]
+        if local < 0 or mir_place_plain_local(&self.body, place) != local or self.copy_is_bits(self.local_type(local)):
+            return op
+        self.body.new_operand(OperandKind.OK_MOVE, place)
+
     mut fn cancel_scheduled_value_drop_for_receiver_expr(expr: i32):
         if expr == 0:
             return
@@ -13315,7 +13434,7 @@ impl MirBuilder:
                 let ref_place = self.place_for_local(ref_tmp)
                 self.body.push_stmt(self.cur_bb, StmtKind.Assign, ref_place, ref_rv, span)
                 return self.body.new_operand(OperandKind.OK_COPY, ref_place)
-            let op_kind = if self.sema.is_copy_frozen(payload_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE
+            let op_kind = self.carrier_read_kind(payload_ty, enum_ty)
             return self.body.new_operand(op_kind, field_place)
 
         let tuple_fields: Vec[i32] = Vec.new()
@@ -13334,7 +13453,7 @@ impl MirBuilder:
                 self.body.push_stmt(self.cur_bb, StmtKind.Assign, ref_place, ref_rv, span)
                 tuple_fields.push(self.body.new_operand(OperandKind.OK_COPY, ref_place))
             else:
-                let op_kind = if self.sema.is_copy_frozen(payload_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE
+                let op_kind = self.carrier_read_kind(payload_ty, enum_ty)
                 tuple_fields.push(self.body.new_operand(op_kind, field_place))
             tuple_names.push(0)
         let tuple_fid = self.body.new_agg_fields(tuple_fields, tuple_names)
@@ -13342,7 +13461,7 @@ impl MirBuilder:
         let tuple_tmp = self.new_temp(unwrapped_ty)
         let tuple_place = self.place_for_local(tuple_tmp)
         self.body.push_stmt(self.cur_bb, StmtKind.Assign, tuple_place, tuple_rv, span)
-        self.body.new_operand(if self.sema.is_copy_frozen(unwrapped_ty) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE, tuple_place)
+        self.body.new_operand(if self.copy_is_bits(unwrapped_ty): OperandKind.OK_COPY else: OperandKind.OK_MOVE, tuple_place)
 
     mut fn assign_enum_variant_to_place(result_place: i32, result_ty: i32, variant_sym: i32, fields: &Vec[i32], span: i32):
         let names: Vec[i32] = Vec.new()
@@ -13436,7 +13555,7 @@ impl MirBuilder:
         self.terminate(TermKind.TK_SWITCH_INT, disc, table, none_bb, 0)
 
         self.switch_to(none_bb)
-        if accessor_kind == 2 and self.sema.is_copy_frozen(enum_ty) == 0:
+        if accessor_kind == 2 and not self.copy_is_bits(enum_ty):
             self.emit_drop_stmt(recv_place, "enum-accessor", span)
         let none_fields: Vec[i32] = Vec.new()
         self.assign_enum_variant_to_place(result_place, result_ty, self.sema.syms.none, none_fields, span)
@@ -13500,7 +13619,7 @@ impl MirBuilder:
                 else:
                     let err_downcast = self.body.new_downcast_place(value_place, err_idx)
                     let err_payload_place = self.body.new_field_place(err_downcast, 0, source_err_ty)
-                    var target_err_op = self.operand_for_place(err_payload_place, source_err_ty)
+                    var target_err_op = self.body.new_operand(self.carrier_read_kind(source_err_ty, self.local_type(self.place_base_local(err_payload_place))), err_payload_place)
                     let conversion_chain = self.sema.error_conversion_chain_frozen(target_err_ty, source_err_ty)
                     if conversion_chain.found == 0 or conversion_chain.ambiguous != 0:
                         self.mark_unsupported()
@@ -13571,7 +13690,7 @@ impl MirBuilder:
 
         self.switch_to(join_bb)
         self.forget_string_flow_facts()
-        if self.sema.is_copy_frozen(result_ty) != 0:
+        if self.copy_is_bits(result_ty):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -13678,7 +13797,7 @@ impl MirBuilder:
         // A Copy subject has nothing to drop: a drop of it made it owned
         // storage to the ownership validator, which then found it Init at
         // return on the success path when this default diverges.
-        if mir_place_plain_local(&self.body, value_place) >= 0 and self.sema.type_needs_drop_frozen(value_ty) != 0:
+        if mir_place_plain_local(&self.body, value_place) >= 0 and self.sema.type_needs_drop_frozen(value_ty) != 0 and not self.carrier_copies(value_ty):
             self.emit_drop_stmt(value_place, "coalesce-default", self.ast.get_start(expr))
         let dq_scrut_local = self.retire_decomposed_carrier(value_place)
         // #772: a lazy-arm frame + divergence guard, exactly like lower_if's
@@ -13693,9 +13812,9 @@ impl MirBuilder:
         self.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
 
         self.switch_to(join_bb)
-        self.mark_local_value_moved(dq_scrut_local)
+        self.mark_carrier_consumed(dq_scrut_local)
         self.forget_string_flow_facts()
-        if self.sema.is_copy_frozen(result_ty) != 0:
+        if self.copy_is_bits(result_ty):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -13734,6 +13853,12 @@ impl MirBuilder:
 
     mut fn lower_owned_receiver_place(self_expr: i32, value_ty: i32) -> i32:
         let source_place = self.lower_expr_place(self_expr)
+        // D111: a Copy receiver with drop glue is copied in with its own hold;
+        // the source keeps its value.
+        if self.carrier_copies(value_ty):
+            let copy_op = self.body.new_operand(OperandKind.OK_COPY, source_place)
+            self.body.set_operand_hold(copy_op, MIR_HOLD_RETAIN)
+            return self.materialize_operand(copy_op, value_ty, self.ast.get_start(self_expr))
         let value_op = self.body.new_operand(OperandKind.OK_MOVE, source_place)
         // #724 acceptance chase: an UNREGISTERED move leaves the source's
         // scheduled drop live — r.err() extracted the payload while r's
@@ -13890,7 +14015,7 @@ impl MirBuilder:
         let some_option_local = self.new_temp(result_ok_ty)
         let some_option_place = self.place_for_local(some_option_local)
         let some_fields: Vec[i32] = Vec.new()
-        some_fields.push(self.operand_for_place(ok_payload_place, inner_ok_ty))
+        some_fields.push(self.body.new_operand(self.carrier_read_kind(inner_ok_ty, self.local_type(self.place_base_local(ok_payload_place))), ok_payload_place))
         self.assign_enum_variant_to_place(some_option_place, result_ok_ty, self.sema.syms.some, some_fields, span)
         let ok_fields: Vec[i32] = Vec.new()
         ok_fields.push(self.operand_for_place(some_option_place, result_ok_ty))
@@ -13902,7 +14027,7 @@ impl MirBuilder:
         let err_downcast = self.body.new_downcast_place(inner_result_place, err_idx)
         let err_payload_place = self.body.new_field_place(err_downcast, 0, inner_err_ty)
         let err_fields: Vec[i32] = Vec.new()
-        err_fields.push(self.operand_for_place(err_payload_place, inner_err_ty))
+        err_fields.push(self.body.new_operand(self.carrier_read_kind(inner_err_ty, self.local_type(self.place_base_local(err_payload_place))), err_payload_place))
         self.assign_enum_variant_to_place(result_place, result_ty, self.sema.syms.err, err_fields, span)
         self.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
 
@@ -13951,7 +14076,7 @@ impl MirBuilder:
         let err_result_local = self.new_temp(result_some_ty)
         let err_result_place = self.place_for_local(err_result_local)
         let err_fields: Vec[i32] = Vec.new()
-        err_fields.push(self.operand_for_place(err_payload_place, inner_err_ty))
+        err_fields.push(self.body.new_operand(self.carrier_read_kind(inner_err_ty, self.local_type(self.place_base_local(err_payload_place))), err_payload_place))
         self.assign_enum_variant_to_place(err_result_place, result_some_ty, self.sema.syms.err, err_fields, span)
         let err_some_fields: Vec[i32] = Vec.new()
         err_some_fields.push(self.operand_for_place(err_result_place, result_some_ty))
@@ -13982,7 +14107,7 @@ impl MirBuilder:
         let ok_result_local = self.new_temp(result_some_ty)
         let ok_result_place = self.place_for_local(ok_result_local)
         let ok_fields: Vec[i32] = Vec.new()
-        ok_fields.push(self.operand_for_place(some_payload_place, inner_some_ty))
+        ok_fields.push(self.body.new_operand(self.carrier_read_kind(inner_some_ty, self.local_type(self.place_base_local(some_payload_place))), some_payload_place))
         self.assign_enum_variant_to_place(ok_result_place, result_some_ty, self.sema.syms.ok, ok_fields, span)
         let some_fields: Vec[i32] = Vec.new()
         some_fields.push(self.operand_for_place(ok_result_place, result_some_ty))
@@ -14110,7 +14235,7 @@ impl MirBuilder:
         let downcast = self.body.new_downcast_place(value_place, variant_idx)
         let payload_place = self.body.new_field_place(downcast, 0, payload_ty)
         let some_fields: Vec[i32] = Vec.new()
-        let ok_err_payload_op = self.operand_for_place(payload_place, payload_ty)
+        let ok_err_payload_op = self.body.new_operand(self.carrier_read_kind(payload_ty, self.local_type(self.place_base_local(payload_place))), payload_place)
         some_fields.push(ok_err_payload_op)
         // Consuming the payload into the Option queues its reset-on-move
         // (§2.5.1): the blank lands on this path, before the goto, so the
@@ -14767,7 +14892,7 @@ impl MirBuilder:
         // the failure path, nothing moved out: drop what is left (an Err
         // payload, or nothing) once, and retire the subject's own drop.
         self.switch_to(none_bb)
-        if mir_place_plain_local(&self.body, value_place) >= 0:
+        if mir_place_plain_local(&self.body, value_place) >= 0 and not self.carrier_copies(value_ty):
             self.emit_drop_stmt(value_place, "unwrap-or-default", self.ast.get_start(node))
         let uo_scrut_local = self.retire_decomposed_carrier(value_place)
         let uo_arm = self.begin_lazy_arm()
@@ -14777,9 +14902,9 @@ impl MirBuilder:
         self.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
 
         self.switch_to(join_bb)
-        self.mark_local_value_moved(uo_scrut_local)
+        self.mark_carrier_consumed(uo_scrut_local)
         self.forget_string_flow_facts()
-        if self.sema.is_copy_frozen(result_ty) != 0:
+        if self.copy_is_bits(result_ty):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -14844,7 +14969,7 @@ impl MirBuilder:
             let err_idx = self.enum_variant_index_for_type(value_ty, self.sema.syms.err)
             let err_downcast = self.body.new_downcast_place(value_place, err_idx)
             let err_payload_place = self.body.new_field_place(err_downcast, 0, err_ty)
-            call_args.push(self.operand_for_place(err_payload_place, err_ty))
+            call_args.push(self.body.new_operand(self.carrier_read_kind(err_ty, value_ty), err_payload_place))
         // #2049: calling the fallback closure reads it, as any closure call
         // does (`call copy _f()`); its owner's drop frees it on both arms. A
         // `move` callee here left the success arm's scope-exit drop running
@@ -14858,7 +14983,7 @@ impl MirBuilder:
         self.terminate(TermKind.TK_GOTO, join_bb, 0, 0, 0)
 
         self.switch_to(join_bb)
-        self.mark_local_value_moved(uoe_scrut_local)
+        self.mark_carrier_consumed(uoe_scrut_local)
         self.forget_string_flow_facts()
         self.operand_for_place(result_place, result_ty)
 
@@ -14945,7 +15070,7 @@ impl MirBuilder:
         let local = self.body.new_local(ty, is_mut, sym, 1)
         self.bind_local(sym, local)
         self.body.push_stmt(self.cur_bb, StmtKind.StorageLive, local, 0, span)
-        if self.sema.is_copy_frozen(ty) == 0:
+        if not self.copy_is_bits(ty):
             self.schedule_drop(local, DropKind.DK_VALUE)
         let rhs = self.lower_expr(rhs_expr)
         let local_place = self.place_for_local(local)
@@ -15014,7 +15139,7 @@ impl MirBuilder:
             let local = self.body.new_local(ty, 0, sym, 1)
             self.bind_local(sym, local)
             self.body.push_stmt(self.cur_bb, StmtKind.StorageLive, local, 0, self.ast.get_start(pat_or_name))
-            if self.sema.is_copy_frozen(ty) == 0:
+            if not self.copy_is_bits(ty):
                 self.schedule_drop(local, DropKind.DK_VALUE)
             let rhs = self.lower_expr(rhs_expr)
             let local_place = self.place_for_local(local)
@@ -15035,8 +15160,8 @@ impl MirBuilder:
         // its drop retired: Init at return (`{ c with width: 300 }`), and a
         // moved String field the owner's glue could still reach.
         let base_local = if base_place >= 0 and base_place < self.body.place_locals.len() and self.body.place_proj_counts[base_place] == 0: self.body.place_locals[base_place] else: -1
-        let base_owned = ty != 0 and self.sema.is_copy_frozen(ty) == 0 and base_local > 0 and self.body.local_is_global[base_local] == 0 and self.body.local_is_caller_place[base_local] == 0 and (self.local_has_scheduled_value_drop(base_local) != 0 or self.stmt_temp_slot_for_local(base_local) >= 0)
-        if not base_owned and base_local >= 0 and ty != 0 and self.sema.is_copy_frozen(ty) == 0:
+        let base_owned = ty != 0 and not self.copy_is_bits(ty) and base_local > 0 and self.body.local_is_global[base_local] == 0 and self.body.local_is_caller_place[base_local] == 0 and (self.local_has_scheduled_value_drop(base_local) != 0 or self.stmt_temp_slot_for_local(base_local) >= 0)
+        if not base_owned and base_local >= 0 and ty != 0 and not self.copy_is_bits(ty):
             self.cancel_scheduled_value_drop_for_local(base_local)
         let resolved_ty = self.sema.resolve_alias(ty)
         var struct_extra = self.sema.get_type_d1(resolved_ty)
@@ -15084,7 +15209,7 @@ impl MirBuilder:
                     update_idx = ui
                     break
             if update_idx >= 0:
-                if field_ty != 0 and self.sema.is_copy_frozen(field_ty) == 0:
+                if field_ty != 0 and not self.copy_is_bits(field_ty):
                     let old_field_tmp = self.new_temp(field_ty)
                     let old_field_place = self.place_for_local(old_field_tmp)
                     let old_field_op = self.body.new_operand(OperandKind.OK_MOVE, src_field_place)
@@ -15221,7 +15346,9 @@ impl MirBuilder:
     mut fn lower_intrinsic_call_with_receiver_operand(intrinsic: MirIntrinsic, recv_op: i32, recv_type: i32, method_sym: i32, arg_start: i32, arg_count: i32, ret_type: i32, node: i32) -> i32:
         let fn_op = self.const_operand(ConstKind.CK_FN, method_sym, self.sema.ty_void)
         let call_args: Vec[i32] = Vec.new()
-        self.consume_moved_operand(recv_op)
+        // A builtin reads its receiver in place (D110): a copy takes no hold.
+        if self.body.operand_kinds[recv_op] == OperandKind.OK_MOVE:
+            self.consume_moved_operand(recv_op)
         call_args.push(recv_op)
         let sig_row = self.sema.builtin_call_sig(node)
         for ai in 0..arg_count:
@@ -15257,9 +15384,12 @@ impl MirBuilder:
         let op_kind = if self.sema.is_copy_frozen(type_id) != 0: OperandKind.OK_COPY else: OperandKind.OK_MOVE
         self.body.new_operand(op_kind, place)
 
+    // A call result is fresh and used once: it moves out, unless a copy of
+    // it is plain bits (D111: a copied str would retain what its temp's drop
+    // then releases — the right count, for nothing).
     mut fn call_result_operand(local: i32, place: i32, type_id: i32) -> i32:
         self.register_stmt_temp(local, type_id)
-        self.operand_for_place(place, type_id)
+        self.body.new_operand(if self.copy_is_bits(type_id): OperandKind.OK_COPY else: OperandKind.OK_MOVE, place)
 
     mut fn lower_call_with_operand_args(fn_op: i32, args: &Vec[i32], ret_type: i32, node: i32) -> i32:
         for ai in 0..args.len():
@@ -15272,7 +15402,7 @@ impl MirBuilder:
         self.terminate(TermKind.TK_CALL, fn_op, args_id, result_place, next_bb)
         self.switch_to(next_bb)
         self.register_stmt_temp(result_local, ret_type)
-        if self.sema.is_copy_frozen(ret_type) != 0:
+        if self.copy_is_bits(ret_type):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -15353,7 +15483,7 @@ impl MirBuilder:
         self.terminate(TermKind.TK_CALL, fn_op, args_id, result_place, next_bb)
         self.switch_to(next_bb)
         self.register_stmt_temp(result_local, ret_type)
-        if self.sema.is_copy_frozen(ret_type) != 0:
+        if self.copy_is_bits(ret_type):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -15377,7 +15507,7 @@ impl MirBuilder:
         self.terminate(TermKind.TK_CALL, fn_op, args_id, result_place, next_bb)
         self.switch_to(next_bb)
         self.register_stmt_temp(result_local, ret_type)
-        if self.sema.is_copy_frozen(ret_type) != 0:
+        if self.copy_is_bits(ret_type):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -15600,7 +15730,7 @@ impl MirBuilder:
             // the body owns it and drops what it did not move on (#1363: an
             // unused `(_) => ""` fallback leaked the Err payload; any unused
             // owned closure argument leaked).
-            if self.sema.is_copy_frozen(param_ty) == 0:
+            if not self.copy_is_bits(param_ty):
                 child.schedule_drop(local, DropKind.DK_VALUE)
         child.body.n_params = captures.len() as i32 + param_count
         child.expected_type = ret_ty
@@ -15619,6 +15749,7 @@ impl MirBuilder:
         child.pop_scope_inline()
         child.terminate(TermKind.TK_RETURN, 0, 0, 0, 0)
         child.verify_goto_labels()
+        child.body = mir_mark_last_use_holds(move child.body)
         var finished = LoweredFunction { body: move child.body, anonymous_bodies: move child.anonymous_bodies }
         self.anonymous_bodies.push(move finished.body)
         while finished.anonymous_bodies.len() > 0:
@@ -15742,7 +15873,7 @@ impl MirBuilder:
 
         self.switch_to(join_bb)
         self.forget_string_flow_facts()
-        if self.sema.is_copy_frozen(result_ty) != 0:
+        if self.copy_is_bits(result_ty):
             return self.body.new_operand(OperandKind.OK_COPY, result_place)
         self.body.new_operand(OperandKind.OK_MOVE, result_place)
 
@@ -16014,7 +16145,9 @@ impl MirBuilder:
             let place = self.lower_field_access(node)
             self.mark_string_place_copied(place)
             let fa_val_ty = self.expr_type(node)
-            if fa_val_ty != 0 and self.sema.type_needs_drop_frozen(fa_val_ty) != 0:
+            // D111: a Copy field with drop glue (a str) is copied; the consumer
+            // retains it. Only a non-Copy owned field moves out.
+            if fa_val_ty != 0 and self.sema.type_needs_drop_frozen(fa_val_ty) != 0 and self.sema.is_copy_frozen(fa_val_ty) == 0:
                 // #780: a field value read whose base chain passes through a
                 // shared borrow (&T param or & field) cannot move out — this
                 // frame doesn't own the place (an explicit `return fact.name`
@@ -16720,14 +16853,20 @@ impl MirBuilder:
                     if self.ast.get_extra(extra_start + fi) != first_node:
                         is_fill = false
                         break
-            let fill_value_is_copy = self.sema.is_copy_frozen(self.expr_type(first_node)) != 0
+            // The element the array holds decides, not the value spelled: `[s; N]`
+            // with `s: &str` under a `[str; N]` demand fills owned strs.
+            let fill_arr_ty = self.sema.resolve_alias(self.expr_type(node))
+            let fill_elem_ty = if self.sema.get_type_kind(fill_arr_ty) == TypeKind.TY_ARRAY: self.sema.get_type_d0(fill_arr_ty) else: self.expr_type(first_node)
+            let fill_value_is_bits = self.copy_is_bits(fill_elem_ty)
             // §4.3a, §2.3 (#1814): a non-Copy fill evaluates its value once
             // per element at every N, so each element owns its own value. It
             // took the one-evaluation fill over 64 elements: one `s.clone()`
             // in N slots was N owners of one buffer (SIGSEGV at 65).
-            if is_fill and not fill_value_is_copy:
+            // A Copy value with drop glue (a str, D111) is the same: each slot
+            // holds its own copy.
+            if is_fill and not fill_value_is_bits:
                 return self.lower_non_copy_array_fill(node, first_node, elem_count)
-            // A Copy fill is one evaluation copied N times.
+            // A plain-bits fill is one evaluation copied N times.
             if is_fill and (elem_count > 64 or fill_count_node != 0):
                 let fill_op = self.lower_expr(first_node)
                 let fill_rv = self.body.new_rvalue(RvalueKind.RK_ARRAY_FILL, fill_op, elem_count, 0)
@@ -17271,7 +17410,7 @@ fn lower_fn_with_sig(builder: MirBuilder, fn_node: i32, sig_idx: i32) -> Lowered
             // parameter, recorded for the ownership validator to read.
             if drop_receiver_self != 0 or borrowed_receiver or share_place_param:
                 builder.body.mark_caller_place_local(local_id)
-            else if builder.sema.is_copy_frozen(p_ty) == 0:
+            else if not builder.copy_is_bits(p_ty):
                 builder.schedule_drop(local_id, DropKind.DK_VALUE)
             param_locals.push(local_id)
         builder.body.n_params = param_count
@@ -17391,6 +17530,7 @@ fn lower_fn_with_sig(builder: MirBuilder, fn_node: i32, sig_idx: i32) -> Lowered
     // D32: field vacates need a mutable path — rebind the owned param.
     var owned_builder = builder
     owned_builder.verify_goto_labels()
+    owned_builder.body = mir_mark_last_use_holds(move owned_builder.body)
     LoweredFunction { body: move owned_builder.body, anonymous_bodies: move owned_builder.anonymous_bodies }
 
 fn lower_fn_clause_dispatcher(sema: &Sema, ast_pool: AstPool, pool: InternPool, group: i32) -> MirBody:
@@ -17435,7 +17575,7 @@ fn lower_fn_clause_dispatcher(sema: &Sema, ast_pool: AstPool, pool: InternPool, 
         // #D5/P1: share-place (value_ref_abi) params are borrows — not callee-dropped.
         // A move-self receiver is owned (§9.5/#D5) and dropped by the callee.
         let clause_share_place = sig_idx >= 0 and sema.sig_param_uses_value_ref_abi(sig_idx, pi) != 0 and not clause_move_self
-        if sema.is_copy_frozen(p_ty) == 0 and not clause_borrowed_receiver and not clause_share_place:
+        if not builder.copy_is_bits(p_ty) and not clause_borrowed_receiver and not clause_share_place:
             builder.schedule_drop(local_id, DropKind.DK_VALUE)
         param_locals.push(local_id)
     builder.body.n_params = param_count
