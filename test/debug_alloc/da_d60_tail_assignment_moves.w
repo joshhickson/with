@@ -21,8 +21,8 @@ type Holder { n: i32, name: str }
 
 fn compute(s: &str): s ++ "!"
 
-fn nums -> Vec[i32]:
-    var v: Vec[i32] = Vec.new()
+fn nums -> List[i32]:
+    var v: List[i32] = List.new()
     v.push(1)
     v.push(2)
     v
@@ -31,8 +31,8 @@ fn local_str -> str:
     var s = "a"
     s = compute("hi")
 
-fn local_vec -> Vec[i32]:
-    var v: Vec[i32] = Vec.new()
+fn local_list -> List[i32]:
+    var v: List[i32] = List.new()
     v.push(9)
     v = nums()
 
@@ -69,7 +69,7 @@ fn try_store(ok: bool) -> Result[str, str]:
 
 fn main:
     print(f"str {local_str()}")
-    print(f"vec {local_vec().len()}")
+    print(f"vec {local_list().len()}")
     let h = local_struct()
     print(f"struct {h.n} {h.name}")
     let o = local_opt() ?? "none"
