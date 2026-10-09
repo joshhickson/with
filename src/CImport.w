@@ -11855,6 +11855,25 @@ impl CiStmtPool:
             let then_v = self.lower_value_expr_ir(session, then_cursor, exprs, types, scope)
             let else_v = self.lower_value_expr_ir(session, else_cursor, exprs, types, scope)
             if ci_value_ir_valid(cond) and ci_value_ir_valid(then_v) and ci_value_ir_valid(else_v):
+                // C's `?:` evaluates one arm, as With's `if` expression does:
+                // when neither the condition nor an arm needs a statement, the
+                // expression is the translation. Hoisting it into a temp left
+                // a pure context (an initializer-list element, a call's
+                // argument there) with a statement it could not take, so STC's
+                // `malloc((size_t)(1 ? n : -1))` was untranslatable.
+                if cond.setup_stmt == 0 and then_v.setup_stmt == 0 and else_v.setup_stmt == 0:
+                    let pure_ty = types.type_from_libclang(session, with_ci_cursor_type(session, cursor))
+                    if pure_ty != 0:
+                        let pure_cond = exprs.bool_expr_from_value_ir(session, cond_cursor, cond.value_expr, types)
+                        // A `null` arm has no type of its own, and an `if`
+                        // arm never takes the other arm's: it is spelled
+                        // with its type, as C's `NULL` already is.
+                        var pure_then = exprs.coerce_value_expr_for_target(session, pure_ty, then_cursor, then_v.value_expr, types)
+                        if pure_then != 0 and exprs.kind(pure_then) == CiExprKind.CIE_NULL_PTR: pure_then = exprs.cast(pure_ty, pure_then)
+                        var pure_else = exprs.coerce_value_expr_for_target(session, pure_ty, else_cursor, else_v.value_expr, types)
+                        if pure_else != 0 and exprs.kind(pure_else) == CiExprKind.CIE_NULL_PTR: pure_else = exprs.cast(pure_ty, pure_else)
+                        if pure_cond != 0 and pure_then != 0 and pure_else != 0:
+                            return CiValueExprIR { value_expr: exprs.add(CiExprKind.CIE_TERNARY, pure_cond as i32, pure_then as i32, pure_else as i32, 0 as CiTypeId) }
                 let result_name = ci_expr_temp_name(session, cursor, "ternary")
                 let result_ty = types.type_from_libclang(session, with_ci_cursor_type(session, cursor))
                 if (result_ty as i32) == 0:
